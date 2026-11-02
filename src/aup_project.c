@@ -39,21 +39,42 @@ void aup_clear_preserved_chunks(void)
 
 static void preserve_unmatched_chunk(const char *name, const uint8_t *data, uint32_t size)
 {
-    PreservedFilterChunk *slot;
-    if (!name || !name[0] || g_preserved_count >= AUP_MAX_PRESERVED)
+    PreservedFilterChunk *slot = NULL;
+    int i;
+    if (!name || !name[0])
         return;
 
-    slot = &g_preserved[g_preserved_count];
+    for (i = 0; i < g_preserved_count; i++)
+    {
+        if (lstrcmpA(g_preserved[i].name, name) == 0)
+        {
+            slot = &g_preserved[i];
+            free(slot->data);
+            slot->data = NULL;
+            slot->size = 0;
+            break;
+        }
+    }
+    if (!slot)
+    {
+        if (g_preserved_count >= AUP_MAX_PRESERVED)
+            return;
+        slot = &g_preserved[g_preserved_count++];
+    }
+
     slot->data = (uint8_t *)malloc(size > 0 ? (size_t)size : 1u);
     if (!slot->data)
+    {
+        slot->name[0] = '\0';
+        slot->size = 0;
         return;
+    }
     if (size > 0 && data)
     {
         memcpy(slot->data, data, (size_t)size);
     }
     lstrcpynA(slot->name, name, sizeof(slot->name));
     slot->size = size;
-    g_preserved_count++;
 }
 
 static uint16_t rd_u16(const uint8_t *p)
@@ -473,6 +494,40 @@ static BOOL try_open_candidate_media(EDITP *ep, const char *aup_abs, const char 
     return FALSE;
 }
 
+static int try_add_candidate_source(EDITP *ep, const char *aup_abs, const char *candidate)
+{
+    int id;
+    char sibling_path[MAX_PATH];
+    const char *slash;
+    const char *fname;
+
+    if (!candidate || !candidate[0])
+        return -1;
+
+    id = editp_add_source_file(ep, candidate);
+    if (id >= 0)
+        return id;
+
+    slash = strrchr(aup_abs, '\\');
+    if (!slash)
+        slash = strrchr(aup_abs, '/');
+    fname = path_filename_part(candidate);
+    if (slash && fname[0])
+    {
+        int dir_len = (int)(slash - aup_abs);
+        if (dir_len > 0 && dir_len + 1 + (int)strlen(fname) < MAX_PATH)
+        {
+            memcpy(sibling_path, aup_abs, (size_t)dir_len);
+            sibling_path[dir_len] = '\\';
+            lstrcpynA(sibling_path + dir_len + 1, fname, MAX_PATH - dir_len - 1);
+            id = editp_add_source_file(ep, sibling_path);
+            if (id >= 0)
+                return id;
+        }
+    }
+    return -1;
+}
+
 static BOOL open_aup_media_or_canvas(EDITP *ep, const char *aup_abs,
                                      const char *edit_name, const char *slot0_name,
                                      int w, int h, int rate, int scale, int audio_rate)
@@ -522,8 +577,13 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     HANDLE hFile = INVALID_HANDLE_VALUE;
     AupReader rd;
     uint8_t *eh = NULL;
+    uint8_t *u32_0 = NULL;
+    uint8_t *u32_1 = NULL;
     uint8_t *tbl_tmp = NULL;
-    uint8_t *status_buf = NULL;
+    uint8_t *u8_0 = NULL;
+    uint8_t *u8_1 = NULL;
+    uint8_t *u8_2 = NULL;
+    uint8_t *u8_3 = NULL;
     uint8_t *chunk_buf = NULL;
     size_t chunk_cap = 0;
     char magic1[AUP_MAGIC_LEN + 1];
@@ -533,10 +593,11 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     char edit_name[260];
     char output_name[260];
     char slot0_name[260];
+    int slot_map[EDITP_MAX_SOURCES];
     int w, h, frame_n, select_s, select_e, frame;
     int video_rate, video_scale, audio_rate, audio_ch;
     BOOL has_audio;
-    int i;
+    int i, s;
     BOOL ok = FALSE;
 
     if (!aup_path || !aup_path[0] || !ep)
@@ -613,6 +674,14 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
         audio_rate = 44100;
 
     // read per-frame table count + 10 RLE-compressed per-frame arrays (0x00423560)
+    // +0x4c09c0: packed (vid_src_id<<24)|vid_src_frame
+    // +0x4c09c4: packed (aud_src_id<<24)|aud_src_frame
+    // +0x4c09c8, +0x4c09cc: internal cache dwords
+    // +0x4c09d0: frame_inter (0..5)
+    // +0x4c09d4: telecine phase (frame % 5)
+    // +0x4c09d8: frame_status (KEYFRAME/MARKFRAME/DELFRAME/NULLFRAME)
+    // +0x4c09dc: frame_config (profile index)
+    // +0x4c09e0, +0x4c09e4: comp profile / HGLOBAL index
     if (!ar_read_u32(&rd, &tbl_frames) || tbl_frames > (uint32_t)(REAVIUTL_MAX_FRAME * 4))
     {
         goto cleanup;
@@ -620,23 +689,28 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
 
     if (tbl_frames > 0)
     {
+        u32_0 = (uint8_t *)calloc((size_t)tbl_frames, 4u);
+        u32_1 = (uint8_t *)calloc((size_t)tbl_frames, 4u);
         tbl_tmp = (uint8_t *)malloc((size_t)tbl_frames * 4u);
-        status_buf = (uint8_t *)calloc((size_t)tbl_frames, 1u);
-        if (!tbl_tmp || !status_buf)
+        u8_0 = (uint8_t *)calloc((size_t)tbl_frames, 1u);
+        u8_1 = (uint8_t *)calloc((size_t)tbl_frames, 1u);
+        u8_2 = (uint8_t *)calloc((size_t)tbl_frames, 1u);
+        u8_3 = (uint8_t *)calloc((size_t)tbl_frames, 1u);
+        if (!u32_0 || !u32_1 || !tbl_tmp || !u8_0 || !u8_1 || !u8_2 || !u8_3)
             goto cleanup;
 
-        for (i = 0; i < 4; i++)
+        if (!ar_rle_read(&rd, u32_0, (size_t)tbl_frames * 4u) ||
+            !ar_rle_read(&rd, u32_1, (size_t)tbl_frames * 4u) ||
+            !ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames * 4u) ||
+            !ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames * 4u) ||
+            !ar_rle_read(&rd, u8_0, (size_t)tbl_frames) ||
+            !ar_rle_read(&rd, u8_1, (size_t)tbl_frames) ||
+            !ar_rle_read(&rd, u8_2, (size_t)tbl_frames) ||
+            !ar_rle_read(&rd, u8_3, (size_t)tbl_frames) ||
+            !ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames) ||
+            !ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames))
         {
-            if (!ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames * 4u))
-                goto cleanup;
-        }
-        // byte table 0 is frame_status (KEYFRAME / MARKFRAME / DELFRAME / NULLFRAME)
-        if (!ar_rle_read(&rd, status_buf, (size_t)tbl_frames))
             goto cleanup;
-        for (i = 1; i < 6; i++)
-        {
-            if (!ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames))
-                goto cleanup;
         }
     }
 
@@ -687,6 +761,22 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
         goto cleanup;
     }
 
+    // open secondary multi-source slots 1..63 stored at +0x026E98 + slot * 0xC4BC
+    for (s = 0; s < EDITP_MAX_SOURCES; s++)
+    {
+        slot_map[s] = (s == 0) ? 0 : -1;
+    }
+    for (s = 1; s < EDITP_MAX_SOURCES; s++)
+    {
+        char slot_path[260];
+        memcpy(slot_path, eh + 0x026E98u + (size_t)s * 0xC4BCu, 260);
+        slot_path[259] = '\0';
+        if (slot_path[0])
+        {
+            slot_map[s] = try_add_candidate_source(ep, abs_aup, slot_path);
+        }
+    }
+
     if (w > 0 && h > 0)
     {
         editp_set_dimensions(ep, w, h);
@@ -697,14 +787,53 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     {
         editp_set_frame_n(ep, frame_n);
     }
-    if (status_buf && frame_n > 0)
+    if (u32_0 && frame_n > 0)
     {
         int lim = ((uint32_t)frame_n < tbl_frames) ? frame_n : (int)tbl_frames;
+        BOOL legacy_reaviutl = (tbl_frames >= 2u &&
+                                rd_u32(u32_0 + 4u) == 0u &&
+                                rd_u32(u32_1 + 4u) == 1u &&
+                                u8_1[1] == 0u);
+
         for (i = 0; i < lim; i++)
         {
-            if (status_buf[i] != 0)
+            if (legacy_reaviutl)
             {
-                editp_set_frame_status(ep, i, status_buf[i]);
+                if (u8_0[i] != 0)
+                    editp_set_frame_status(ep, i, u8_0[i]);
+            }
+            else
+            {
+                uint32_t pv = rd_u32(u32_0 + (size_t)i * 4u) + 0x100u;
+                uint32_t pa = rd_u32(u32_1 + (size_t)i * 4u) + 0x100u;
+                int v_slot = (int)(pv >> 24);
+                int v_frm = (int)(pv & 0xFFFFFFu) - 0x100;
+                int a_slot = (int)(pa >> 24);
+                int a_frm = (int)(pa & 0xFFFFFFu) - 0x100;
+                uint32_t mapped_vid_id = 0u;
+                uint32_t mapped_aud_id = 0u;
+                BYTE st = (BYTE)(u8_2[i] & 0x7Fu);
+
+                if (v_slot >= 0 && v_slot < EDITP_MAX_SOURCES && slot_map[v_slot] >= 0)
+                    mapped_vid_id = (uint32_t)slot_map[v_slot];
+                if (a_slot >= 0 && a_slot < EDITP_MAX_SOURCES && slot_map[a_slot] >= 0)
+                    mapped_aud_id = (uint32_t)slot_map[a_slot];
+                if (v_frm < 0)
+                    v_frm = 0;
+                if (a_frm < 0)
+                    a_frm = 0;
+
+                if (mapped_vid_id != 0u || v_frm != i || mapped_aud_id != 0u || a_frm != i)
+                {
+                    editp_set_frame_mapping(ep, i, mapped_vid_id, (uint32_t)v_frm,
+                                            mapped_aud_id, (uint32_t)a_frm);
+                }
+                if (st != 0)
+                    editp_set_frame_status(ep, i, st);
+                if (u8_0[i] != 0)
+                    editp_set_frame_inter(ep, i, u8_0[i]);
+                if (u8_3[i] != 0)
+                    editp_set_frame_config(ep, i, u8_3[i]);
             }
         }
     }
@@ -810,8 +939,13 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
 
 cleanup:
     free(chunk_buf);
-    free(status_buf);
+    free(u8_3);
+    free(u8_2);
+    free(u8_1);
+    free(u8_0);
     free(tbl_tmp);
+    free(u32_1);
+    free(u32_0);
     free(eh);
     ar_free(&rd);
     CloseHandle(hFile);
@@ -820,6 +954,60 @@ cleanup:
 
 // 0x00424160, save .aup project
 
+static void fill_source_file_info_block(uint8_t *src_blk, int w, int h, int frame_n,
+                                        int fps_rate, int fps_scale,
+                                        int audio_rate, int audio_ch, BOOL has_audio,
+                                        int slot_id)
+{
+    uint32_t yc_img_sz = (uint32_t)w * (uint32_t)h * 6u;
+    uint16_t block_align = (uint16_t)(audio_ch * 2);
+    uint32_t avg_bps = (uint32_t)audio_rate * (uint32_t)block_align;
+
+    wr_u32(src_blk + 0x0000u, has_audio ? 0x07u : 0x03u);
+    wr_i32(src_blk + 0x0004u, w);
+    wr_i32(src_blk + 0x0008u, h);
+    wr_i32(src_blk + 0x000Cu, frame_n);
+
+    wr_u32(src_blk + 0x0010u, 40u);
+    wr_i32(src_blk + 0x0014u, w);
+    wr_i32(src_blk + 0x0018u, h);
+    wr_u16(src_blk + 0x001Cu, 1u);
+    wr_u16(src_blk + 0x001Eu, 48u);
+    wr_u32(src_blk + 0x0020u, FOURCC_YC48);
+    wr_u32(src_blk + 0x0024u, yc_img_sz);
+
+    wr_u16(src_blk + 0x0038u, 1u);
+    wr_u16(src_blk + 0x003Au, (uint16_t)audio_ch);
+    wr_u32(src_blk + 0x003Cu, (uint32_t)audio_rate);
+    wr_u32(src_blk + 0x0040u, avg_bps);
+    wr_u16(src_blk + 0x0044u, block_align);
+    wr_u16(src_blk + 0x0046u, 16u);
+
+    wr_u32(src_blk + 0x0050u, 3u);
+    wr_i32(src_blk + 0x0054u, fps_rate);
+    wr_i32(src_blk + 0x0058u, fps_scale);
+    wr_i32(src_blk + 0x005Cu, 1);
+
+    wr_u32(src_blk + 0x0094u, FOURCC_VIDS);
+    wr_u32(src_blk + 0x0098u, FOURCC_YC48);
+    wr_i32(src_blk + 0x00A8u, fps_scale); // +0x468: video_scale
+    wr_i32(src_blk + 0x00ACu, fps_rate);  // +0x46C: video_rate
+    wr_i32(src_blk + 0x00B4u, frame_n);
+
+    wr_u32(src_blk + 0x0120u, FOURCC_AUDS);
+    wr_i32(src_blk + 0x0134u, (int32_t)block_align);
+    wr_u32(src_blk + 0x0138u, avg_bps);
+    wr_u32(src_blk + 0x0140u, 0x7FFFFFFFu);
+    wr_i32(src_blk + 0x0150u, (int32_t)block_align);
+
+    wr_u32(src_blk + 0x01ACu, 40u);
+    memcpy(src_blk + 0x01B0u, src_blk + 0x0010u, 40u);
+    wr_u32(src_blk + 0x21ACu, 40u);
+    memcpy(src_blk + 0x21B0u, src_blk + 0x0038u, 18u);
+    wr_i32(src_blk + 0xC398u, slot_id);
+    wr_i32(src_blk + 0xC39Cu, 1204);
+}
+
 static void populate_aviutl_edit_handle(uint8_t *eh, EDITP *ep, const char *abs_aup)
 {
     int w = 0, h = 0, max_w = 0, max_h = 0;
@@ -827,9 +1015,9 @@ static void populate_aviutl_edit_handle(uint8_t *eh, EDITP *ep, const char *abs_
     int frame_n, frame, select_s = 0, select_e = 0;
     int audio_rate, audio_ch;
     BOOL has_audio;
-    uint32_t rgb_stride, rgb_img_sz, yc_img_sz, avg_bps;
-    uint16_t block_align;
-    uint8_t *src_blk;
+    uint32_t rgb_stride, rgb_img_sz;
+    int src_count, s;
+    const char *src0_path;
 
     editp_get_dimensions(ep, &w, &h, &max_w, &max_h);
     editp_get_fps(ep, &fps_rate, &fps_scale);
@@ -861,9 +1049,6 @@ static void populate_aviutl_edit_handle(uint8_t *eh, EDITP *ep, const char *abs_
 
     rgb_stride = (uint32_t)((w * 3 + 3) & ~3);
     rgb_img_sz = rgb_stride * (uint32_t)h;
-    yc_img_sz = (uint32_t)w * (uint32_t)h * 6u;
-    block_align = (uint16_t)(audio_ch * 2);
-    avg_bps = (uint32_t)audio_rate * (uint32_t)block_align;
 
     // prefix (+0x000 .. +0x20B) + project_name (+0x20C)
     wr_u32(eh + 0x000000u, 1u);
@@ -893,59 +1078,39 @@ static void populate_aviutl_edit_handle(uint8_t *eh, EDITP *ep, const char *abs_
     wr_i32(eh + 0x0003B4u, h);
 
     // active SOURCE_FILE_INFO block (+0x3C0 .. +0xC777, size 0xC3B8)
-    src_blk = eh + 0x0003C0u;
-    wr_u32(src_blk + 0x0000u, has_audio ? 0x07u : 0x03u);
-    wr_i32(src_blk + 0x0004u, w);
-    wr_i32(src_blk + 0x0008u, h);
-    wr_i32(src_blk + 0x000Cu, frame_n);
+    fill_source_file_info_block(eh + 0x0003C0u, w, h, frame_n,
+                                fps_rate, fps_scale, audio_rate, audio_ch, has_audio, -1);
 
-    // YC48 BITMAPINFOHEADER @ src_blk + 0x0010 (+0x3D0)
-    wr_u32(src_blk + 0x0010u, 40u);
-    wr_i32(src_blk + 0x0014u, w);
-    wr_i32(src_blk + 0x0018u, h);
-    wr_u16(src_blk + 0x001Cu, 1u);
-    wr_u16(src_blk + 0x001Eu, 48u);
-    wr_u32(src_blk + 0x0020u, FOURCC_YC48);
-    wr_u32(src_blk + 0x0024u, yc_img_sz);
-
-    // PCM16 WAVEFORMATEX @ src_blk + 0x0038 (+0x3F8)
-    wr_u16(src_blk + 0x0038u, 1u);
-    wr_u16(src_blk + 0x003Au, (uint16_t)audio_ch);
-    wr_u32(src_blk + 0x003Cu, (uint32_t)audio_rate);
-    wr_u32(src_blk + 0x0040u, avg_bps);
-    wr_u16(src_blk + 0x0044u, block_align);
-    wr_u16(src_blk + 0x0046u, 16u);
-
-    // AVIFILEINFOA & AVISTREAMINFOA fields
-    wr_u32(src_blk + 0x0050u, 3u);
-    wr_i32(src_blk + 0x0054u, fps_rate);
-    wr_i32(src_blk + 0x0058u, fps_scale);
-    wr_i32(src_blk + 0x005Cu, 1);
-
-    wr_u32(src_blk + 0x0094u, FOURCC_VIDS);
-    wr_u32(src_blk + 0x0098u, FOURCC_YC48);
-    wr_i32(src_blk + 0x00A8u, fps_scale); // +0x468: video_scale
-    wr_i32(src_blk + 0x00ACu, fps_rate);  // +0x46C: video_rate
-    wr_i32(src_blk + 0x00B4u, frame_n);
-
-    wr_u32(src_blk + 0x0120u, FOURCC_AUDS);
-    wr_i32(src_blk + 0x0134u, (int32_t)block_align);
-    wr_u32(src_blk + 0x0138u, avg_bps);
-    wr_u32(src_blk + 0x0140u, 0x7FFFFFFFu);
-    wr_i32(src_blk + 0x0150u, (int32_t)block_align);
-
-    // embedded format copies inside SOURCE_FILE_INFO
-    wr_u32(src_blk + 0x01ACu, 40u);
-    memcpy(src_blk + 0x01B0u, src_blk + 0x0010u, 40u);
-    wr_u32(src_blk + 0x21ACu, 40u);
-    memcpy(src_blk + 0x21B0u, src_blk + 0x0038u, 18u);
-    wr_i32(src_blk + 0xC398u, -1);
-    wr_i32(src_blk + 0xC39Cu, 1204);
-
-    // mirror source slot[0] at +0x26E98 (filepath[260] + 0xC3B8 SOURCE_FILE_INFO)
-    lstrcpynA((char *)(eh + 0x026E98u), editp_get_edit_path(ep), 260);
-    memcpy(eh + 0x026E98u + 0x0104u, src_blk, 0xC3B8u);
+    // mirror source slots[0..N-1] at +0x26E98 + slot * 0xC4BC
+    src0_path = editp_get_source_path(ep, 0);
+    lstrcpynA((char *)(eh + 0x026E98u),
+              (src0_path && src0_path[0]) ? src0_path : editp_get_edit_path(ep), 260);
+    memcpy(eh + 0x026E98u + 0x0104u, eh + 0x0003C0u, 0xC3B8u);
     wr_i32(eh + 0x026E98u + 0x0104u + 0xC398u, 0);
+
+    src_count = editp_get_source_count(ep);
+    for (s = 1; s < src_count && s < EDITP_MAX_SOURCES; s++)
+    {
+        const char *spath = editp_get_source_path(ep, s);
+        FILE_INFO sfi;
+        uint8_t *slot_base = eh + 0x026E98u + (size_t)s * 0xC4BCu;
+        if (!spath || !spath[0])
+            continue;
+        lstrcpynA((char *)slot_base, spath, 260);
+        if (editp_get_source_file_info(ep, &sfi, s))
+        {
+            fill_source_file_info_block(slot_base + 0x0104u,
+                                        sfi.w > 0 ? sfi.w : w,
+                                        sfi.h > 0 ? sfi.h : h,
+                                        sfi.frame_n > 0 ? sfi.frame_n : 1,
+                                        sfi.video_rate > 0 ? sfi.video_rate : fps_rate,
+                                        sfi.video_scale > 0 ? sfi.video_scale : fps_scale,
+                                        sfi.audio_rate > 0 ? sfi.audio_rate : audio_rate,
+                                        sfi.audio_ch > 0 ? sfi.audio_ch : audio_ch,
+                                        (sfi.flag & FILE_INFO_FLAG_AUDIO) != 0,
+                                        s);
+        }
+    }
 }
 
 BOOL aup_save_local(const char *aup_path, EDITP *ep)
@@ -954,10 +1119,13 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
     HANDLE hFile = INVALID_HANDLE_VALUE;
     AupWriter wr;
     uint8_t *eh = NULL;
+    uint8_t *u32_vid = NULL;
+    uint8_t *u32_aud = NULL;
     uint8_t *u32_zeros = NULL;
-    uint8_t *u32_seq = NULL;
+    uint8_t *u8_inter = NULL;
+    uint8_t *u8_telecine = NULL;
     uint8_t *u8_status = NULL;
-    uint8_t *u8_key = NULL;
+    uint8_t *u8_config = NULL;
     uint8_t *u8_zeros = NULL;
     uint8_t *flt_buf = NULL;
     size_t flt_cap = 0;
@@ -981,12 +1149,16 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
         frame_n = 1;
 
     eh = (uint8_t *)calloc(1, (size_t)AUP_EDIT_HANDLE_SIZE);
+    u32_vid = (uint8_t *)malloc((size_t)frame_n * 4u);
+    u32_aud = (uint8_t *)malloc((size_t)frame_n * 4u);
     u32_zeros = (uint8_t *)calloc((size_t)frame_n, 4u);
-    u32_seq = (uint8_t *)malloc((size_t)frame_n * 4u);
+    u8_inter = (uint8_t *)calloc((size_t)frame_n, 1u);
+    u8_telecine = (uint8_t *)malloc((size_t)frame_n);
     u8_status = (uint8_t *)calloc((size_t)frame_n, 1u);
-    u8_key = (uint8_t *)malloc((size_t)frame_n);
+    u8_config = (uint8_t *)calloc((size_t)frame_n, 1u);
     u8_zeros = (uint8_t *)calloc((size_t)frame_n, 1u);
-    if (!eh || !u32_zeros || !u32_seq || !u8_status || !u8_key || !u8_zeros)
+    if (!eh || !u32_vid || !u32_aud || !u32_zeros ||
+        !u8_inter || !u8_telecine || !u8_status || !u8_config || !u8_zeros)
     {
         goto cleanup_mem;
     }
@@ -995,13 +1167,24 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
 
     for (i = 0; i < frame_n; i++)
     {
+        uint32_t vid_id = 0u, vid_f = (uint32_t)i;
+        uint32_t aud_id = 0u, aud_f = (uint32_t)i;
         BYTE st = 0;
-        wr_u32(u32_seq + (size_t)i * 4u, (uint32_t)i);
+
+        editp_get_frame_mapping(ep, i, &vid_id, &vid_f, &aud_id, &aud_f);
+        if (vid_id >= EDITP_MAX_SOURCES)
+            vid_id = 0u;
+        if (aud_id >= EDITP_MAX_SOURCES)
+            aud_id = 0u;
+
+        wr_u32(u32_vid + (size_t)i * 4u, ((vid_id & 0xFFu) << 24) | (vid_f & 0xFFFFFFu));
+        wr_u32(u32_aud + (size_t)i * 4u, ((aud_id & 0xFFu) << 24) | (aud_f & 0xFFFFFFu));
+
+        u8_inter[i] = editp_get_frame_inter(ep, i);
+        u8_telecine[i] = (uint8_t)(i % 5);
         if (editp_get_frame_status(ep, i, &st))
-        {
             u8_status[i] = st;
-        }
-        u8_key[i] = editp_is_source_keyframe(ep, i) ? 2u : 0u;
+        u8_config[i] = editp_get_frame_config(ep, i);
     }
 
     ZeroMemory(magic_buf, sizeof(magic_buf));
@@ -1034,14 +1217,14 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
 
     // per-frame table count + 10 RLE-compressed per-frame arrays (0x00424160)
     if (!aw_write_u32(&wr, (uint32_t)frame_n) ||
+        !aw_rle_write(&wr, u32_vid, (size_t)frame_n * 4u) ||
+        !aw_rle_write(&wr, u32_aud, (size_t)frame_n * 4u) ||
         !aw_rle_write(&wr, u32_zeros, (size_t)frame_n * 4u) ||
-        !aw_rle_write(&wr, u32_seq, (size_t)frame_n * 4u) ||
         !aw_rle_write(&wr, u32_zeros, (size_t)frame_n * 4u) ||
-        !aw_rle_write(&wr, u32_zeros, (size_t)frame_n * 4u) ||
+        !aw_rle_write(&wr, u8_inter, (size_t)frame_n) ||
+        !aw_rle_write(&wr, u8_telecine, (size_t)frame_n) ||
         !aw_rle_write(&wr, u8_status, (size_t)frame_n) ||
-        !aw_rle_write(&wr, u8_zeros, (size_t)frame_n) ||
-        !aw_rle_write(&wr, u8_key, (size_t)frame_n) ||
-        !aw_rle_write(&wr, u8_zeros, (size_t)frame_n) ||
+        !aw_rle_write(&wr, u8_config, (size_t)frame_n) ||
         !aw_rle_write(&wr, u8_zeros, (size_t)frame_n) ||
         !aw_rle_write(&wr, u8_zeros, (size_t)frame_n))
     {
@@ -1097,7 +1280,7 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
         dbg_aup("Saved FilterProject chunk '%s' (%d bytes)", fp->name, sz);
     }
 
-    // re-emit any preserved chunks from unloaded third-party plugins
+    // re-emit any preserved chunks from unloaded third-party / 32-bit bridged plugins
     for (i = 0; i < g_preserved_count; i++)
     {
         const PreservedFilterChunk *pc = &g_preserved[i];
@@ -1133,10 +1316,180 @@ cleanup_file:
 cleanup_mem:
     free(flt_buf);
     free(u8_zeros);
-    free(u8_key);
+    free(u8_config);
     free(u8_status);
-    free(u32_seq);
+    free(u8_telecine);
+    free(u8_inter);
     free(u32_zeros);
+    free(u32_aud);
+    free(u32_vid);
     free(eh);
+    return ok;
+}
+
+BOOL aup_harvest_unmatched_chunks(const char *aup_path)
+{
+    char abs_aup[MAX_PATH];
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    AupReader rd;
+    uint8_t *eh = NULL;
+    uint8_t *tbl_tmp = NULL;
+    uint8_t *chunk_buf = NULL;
+    size_t chunk_cap = 0;
+    char magic1[AUP_MAGIC_LEN + 1];
+    char magic2[AUP_MAGIC_LEN + 1];
+    uint32_t eh_size = 0;
+    uint32_t tbl_frames = 0;
+    int i;
+    BOOL ok = FALSE;
+
+    if (!aup_path || !aup_path[0])
+        return FALSE;
+    if (GetFullPathNameA(aup_path, MAX_PATH, abs_aup, NULL) == 0)
+        lstrcpynA(abs_aup, aup_path, MAX_PATH);
+
+    hFile = CreateFileA(abs_aup, GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return FALSE;
+    if (!ar_init(&rd, hFile))
+    {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    ZeroMemory(magic1, sizeof(magic1));
+    if (!ar_read_exact(&rd, magic1, AUP_MAGIC_LEN) ||
+        lstrcmpA(magic1, AUP_MAGIC_018) != 0 ||
+        !ar_read_u32(&rd, &eh_size) ||
+        eh_size != AUP_EDIT_HANDLE_SIZE)
+    {
+        goto cleanup;
+    }
+
+    eh = (uint8_t *)calloc(1, (size_t)eh_size);
+    if (!eh)
+        goto cleanup;
+    if (!ar_read_exact(&rd, eh, AUP_UNCOMPRESSED_PREFIX) ||
+        !ar_rle_read(&rd, eh + AUP_UNCOMPRESSED_PREFIX,
+                     (size_t)(eh_size - AUP_UNCOMPRESSED_PREFIX)))
+    {
+        goto cleanup;
+    }
+
+    if (!ar_read_u32(&rd, &tbl_frames) || tbl_frames > (uint32_t)(REAVIUTL_MAX_FRAME * 4))
+        goto cleanup;
+
+    if (tbl_frames > 0)
+    {
+        tbl_tmp = (uint8_t *)malloc((size_t)tbl_frames * 4u);
+        if (!tbl_tmp)
+            goto cleanup;
+        for (i = 0; i < 4; i++)
+        {
+            if (!ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames * 4u))
+                goto cleanup;
+        }
+        for (i = 0; i < 6; i++)
+        {
+            if (!ar_rle_read(&rd, tbl_tmp, (size_t)tbl_frames))
+                goto cleanup;
+        }
+    }
+
+    for (i = 0; i < 96; i++)
+    {
+        if (eh[0x020D18u + (size_t)i * 0x104u] != 0)
+        {
+            uint32_t blob_sz = 0;
+            if (!ar_read_u32(&rd, &blob_sz))
+                goto cleanup;
+            if (blob_sz > 0 && !ar_skip(&rd, (size_t)blob_sz))
+                goto cleanup;
+        }
+    }
+    for (i = 0; i < 256; i++)
+    {
+        if (rd_u32(eh + 0x4BBD98u + (size_t)i * 4u) != 0)
+        {
+            uint32_t blob_sz = 0;
+            if (!ar_read_u32(&rd, &blob_sz))
+                goto cleanup;
+            if (blob_sz > 0 && !ar_skip(&rd, (size_t)blob_sz))
+                goto cleanup;
+        }
+    }
+
+    ZeroMemory(magic2, sizeof(magic2));
+    if (!ar_read_exact(&rd, magic2, AUP_MAGIC_LEN) ||
+        lstrcmpA(magic2, AUP_MAGIC_018) != 0)
+    {
+        goto cleanup;
+    }
+
+    for (;;)
+    {
+        char fp_magic[AUP_FILTER_MAGIC_LEN + 1];
+        char flt_name[512];
+        uint32_t name_len = 0;
+        uint32_t data_size = 0;
+        size_t got_hdr;
+        int fcount, fi;
+        BOOL native_saved = FALSE;
+
+        ZeroMemory(fp_magic, sizeof(fp_magic));
+        got_hdr = ar_read_some(&rd, fp_magic, AUP_FILTER_MAGIC_LEN);
+        if (got_hdr == 0)
+            break;
+        if (got_hdr != AUP_FILTER_MAGIC_LEN || lstrcmpA(fp_magic, AUP_FILTER_MAGIC) != 0)
+            break;
+
+        if (!ar_read_u32(&rd, &name_len) || name_len == 0 || name_len >= sizeof(flt_name))
+            goto cleanup;
+        if (!ar_read_exact(&rd, flt_name, (size_t)name_len))
+            goto cleanup;
+        flt_name[name_len - 1] = '\0';
+
+        if (!ar_read_u32(&rd, &data_size) || data_size > AUP_MAX_CHUNK_BYTES)
+            goto cleanup;
+        if ((size_t)data_size > chunk_cap || !chunk_buf)
+        {
+            size_t new_cap = (data_size > 0x100000u) ? (size_t)data_size : 0x100000u;
+            uint8_t *nb = (uint8_t *)realloc(chunk_buf, new_cap);
+            if (!nb)
+                goto cleanup;
+            chunk_buf = nb;
+            chunk_cap = new_cap;
+        }
+        if (data_size > 0)
+        {
+            memset(chunk_buf, 0, (size_t)data_size);
+            if (!ar_rle_read(&rd, chunk_buf, (size_t)data_size))
+                goto cleanup;
+        }
+
+        fcount = plugin_manager_get_count();
+        for (fi = 0; fi < fcount; fi++)
+        {
+            FILTER *fp = plugin_manager_get_filter(fi);
+            if (fp && fp->name && fp->func_project_save && lstrcmpA(fp->name, flt_name) == 0)
+            {
+                native_saved = TRUE;
+                break;
+            }
+        }
+        if (!native_saved)
+        {
+            preserve_unmatched_chunk(flt_name, chunk_buf, data_size);
+        }
+    }
+    ok = TRUE;
+
+cleanup:
+    free(chunk_buf);
+    free(tbl_tmp);
+    free(eh);
+    ar_free(&rd);
+    CloseHandle(hFile);
     return ok;
 }

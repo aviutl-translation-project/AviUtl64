@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include "preview.h"
 #include "i18n.h"
 #include "aviutl_dlg.h"
@@ -1266,10 +1267,151 @@ static BOOL confirm_discard_current_edit(HWND hwnd)
                            MB_OKCANCEL | MB_ICONQUESTION) == IDOK;
 }
 
-static BOOL open_media_or_exo_ex(HWND hwnd, const char *path, BOOL force_project_aup)
+typedef struct LoadOptionHookCtx
+{
+    BOOL is_append;
+    EditpLoadOptions opts;
+} LoadOptionHookCtx;
+
+static void parse_fps_spec(const char *s, int *out_rate, int *out_scale)
+{
+    double v;
+    if (!s || !s[0] || !out_rate || !out_scale)
+        return;
+    v = atof(s);
+    if (v <= 0.0)
+        return;
+    if (fabs(v - 29.97) < 0.02)
+    {
+        *out_rate = 30000;
+        *out_scale = 1001;
+    }
+    else if (fabs(v - 23.976) < 0.02)
+    {
+        *out_rate = 24000;
+        *out_scale = 1001;
+    }
+    else if (fabs(v - 59.94) < 0.02)
+    {
+        *out_rate = 60000;
+        *out_scale = 1001;
+    }
+    else if (fabs(v - 119.88) < 0.02)
+    {
+        *out_rate = 120000;
+        *out_scale = 1001;
+    }
+    else
+    {
+        int r1000 = (int)(v * 1000.0 + 0.5);
+        if (r1000 > 0)
+        {
+            if ((r1000 % 1000) == 0)
+            {
+                *out_rate = r1000 / 1000;
+                *out_scale = 1;
+            }
+            else
+            {
+                *out_rate = r1000;
+                *out_scale = 1000;
+            }
+        }
+    }
+}
+
+static UINT_PTR CALLBACK LoadOptionHookProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)wp;
+    if (msg == WM_INITDIALOG)
+    {
+        OPENFILENAMEA *ofn = (OPENFILENAMEA *)lp;
+        LoadOptionHookCtx *ctx = ofn ? (LoadOptionHookCtx *)ofn->lCustData : NULL;
+        HWND hCombo = GetDlgItem(hdlg, 32500);
+        HWND hIntoSel = GetDlgItem(hdlg, 32203);
+        char ini[MAX_PATH], fpslist[260];
+
+        SetWindowLongPtrA(hdlg, GWLP_USERDATA, (LONG_PTR)ctx);
+        if (hIntoSel)
+        {
+            EnableWindow(hIntoSel, (ctx && ctx->is_append) ? TRUE : FALSE);
+        }
+        if (hCombo)
+        {
+            const wchar_t *no_conv = i18n_get_wstr(33);
+            char *p;
+            SendMessageW(hCombo, CB_ADDSTRING, 0,
+                         (LPARAM)((no_conv && no_conv[0]) ? no_conv : L"No fps change"));
+
+            get_aviutl_ini_path(ini, sizeof(ini));
+            GetPrivateProfileStringA("system", "fpslist",
+                                     "29.97,23.976,24,15,10", fpslist, sizeof(fpslist), ini);
+            p = fpslist;
+            while (*p)
+            {
+                char item[64];
+                wchar_t witem[96];
+                int k = 0;
+                while (*p == ' ' || *p == ',')
+                    p++;
+                while (*p && *p != ',' && k + 1 < (int)sizeof(item))
+                    item[k++] = *p++;
+                item[k] = '\0';
+                if (k > 0)
+                {
+                    wsprintfW(witem, L"%Sfps", item);
+                    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)witem);
+                }
+            }
+            SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
+        }
+        return TRUE;
+    }
+    if (msg == WM_NOTIFY && lp)
+    {
+        NMHDR *nm = (NMHDR *)lp;
+        if (nm->code == CDN_FILEOK)
+        {
+            LoadOptionHookCtx *ctx = (LoadOptionHookCtx *)GetWindowLongPtrA(hdlg, GWLP_USERDATA);
+            if (ctx)
+            {
+                HWND hCombo = GetDlgItem(hdlg, 32500);
+                ctx->opts.seq_avi = (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED);
+                ctx->opts.fps_adjust = (IsDlgButtonChecked(hdlg, 32202) == BST_CHECKED);
+                ctx->opts.load_60fps = (IsDlgButtonChecked(hdlg, 32200) == BST_CHECKED);
+                ctx->opts.into_selection = ctx->is_append &&
+                                           (IsDlgButtonChecked(hdlg, 32203) == BST_CHECKED);
+                ctx->opts.fps_rate = 0;
+                ctx->opts.fps_scale = 0;
+                if (hCombo)
+                {
+                    int sel = (int)SendMessageA(hCombo, CB_GETCURSEL, 0, 0);
+                    char txt[96] = {0};
+                    if (sel > 0)
+                    {
+                        SendMessageA(hCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)txt);
+                        parse_fps_spec(txt, &ctx->opts.fps_rate, &ctx->opts.fps_scale);
+                    }
+                    else
+                    {
+                        GetWindowTextA(hCombo, txt, sizeof(txt));
+                        if (txt[0] >= '0' && txt[0] <= '9')
+                            parse_fps_spec(txt, &ctx->opts.fps_rate, &ctx->opts.fps_scale);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static BOOL open_media_or_exo_with_opts(HWND hwnd, const char *path, BOOL force_project_aup,
+                                        const EditpLoadOptions *in_opts)
 {
     const char *ext;
     BOOL treat_as_aup;
+    EditpLoadOptions opts;
+    char ini[MAX_PATH];
 
     if (!g_editp || !path || !path[0])
         return FALSE;
@@ -1319,10 +1461,34 @@ static BOOL open_media_or_exo_ex(HWND hwnd, const char *path, BOOL force_project
         return TRUE;
     }
 
-    if (!editp_open_video(g_editp, path))
+    ZeroMemory(&opts, sizeof(opts));
+    if (in_opts)
+        opts = *in_opts;
+    get_aviutl_ini_path(ini, sizeof(ini));
+    if (!opts.fps_adjust && GetPrivateProfileIntA("system", "loadfpsadjust", 0, ini) != 0)
+    {
+        opts.fps_adjust = TRUE;
+    }
+
+    if (editp_is_editing(g_editp))
+    {
+        plugin_manager_notify_file_close(g_editp);
+    }
+    if (!editp_open_video_ex(g_editp, path, &opts))
     {
         aviutl_msgbox_w(hwnd, i18n_get_wstr(1038), L"AviUtl", MB_OK | MB_ICONWARNING);
         return FALSE;
+    }
+    if (opts.fps_rate <= 0 && GetPrivateProfileIntA("system", "load30fps", 0, ini) != 0)
+    {
+        int r = 0, sc = 0;
+        editp_get_fps(g_editp, &r, &sc);
+        if (r > 0 && sc > 0)
+        {
+            double fps = (double)r / (double)sc;
+            if (fps > 29.90 && fps < 30.00 && !(r == 30000 && sc == 1001))
+                editp_set_fps(g_editp, 30000, 1001);
+        }
     }
 
     g_last_auto_w = 0;
@@ -1334,41 +1500,45 @@ static BOOL open_media_or_exo_ex(HWND hwnd, const char *path, BOOL force_project
     return TRUE;
 }
 
+static BOOL open_media_or_exo_ex(HWND hwnd, const char *path, BOOL force_project_aup)
+{
+    return open_media_or_exo_with_opts(hwnd, path, force_project_aup, NULL);
+}
+
 static BOOL open_media_or_exo(HWND hwnd, const char *path)
 {
     return open_media_or_exo_ex(hwnd, path, FALSE);
 }
 
-static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path)
+static void build_video_open_filter(char *flt_buf, int flt_cap, BOOL include_project_exo)
 {
-    OPENFILENAMEA ofn;
-    char file[MAX_PATH] = {0};
-    char flt_buf[4096];
     const char *base_flt = input_plugin_get_file_filter(0);
     int p = 0;
 
-    if (initial_path && initial_path[0])
-    {
-        lstrcpynA(file, initial_path, sizeof(file));
-    }
-
-    memset(flt_buf, 0, sizeof(flt_buf));
+    memset(flt_buf, 0, (size_t)flt_cap);
     if (base_flt && base_flt[0])
     {
         int l1 = (int)strlen(base_flt);
         int l2 = (int)strlen(base_flt + l1 + 1);
-        if (l1 > 0 && l2 > 0 && l1 + l2 + 128 < (int)sizeof(flt_buf))
+        if (l1 > 0 && l2 > 0 && l1 + l2 + 128 < flt_cap)
         {
-            p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo)", base_flt);
-            if (p > 0 && p >= 13 && flt_buf[p - 12] == ')')
+            if (include_project_exo)
             {
-                // replace trailing ')' from "VideoFile (...)" before ";*.aup;*.exo)"
-                memmove(flt_buf + p - 12, flt_buf + p - 11, 12);
-                p--;
+                p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo)", base_flt);
+                if (p > 0 && p >= 13 && flt_buf[p - 12] == ')')
+                {
+                    memmove(flt_buf + p - 12, flt_buf + p - 11, 12);
+                    p--;
+                }
+                p++;
+                p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo", base_flt + l1 + 1);
+                p++;
             }
-            p++;
-            p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo", base_flt + l1 + 1);
-            p++;
+            else
+            {
+                memcpy(flt_buf, base_flt, (size_t)(l1 + 1 + l2 + 1));
+                p = l1 + 1 + l2 + 1;
+            }
         }
     }
     if (p == 0)
@@ -1376,11 +1546,36 @@ static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path
         memcpy(flt_buf, "VideoFile (*.*)\0*.*\0", 20);
         p = 20;
     }
-    memcpy(flt_buf + p,
-           "AviUtl Project (*.aup)\0*.aup\0"
-           "ExEdit Object (*.exo)\0*.exo\0"
-           "AllFile (*.*)\0*.*\0\0",
-           76);
+    if (include_project_exo)
+    {
+        memcpy(flt_buf + p,
+               "AviUtl Project (*.aup)\0*.aup\0"
+               "ExEdit Object (*.exo)\0*.exo\0"
+               "AllFile (*.*)\0*.*\0\0",
+               76);
+    }
+    else
+    {
+        memcpy(flt_buf + p, "AllFile (*.*)\0*.*\0\0", 19);
+    }
+}
+
+static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path)
+{
+    OPENFILENAMEA ofn;
+    char file[MAX_PATH] = {0};
+    char flt_buf[4096];
+    LoadOptionHookCtx hook_ctx;
+    const DLGTEMPLATE *tmpl = i18n_load_dialog_template("LOAD_OPTION");
+
+    if (initial_path && initial_path[0])
+    {
+        lstrcpynA(file, initial_path, sizeof(file));
+    }
+
+    build_video_open_filter(flt_buf, sizeof(flt_buf), TRUE);
+    ZeroMemory(&hook_ctx, sizeof(hook_ctx));
+    hook_ctx.is_append = FALSE;
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -1389,12 +1584,73 @@ static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path
     ofn.nFilterIndex = 1;
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file);
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (tmpl)
+    {
+        ofn.hInstance = (HINSTANCE)tmpl;
+        ofn.lpfnHook = LoadOptionHookProc;
+        ofn.lCustData = (LPARAM)&hook_ctx;
+        ofn.Flags |= OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK | OFN_ENABLETEMPLATEHANDLE;
+    }
 
     if (GetOpenFileNameA(&ofn))
     {
-        open_media_or_exo_ex(owner, file, FALSE);
+        open_media_or_exo_with_opts(owner, file, FALSE, &hook_ctx.opts);
     }
+}
+
+static void reaviutl_file_append(HWND owner)
+{
+    OPENFILENAMEA ofn;
+    char file[MAX_PATH] = {0};
+    char flt_buf[4096];
+    char title_buf[128];
+    LoadOptionHookCtx hook_ctx;
+    const DLGTEMPLATE *tmpl;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+    {
+        reaviutl_file_open_with_initial(owner, NULL);
+        return;
+    }
+
+    stop_playback(owner);
+    build_video_open_filter(flt_buf, sizeof(flt_buf), FALSE);
+    ZeroMemory(&hook_ctx, sizeof(hook_ctx));
+    hook_ctx.is_append = TRUE;
+    lstrcpynA(title_buf, i18n_get_str(139), sizeof(title_buf));
+    tmpl = i18n_load_dialog_template("LOAD_OPTION");
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = flt_buf;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = sizeof(file);
+    ofn.lpstrTitle = title_buf[0] ? title_buf : NULL;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (tmpl)
+    {
+        ofn.hInstance = (HINSTANCE)tmpl;
+        ofn.lpfnHook = LoadOptionHookProc;
+        ofn.lCustData = (LPARAM)&hook_ctx;
+        ofn.Flags |= OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK | OFN_ENABLETEMPLATEHANDLE;
+    }
+
+    if (!GetOpenFileNameA(&ofn))
+        return;
+
+    if (!editp_append_video_ex(g_editp, file, &hook_ctx.opts))
+    {
+        aviutl_msgbox_w(owner, i18n_get_wstr(1038), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    exfunc_invalidate_all_caches();
+    if (plugin_manager_is_bridged())
+        plugin_bridge_invalidate_caches();
+    plugin_manager_notify_update(g_editp);
+    refresh_current_frame(owner);
 }
 
 void reaviutl_file_open(HWND owner)
@@ -1684,6 +1940,27 @@ static void copy_frame_number_to_clipboard(HWND hwnd)
     CloseClipboard();
 }
 
+static void copy_current_frame_yc48(HWND hwnd)
+{
+    int org_w = 0, org_h = 0, w = 0, h = 0, mw = 0, mh = 0, cur;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    cur = editp_get_frame(g_editp);
+    editp_load_frame(g_editp, cur);
+    editp_get_dimensions(g_editp, &w, &h, &mw, &mh);
+    editp_get_org_dimensions(g_editp, &org_w, &org_h);
+    if (org_w <= 0)
+        org_w = w;
+    if (org_h <= 0)
+        org_h = h;
+    if (org_w > 0 && org_h > 0 && mw >= org_w)
+    {
+        editp_copy_frame_image(g_editp, editp_get_ycp_edit(g_editp), mw, org_w, org_h);
+    }
+    refresh_current_frame(hwnd);
+}
+
 static void toggle_frame_edit_flag(HWND hwnd, BYTE mask)
 {
     BYTE st = 0;
@@ -1694,6 +1971,7 @@ static void toggle_frame_edit_flag(HWND hwnd, BYTE mask)
     editp_get_frame_status(g_editp, cur, &st);
     st ^= mask;
     editp_set_frame_status(g_editp, cur, st);
+    plugin_manager_notify_update(g_editp);
     refresh_current_frame(hwnd);
 }
 
@@ -1721,6 +1999,191 @@ static void seek_matching_frame(HWND hwnd, int dir, BOOL match_mark)
             return;
         }
     }
+}
+
+static void seek_skipping_deleted_frames(HWND hwnd, int dir)
+{
+    int cur, fn, f;
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    cur = editp_get_frame(g_editp);
+    fn = editp_get_frame_n(g_editp);
+    for (f = cur + dir; f >= 0 && f < fn; f += dir)
+    {
+        BYTE st = 0;
+        editp_get_frame_status(g_editp, f, &st);
+        if (!(st & EDIT_FRAME_EDIT_FLAG_DELFRAME))
+        {
+            seek_to_frame_ex(hwnd, f, TRUE);
+            return;
+        }
+    }
+    seek_to_frame_ex(hwnd, (dir > 0) ? (fn - 1) : 0, TRUE);
+}
+
+static void seek_frame_discontinuity(HWND hwnd, int dir)
+{
+    int cur, fn, f;
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    cur = editp_get_frame(g_editp);
+    fn = editp_get_frame_n(g_editp);
+    for (f = cur + dir; f > 0 && f < fn; f += dir)
+    {
+        if (editp_is_frame_discontinuity(g_editp, f))
+        {
+            seek_to_frame_ex(hwnd, f, TRUE);
+            return;
+        }
+    }
+    seek_to_frame_ex(hwnd, (dir > 0) ? (fn - 1) : 0, TRUE);
+}
+
+static void run_inter_dialog(HWND hwnd)
+{
+    AviUtlDlgState st;
+    const wchar_t *items[7];
+    wchar_t wbuf[6][96];
+    static const UINT str_ids[6] = {23, 24, 17, 18, 19, 21};
+    int i, s = 0, e = 0, cur;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+
+    for (i = 0; i < 6; i++)
+    {
+        lstrcpynW(wbuf[i], i18n_get_wstr(str_ids[i]), 96);
+        items[i] = wbuf[i];
+    }
+    items[6] = NULL;
+
+    cur = editp_get_frame(g_editp);
+    aviutl_dlg_init(&st);
+    st.combo_items[0] = items;
+    st.combo_sel[0] = (int)editp_get_frame_inter(g_editp, cur);
+    if (st.combo_sel[0] < 0 || st.combo_sel[0] > 5)
+        st.combo_sel[0] = 0;
+
+    if (aviutl_dlg_run(hwnd, "INTER", &st) != IDOK)
+        return;
+    if (st.combo_sel[0] < 0 || st.combo_sel[0] > 5)
+        return;
+
+    editp_get_select_frame(g_editp, &s, &e);
+    if (s <= e)
+    {
+        editp_push_undo(g_editp);
+        for (i = s; i <= e; i++)
+        {
+            editp_set_frame_inter(g_editp, i, (BYTE)st.combo_sel[0]);
+        }
+        exfunc_invalidate_all_caches();
+        if (plugin_manager_is_bridged())
+            plugin_bridge_invalidate_caches();
+        plugin_manager_notify_update(g_editp);
+        refresh_current_frame(hwnd);
+    }
+}
+
+static void import_keyframe_list(HWND hwnd)
+{
+    OPENFILENAMEA ofn;
+    char file[MAX_PATH] = {0};
+    static const char filter[] = "Text File (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    FILE *fp;
+    char line[256];
+    int sf, fn;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = sizeof(file);
+    ofn.lpstrDefExt = "txt";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&ofn))
+        return;
+
+    fp = fopen(file, "r");
+    if (!fp)
+    {
+        aviutl_msgbox_w(hwnd, i18n_get_wstr(1000), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    editp_push_undo(g_editp);
+    sf = preview_get_sys_config() ? preview_get_sys_config()->startframe : 1;
+    fn = editp_get_frame_n(g_editp);
+    while (fgets(line, sizeof(line), fp))
+    {
+        char *p = line;
+        char *endp = NULL;
+        long v;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p < '0' || *p > '9')
+            continue;
+        v = strtol(p, &endp, 10) - sf;
+        if (endp != p && v >= 0 && v < fn)
+        {
+            BYTE st = 0;
+            editp_get_frame_status(g_editp, (int)v, &st);
+            editp_set_frame_status(g_editp, (int)v, (BYTE)(st | EDIT_FRAME_EDIT_FLAG_KEYFRAME));
+        }
+    }
+    fclose(fp);
+    plugin_manager_notify_update(g_editp);
+    refresh_current_frame(hwnd);
+}
+
+static void export_keyframe_list(HWND hwnd)
+{
+    OPENFILENAMEA ofn;
+    char file[MAX_PATH] = {0};
+    static const char filter[] = "Text File (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    FILE *fp;
+    int sf, fn, f;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = sizeof(file);
+    ofn.lpstrDefExt = "txt";
+    ofn.Flags = OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
+                ((preview_get_sys_config()->overwritecheck == 0) ? OFN_OVERWRITEPROMPT : 0);
+    if (!GetSaveFileNameA(&ofn))
+        return;
+
+    fp = fopen(file, "w");
+    if (!fp)
+    {
+        aviutl_msgbox_w(hwnd, i18n_get_wstr(1002), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    sf = preview_get_sys_config() ? preview_get_sys_config()->startframe : 1;
+    fn = editp_get_frame_n(g_editp);
+    for (f = 0; f < fn; f++)
+    {
+        BYTE st = 0;
+        editp_get_frame_status(g_editp, f, &st);
+        if ((st & EDIT_FRAME_EDIT_FLAG_KEYFRAME) || editp_is_source_keyframe(g_editp, f))
+        {
+            fprintf(fp, "%d\n", f + sf);
+        }
+    }
+    fclose(fp);
 }
 
 static void reset_window_positions(HWND hwnd)
@@ -2453,6 +2916,68 @@ static void show_current_file_info(HWND owner)
     aviutl_msgbox_w(owner, buf, i18n_get_wstr(1028), MB_OK | MB_ICONINFORMATION);
 }
 
+static void sync_edit_menu_states(HMENU hMenu)
+{
+    BOOL active_edit = (g_editp && editp_is_editing(g_editp) && !editp_is_saving(g_editp));
+    static const UINT edit_only_ids[] = {
+        5157, 5100, 5168, 1023, 1024, 1003, 1062, 5167, 1054,
+        1020, 5117, 1026, 5123, 1070, 5131, 5115, 5184, 5143, 5101,
+        5147, 5112, 5109, 5126, 5125, 5129, 5130, 5132, 5156, 5398,
+        5196, 5197, 5198, 5199, 5200, 5201,
+        5206, 5207, 5208, 5209, 5210, 5211, 5212, 5213, 5214, 5215};
+    int k;
+
+    if (!hMenu)
+        return;
+
+    for (k = 0; k < (int)(sizeof(edit_only_ids) / sizeof(edit_only_ids[0])); k++)
+    {
+        EnableMenuItem(hMenu, edit_only_ids[k],
+                       MF_BYCOMMAND | (active_edit ? MF_ENABLED : (MF_GRAYED | MF_DISABLED)));
+    }
+    EnableMenuItem(hMenu, 1009,
+                   MF_BYCOMMAND | ((g_editp && editp_is_saving(g_editp)) ? MF_ENABLED : (MF_GRAYED | MF_DISABLED)));
+
+    if (!active_edit)
+        return;
+
+    if (!editp_can_undo(g_editp))
+        EnableMenuItem(hMenu, 5147, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+    if (!editp_has_copied_frame_image(g_editp))
+    {
+        EnableMenuItem(hMenu, 5117, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+        EnableMenuItem(hMenu, 5184, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+    }
+    if (!IsClipboardFormatAvailable(CF_DIB))
+    {
+        EnableMenuItem(hMenu, 5123, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+    }
+
+    {
+        int cur = editp_get_frame(g_editp);
+        BYTE st = 0;
+        BYTE inter = editp_get_frame_inter(g_editp, cur);
+        BYTE cfg = editp_get_frame_config(g_editp, cur);
+
+        editp_get_frame_status(g_editp, cur, &st);
+        CheckMenuItem(hMenu, 5129, MF_BYCOMMAND | ((st & EDIT_FRAME_EDIT_FLAG_KEYFRAME) ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(hMenu, 5130, MF_BYCOMMAND | ((st & EDIT_FRAME_EDIT_FLAG_MARKFRAME) ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(hMenu, 5132, MF_BYCOMMAND | ((st & EDIT_FRAME_EDIT_FLAG_DELFRAME) ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(hMenu, 5156, MF_BYCOMMAND | ((st & EDIT_FRAME_EDIT_FLAG_NULLFRAME) ? MF_CHECKED : MF_UNCHECKED));
+
+        for (k = 0; k < 6; k++)
+        {
+            CheckMenuItem(hMenu, (UINT)(5196 + k),
+                          MF_BYCOMMAND | ((inter == (BYTE)k) ? MF_CHECKED : MF_UNCHECKED));
+        }
+        for (k = 0; k < 10; k++)
+        {
+            CheckMenuItem(hMenu, (UINT)(5206 + k),
+                          MF_BYCOMMAND | ((cfg == (BYTE)k) ? MF_CHECKED : MF_UNCHECKED));
+        }
+    }
+}
+
 // show aviutl right-click "CONTEXT" popup menu (0x00412300)
 static void show_preview_context_menu(HWND hwnd, int screen_x, int screen_y)
 {
@@ -2465,28 +2990,8 @@ static void show_preview_context_menu(HWND hwnd, int screen_x, int screen_y)
     hSub = GetSubMenu(hMenu, 0);
     if (hSub)
     {
-        BOOL active_edit = (g_editp && editp_is_editing(g_editp) && !editp_is_saving(g_editp));
         CheckMenuRadioItem(hSub, 9200, 9206, 9200 + preview_get_zoom(), MF_BYCOMMAND);
-
-        if (!active_edit)
-        {
-            static const UINT gray_ids[] = {
-                1020, 5117, 1026, 5123, 1070, 5101, 5143, 5112, 5130, 5147};
-            int k;
-            for (k = 0; k < (int)(sizeof(gray_ids) / sizeof(gray_ids[0])); k++)
-            {
-                EnableMenuItem(hSub, gray_ids[k], MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
-            }
-        }
-        else
-        {
-            BYTE st = 0;
-            if (editp_get_frame_status(g_editp, editp_get_frame(g_editp), &st) &&
-                (st & EDIT_FRAME_EDIT_FLAG_MARKFRAME))
-            {
-                CheckMenuItem(hSub, 5130, MF_BYCOMMAND | MF_CHECKED);
-            }
-        }
+        sync_edit_menu_states(hSub);
 
         if (screen_x == -1 && screen_y == -1)
         {
@@ -2908,6 +3413,13 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_INITMENUPOPUP:
+        if (!HIWORD(lp))
+        {
+            sync_edit_menu_states((HMENU)wp);
+        }
+        break;
+
     case WM_COMMAND:
     {
         int id = LOWORD(wp);
@@ -2981,8 +3493,17 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 5097: // file -> Open (Ctrl+O)
             reaviutl_file_open(hwnd);
             return 0;
+        case 5100: // file -> Append Load (追加読み込み)
+            reaviutl_file_append(hwnd);
+            return 0;
         case 5168: // file -> Load Audio (音声読み込み)
             reaviutl_audio_open(hwnd);
+            return 0;
+        case 5167: // file -> Import -> Keyframe List
+            import_keyframe_list(hwnd);
+            return 0;
+        case 1054: // file -> Export -> Keyframe List
+            export_keyframe_list(hwnd);
             return 0;
         case 1003: // file -> AVI Output (Ctrl+S)
             stop_playback(hwnd);
@@ -3094,14 +3615,24 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
 
         case 9001: // '<' Prev frame
-        case 5141:
             if (g_editp)
                 seek_to_frame_ex(hwnd, editp_get_frame(g_editp) - 1, TRUE);
             return 0;
         case 9002: // '>' Next frame
-        case 5142:
             if (g_editp)
                 seek_to_frame_ex(hwnd, editp_get_frame(g_editp) + 1, TRUE);
+            return 0;
+        case 5141: // up: Prev frame skipping deleted frames
+            seek_skipping_deleted_frames(hwnd, -1);
+            return 0;
+        case 5142: // down: Next frame skipping deleted frames
+            seek_skipping_deleted_frames(hwnd, +1);
+            return 0;
+        case 5170: // next frame discontinuity
+            seek_frame_discontinuity(hwnd, +1);
+            return 0;
+        case 5171: // prev frame discontinuity
+            seek_frame_discontinuity(hwnd, -1);
             return 0;
         case 9003: // '|->' Set selection end
         case 5111: // ']' Set selection end
@@ -3237,8 +3768,113 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             seek_matching_frame(hwnd, -1, TRUE);
             return 0;
 
-        case 1020: // copy filtered output image (Ctrl+C)
-        case 1070:
+        case 5101: // delete selection range (Del)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                int s = 0, e = 0;
+                stop_playback(hwnd);
+                editp_get_select_frame(g_editp, &s, &e);
+                if (editp_delete_range(g_editp, s, e))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5143: // trim/Cut to selection range
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                int s = 0, e = 0;
+                stop_playback(hwnd);
+                editp_get_select_frame(g_editp, &s, &e);
+                if (editp_trim_to_range(g_editp, s, e))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5147: // undo (Ctrl+Z)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                stop_playback(hwnd);
+                if (editp_undo(g_editp))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5125: // specify selection deinterlace (INTER dialog)
+            run_inter_dialog(hwnd);
+            return 0;
+        case 5196:
+        case 5197:
+        case 5198:
+        case 5199:
+        case 5200:
+        case 5201: // current frame deinterlace mode (Numpad 0..5)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                editp_push_undo(g_editp);
+                editp_set_frame_inter(g_editp, editp_get_frame(g_editp), (BYTE)(id - 5196));
+                exfunc_invalidate_all_caches();
+                if (plugin_manager_is_bridged())
+                    plugin_bridge_invalidate_caches();
+                plugin_manager_notify_update(g_editp);
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+
+        case 1020: // copy current frame YC48 image (Ctrl+C)
+            copy_current_frame_yc48(hwnd);
+            return 0;
+        case 5117: // paste copied YC48 image into current frame (Ctrl+V)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                int cur = editp_get_frame(g_editp);
+                if (editp_paste_frame_image(g_editp, cur, cur))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5184: // paste copied YC48 image into selection range
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                int s = 0, e = 0;
+                editp_get_select_frame(g_editp, &s, &e);
+                if (editp_paste_frame_image(g_editp, s, e))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5123: // paste Windows CF_DIB clipboard into current frame
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                if (editp_paste_clipboard_dib(hwnd, g_editp, editp_get_frame(g_editp), TRUE))
+                {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 1070: // copy filtered output image to clipboard
             copy_current_frame_to_clipboard(hwnd, FALSE);
             return 0;
         case 1026: // copy raw source frame to clipboard

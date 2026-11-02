@@ -511,28 +511,31 @@ static int __cdecl impl_set_frame_n(void *editp, int n)
 // +0x02c
 static BOOL __cdecl impl_copy_frame(void *editp, int d, int s)
 {
-    (void)editp;
-    (void)d;
-    (void)s;
-    return FALSE;
+    EDITP *ep = resolve_ep(editp);
+    BOOL ok = editp_copy_frame(ep, d, s);
+    if (ok && g_on_state_changed)
+        g_on_state_changed(ep);
+    return ok;
 }
 
 // +0x030
 static BOOL __cdecl impl_copy_video(void *editp, int d, int s)
 {
-    (void)editp;
-    (void)d;
-    (void)s;
-    return FALSE;
+    EDITP *ep = resolve_ep(editp);
+    BOOL ok = editp_copy_video(ep, d, s);
+    if (ok && g_on_state_changed)
+        g_on_state_changed(ep);
+    return ok;
 }
 
 // +0x034
 static BOOL __cdecl impl_copy_audio(void *editp, int d, int s)
 {
-    (void)editp;
-    (void)d;
-    (void)s;
-    return FALSE;
+    EDITP *ep = resolve_ep(editp);
+    BOOL ok = editp_copy_audio(ep, d, s);
+    if (ok && g_on_state_changed)
+        g_on_state_changed(ep);
+    return ok;
 }
 
 // +0x038
@@ -575,10 +578,11 @@ static BOOL __cdecl impl_copy_clip(HWND hwnd, void *pixelp, int w, int h)
 // +0x03c
 static BOOL __cdecl impl_paste_clip(HWND hwnd, void *editp, int n)
 {
-    (void)hwnd;
-    (void)editp;
-    (void)n;
-    return FALSE;
+    EDITP *ep = resolve_ep(editp);
+    BOOL ok = editp_paste_clipboard_dib(hwnd, ep, n, FALSE);
+    if (ok && g_on_state_changed)
+        g_on_state_changed(ep);
+    return ok;
 }
 
 // +0x040
@@ -884,22 +888,14 @@ static BOOL __cdecl impl_ini_save_str(FILTER *fp, LPSTR key, LPSTR str)
 // +0x098
 static BOOL __cdecl impl_get_source_file_info(void *editp, FILE_INFO *fip, int source_file_id)
 {
-    (void)source_file_id;
-    return editp_get_file_info(resolve_ep(editp), fip);
+    return editp_get_source_file_info(resolve_ep(editp), fip, source_file_id);
 }
 
 // +0x09c
 static BOOL __cdecl impl_get_source_video_number(void *editp, int n,
                                                  int *source_file_id, int *source_video_number)
 {
-    EDITP *ep = resolve_ep(editp);
-    if (!ep || !editp_is_editing(ep))
-        return FALSE;
-    if (source_file_id)
-        *source_file_id = 0;
-    if (source_video_number)
-        *source_video_number = n;
-    return TRUE;
+    return editp_get_source_video_number(resolve_ep(editp), n, source_file_id, source_video_number);
 }
 
 // +0x0a0 (editp can be NULL during func_init)
@@ -1783,8 +1779,7 @@ static BYTE *__cdecl impl_get_frame_status_table(void *editp, int type)
 // +0x10c
 static BOOL __cdecl impl_set_undo(void *editp)
 {
-    (void)editp;
-    return TRUE;
+    return editp_push_undo(resolve_ep(editp));
 }
 
 // +0x110
@@ -1804,18 +1799,48 @@ static BOOL __cdecl impl_add_menu_item(FILTER *fp, LPSTR name, HWND hwnd,
 static BOOL __cdecl impl_edit_open(void *editp, LPSTR file, int flag)
 {
     EDITP *ep = resolve_ep(editp);
+    char chosen[MAX_PATH];
+    const char *target = file;
+
     dbg_info("EXFUNC edit_open('%s', flag=0x%x)", file ? file : "(null)", (unsigned)flag);
-    if (!ep || !file || !file[0])
+    if (!ep)
+        return FALSE;
+
+    if ((flag & EDIT_OPEN_FLAG_DIALOG) != 0)
+    {
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ZeroMemory(chosen, sizeof(chosen));
+        if (file && file[0])
+            lstrcpynA(chosen, file, MAX_PATH);
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = editp_get_main_hwnd(ep);
+        ofn.lpstrFilter = (flag & EDIT_OPEN_FLAG_PROJECT) != 0
+                              ? "AviUtl ProjectFile (*.aup)\0*.aup\0All Files (*.*)\0*.*\0"
+                              : "All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = chosen;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameA(&ofn))
+            return FALSE;
+        target = chosen;
+    }
+
+    if (!target || !target[0])
         return FALSE;
     if (g_on_edit_open)
     {
-        return g_on_edit_open(ep, file, flag);
+        return g_on_edit_open(ep, target, flag);
     }
     if ((flag & EDIT_OPEN_FLAG_AUDIO) != 0 && editp_is_editing(ep))
     {
-        return editp_open_audio(ep, file);
+        return editp_open_audio(ep, target);
     }
-    return editp_open_video(ep, file);
+    if ((flag & EDIT_OPEN_FLAG_ADD) != 0 && editp_is_editing(ep))
+    {
+        return editp_append_video(ep, target);
+    }
+    return editp_open_video(ep, target);
 }
 
 // +0x118

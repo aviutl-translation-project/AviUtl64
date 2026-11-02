@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "preview.h"
+#include "builtin_filters.h"
 
 #define AVIUTL_BUTTON_CLASS "AviUtlButton"
 #define BTN_EXTRA_HICON (0 * (int)sizeof(LONG_PTR))
@@ -33,6 +34,9 @@ static HICON g_icon_fwd = NULL;
 static HICON g_icon_in = NULL;
 static HICON g_icon_out = NULL;
 static HICON g_icon_del = NULL;
+static HICON g_icon_del2 = NULL;
+static HICON g_icon_mark = NULL;
+static HICON g_icon_inter[6] = {NULL};
 static HICON g_icon_play = NULL;
 static HICON g_icon_stop = NULL;
 
@@ -311,6 +315,14 @@ BOOL preview_register_classes(HINSTANCE hInst)
     g_icon_in = load_icon_24(hInst, "ICON_IN");
     g_icon_out = load_icon_24(hInst, "ICON_OUT");
     g_icon_del = load_icon_24(hInst, "ICON_DEL");
+    g_icon_del2 = load_icon_24(hInst, "ICON_DEL2");
+    g_icon_mark = load_icon_24(hInst, "ICON_MARK");
+    g_icon_inter[0] = load_icon_24(hInst, "ICON_I_NORM");
+    g_icon_inter[1] = load_icon_24(hInst, "ICON_I_REV");
+    g_icon_inter[2] = load_icon_24(hInst, "ICON_I_ODD");
+    g_icon_inter[3] = load_icon_24(hInst, "ICON_I_EVEN");
+    g_icon_inter[4] = load_icon_24(hInst, "ICON_I_MIX");
+    g_icon_inter[5] = load_icon_24(hInst, "ICON_I_AUTO");
     g_icon_play = load_icon_24(hInst, "ICON_PLAY");
     g_icon_stop = load_icon_24(hInst, "ICON_STOP");
 
@@ -1312,20 +1324,47 @@ void preview_paint(HWND hwnd, HDC hdc)
                           g_frame_bits, &g_bmi, DIB_RGB_COLORS, SRCCOPY);
         }
 
-        // corner status badges: ICON_IN, ICON_DEL, ICON_OUT (0x00461ea0)
+        // corner status badges: ICON_IN, ICON_MARK, ICON_DEL/DEL2, ICON_I_*, ICON_OUT (0x00461ea0)
         if (avail_h >= 36 && client_w >= 64)
         {
             int left_x = g_dst_x + 6;
             int top_y = g_dst_y + 6;
+            int cur_f = g_cur_ep ? editp_get_frame(g_cur_ep) : 0;
+            int sel_s = 0, sel_e = 0;
+            BYTE fst = 0;
+            BYTE finter = g_cur_ep ? editp_get_frame_inter(g_cur_ep, cur_f) : 0;
+
+            if (g_cur_ep)
+            {
+                editp_get_select_frame(g_cur_ep, &sel_s, &sel_e);
+                editp_get_frame_status(g_cur_ep, cur_f, &fst);
+            }
             if (g_preview_flags & PREVIEW_FLAG_AT_SELECT_S)
             {
                 draw_corner_badge(hdc, left_x, top_y, g_icon_in);
+                left_x += 24;
+            }
+            if (fst & EDIT_FRAME_EDIT_FLAG_MARKFRAME)
+            {
+                draw_corner_badge(hdc, left_x, top_y, g_icon_mark);
                 left_x += 24;
             }
             if ((g_preview_flags & (PREVIEW_FLAG_DELETEFRAME | PREVIEW_FLAG_AT_DELFRAME)) ==
                 (PREVIEW_FLAG_DELETEFRAME | PREVIEW_FLAG_AT_DELFRAME))
             {
                 draw_corner_badge(hdc, left_x, top_y, g_icon_del);
+                left_x += 24;
+            }
+            else if ((g_preview_flags & PREVIEW_FLAG_DELETEFRAME) &&
+                     cur_f >= sel_s &&
+                     !builtin_filters_is_framerate_kept_frame(cur_f - sel_s))
+            {
+                draw_corner_badge(hdc, left_x, top_y, g_icon_del2);
+                left_x += 24;
+            }
+            if (finter >= 1 && finter <= 5 && g_icon_inter[finter])
+            {
+                draw_corner_badge(hdc, left_x, top_y, g_icon_inter[finter]);
             }
             if (g_preview_flags & PREVIEW_FLAG_AT_SELECT_E)
             {

@@ -15,10 +15,27 @@ typedef struct EDITP_T EDITP;
 typedef struct EDITP_T EditpHandle;
 typedef struct VFWInput VFWInput;
 
+#define EDITP_MAX_SOURCES 64
+#define EDITP_MEM_SRC_BASE 0x10000u
+#define EDITP_EXT_AUDIO_ID 0xFFFFu
+
+typedef struct EditpLoadOptions
+{
+    BOOL seq_avi;        // 32201: sequential numbered AVI load
+    BOOL fps_adjust;     // 32202: sync video fps to audio duration
+    BOOL load_60fps;     // 32200: 60fps field-doubled load
+    BOOL into_selection; // 32203: load into selection (append mode)
+    int fps_rate;        // >0 for custom framerate override
+    int fps_scale;       // >0 for custom framerate override
+} EditpLoadOptions;
+
 EDITP *editp_create_idle(HWND main_hwnd);
 EDITP *editp_create(int w, int h, int frame_n, int fps_scale, int fps_rate);
 EDITP *editp_create_from_video(const char *filepath);
 BOOL editp_open_video(EDITP *ep, const char *filepath);
+BOOL editp_open_video_ex(EDITP *ep, const char *filepath, const EditpLoadOptions *opts);
+BOOL editp_append_video(EDITP *ep, const char *filepath);
+BOOL editp_append_video_ex(EDITP *ep, const char *filepath, const EditpLoadOptions *opts);
 BOOL editp_open_audio(EDITP *ep, const char *filepath);
 void editp_close_video(EDITP *ep);
 void editp_destroy(EDITP *ep);
@@ -82,5 +99,35 @@ void editp_sync_preview_state(EDITP *ep, uint32_t flags,
 BOOL editp_seek_frame_ex(EDITP *ep, int target_frame, BOOL shift_held, BOOL shift_select_cfg);
 BOOL editp_has_audio(EDITP *ep);
 BOOL editp_is_source_keyframe(EDITP *ep, int frame_num);
+
+BOOL editp_has_virtual_edits(EDITP *ep);
+int editp_get_source_count(EDITP *ep);
+const char *editp_get_source_path(EDITP *ep, int source_file_id);
+int editp_add_source_file(EDITP *ep, const char *filepath);
+BOOL editp_get_source_file_info(EDITP *ep, FILE_INFO *fi, int source_file_id);
+BOOL editp_get_source_video_number(EDITP *ep, int n, int *source_file_id, int *source_video_number);
+BOOL editp_get_frame_mapping(EDITP *ep, int n, uint32_t *vid_id, uint32_t *vid_f,
+                             uint32_t *aud_id, uint32_t *aud_f);
+BOOL editp_set_frame_mapping(EDITP *ep, int n, uint32_t vid_id, uint32_t vid_f,
+                             uint32_t aud_id, uint32_t aud_f);
+BYTE editp_get_frame_inter(EDITP *ep, int n);
+BOOL editp_set_frame_inter(EDITP *ep, int n, BYTE inter);
+BYTE editp_get_frame_config(EDITP *ep, int n);
+BOOL editp_set_frame_config(EDITP *ep, int n, BYTE cfg);
+BOOL editp_is_frame_discontinuity(EDITP *ep, int n);
+
+BOOL editp_push_undo(EDITP *ep);
+BOOL editp_can_undo(EDITP *ep);
+BOOL editp_undo(EDITP *ep);
+
+BOOL editp_delete_range(EDITP *ep, int s, int e);
+BOOL editp_trim_to_range(EDITP *ep, int s, int e);
+BOOL editp_copy_frame(EDITP *ep, int dst, int src);
+BOOL editp_copy_video(EDITP *ep, int dst, int src);
+BOOL editp_copy_audio(EDITP *ep, int dst, int src);
+BOOL editp_copy_frame_image(EDITP *ep, const PIXEL_YC *src_yc, int src_stride, int w, int h);
+BOOL editp_has_copied_frame_image(EDITP *ep);
+BOOL editp_paste_frame_image(EDITP *ep, int s, int e);
+BOOL editp_paste_clipboard_dib(HWND hwnd, EDITP *ep, int dst_frame, BOOL record_undo);
 
 #endif

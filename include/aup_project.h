@@ -18,6 +18,7 @@
 
 BOOL aup_load_local(const char *aup_path, EDITP *ep);
 BOOL aup_save_local(const char *aup_path, EDITP *ep);
+BOOL aup_harvest_unmatched_chunks(const char *aup_path);
 void aup_clear_preserved_chunks(void);
 
 #endif

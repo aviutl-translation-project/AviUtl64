@@ -238,21 +238,50 @@ static BOOL cb_add_menu_item(FILTER *fp, LPSTR name, HWND hwnd,
 
 static void cb_host_state_changed(EDITP *ep)
 {
-    (void)ep;
+    if (ep && plugin_bridge_is_active())
+    {
+        plugin_bridge_sync_to_bridge(ep);
+    }
     post_host_redraw(1);
 }
 
 static BOOL cb_host_edit_open(EDITP *ep, const char *file, int flag)
 {
+    const char *dot;
     if (!ep || !file || !file[0])
         return FALSE;
+
+    dot = strrchr(file, '.');
+    if ((flag & EDIT_OPEN_FLAG_PROJECT) != 0 ||
+        ((flag & (EDIT_OPEN_FLAG_VIDEO | EDIT_OPEN_FLAG_AUDIO | EDIT_OPEN_FLAG_ADD)) == 0 &&
+         dot && lstrcmpiA(dot, ".aup") == 0))
+    {
+        return plugin_manager_load_aup(file, ep);
+    }
     if ((flag & EDIT_OPEN_FLAG_AUDIO) != 0 && editp_is_editing(ep))
     {
         if (!editp_open_audio(ep, file))
             return FALSE;
+        if (plugin_bridge_is_active())
+            plugin_bridge_open_audio(file, NULL);
         plugin_manager_notify_update(ep);
         post_host_redraw(2);
         return TRUE;
+    }
+    if ((flag & EDIT_OPEN_FLAG_ADD) != 0 && editp_is_editing(ep))
+    {
+        if (!editp_append_video(ep, file))
+            return FALSE;
+        exfunc_invalidate_all_caches();
+        if (plugin_bridge_is_active())
+            plugin_bridge_invalidate_caches();
+        plugin_manager_notify_update(ep);
+        post_host_redraw(2);
+        return TRUE;
+    }
+    if (editp_is_editing(ep))
+    {
+        plugin_manager_notify_file_close(ep);
     }
     if (!editp_open_video(ep, file))
         return FALSE;
@@ -469,10 +498,12 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
     int order[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
     int k, cnt;
     BOOL host_loaded = FALSE;
+    BYTE cur_inter;
 
     if (!ep || !editp_is_editing(ep))
         return FALSE;
 
+    cur_inter = editp_get_frame_inter(ep, frame_num);
     cnt = plugin_manager_get_execution_order(FALSE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
     for (k = 0; k < cnt; k++)
     {
@@ -498,6 +529,7 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
                 editp_load_frame(ep, frame_num);
                 host_loaded = TRUE;
             }
+            builtin_filters_set_frame_interlace_override((int)cur_inter);
             apply_single_native_video_entry(e, ep, frame_num);
         }
         else if (plugin_bridge_is_active())
@@ -525,6 +557,11 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
                     b_run[run_n++] = nb;
                 }
             }
+            if (!host_loaded && editp_has_virtual_edits(ep))
+            {
+                editp_load_frame(ep, frame_num);
+                host_loaded = TRUE;
+            }
             if (!plugin_bridge_render_frame_subset(ep, frame_num, host_loaded, b_run, run_n))
             {
                 if (!host_loaded)
@@ -540,6 +577,7 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
         }
     }
 
+    builtin_filters_set_frame_interlace_override(0);
     if (!host_loaded)
     {
         editp_load_frame(ep, frame_num);
@@ -3067,6 +3105,8 @@ BOOL plugin_manager_import_exo(int filter_index, const char *exo_path, EDITP *ep
     return TRUE;
 }
 
+static BOOL g_suppress_bridge_file_notify = FALSE;
+
 BOOL plugin_manager_load_aup(const char *aup_path, EDITP *ep)
 {
     char abs_aup[MAX_PATH];
@@ -3081,12 +3121,14 @@ BOOL plugin_manager_load_aup(const char *aup_path, EDITP *ep)
     }
 
     if (plugin_bridge_is_active())
+        g_suppress_bridge_file_notify = TRUE;
+    ok = aup_load_local(abs_aup, target_ep);
+    g_suppress_bridge_file_notify = FALSE;
+
+    if (ok && plugin_bridge_is_active())
     {
-        ok = plugin_bridge_load_aup(abs_aup, target_ep);
-    }
-    else
-    {
-        ok = aup_load_local(abs_aup, target_ep);
+        plugin_bridge_load_aup(abs_aup, target_ep);
+        plugin_bridge_sync_to_bridge(target_ep);
     }
     if (ok)
     {
@@ -3114,7 +3156,12 @@ BOOL plugin_manager_save_aup(const char *aup_path, EDITP *ep)
 
     if (plugin_bridge_is_active())
     {
-        return plugin_bridge_save_aup(abs_aup, target_ep);
+        editp_set_project_path(target_ep, abs_aup);
+        plugin_bridge_sync_to_bridge(target_ep);
+        if (plugin_bridge_save_aup(abs_aup, NULL))
+        {
+            aup_harvest_unmatched_chunks(abs_aup);
+        }
     }
     return aup_save_local(abs_aup, target_ep);
 }
@@ -3123,7 +3170,7 @@ void plugin_manager_notify_file_open(EDITP *ep)
 {
     int i;
     exfunc_invalidate_all_caches();
-    if (plugin_bridge_is_active())
+    if (plugin_bridge_is_active() && !g_suppress_bridge_file_notify)
     {
         if (ep && editp_get_edit_path(ep)[0])
         {
@@ -3146,7 +3193,7 @@ void plugin_manager_notify_file_close(EDITP *ep)
     int i;
     exfunc_invalidate_all_caches();
     aup_clear_preserved_chunks();
-    if (plugin_bridge_is_active())
+    if (plugin_bridge_is_active() && !g_suppress_bridge_file_notify)
     {
         plugin_bridge_close_video(ep);
     }
@@ -3164,7 +3211,7 @@ void plugin_manager_notify_file_close(EDITP *ep)
 void plugin_manager_notify_update(EDITP *ep)
 {
     int i;
-    if (plugin_bridge_is_active())
+    if (plugin_bridge_is_active() && !g_suppress_bridge_file_notify)
     {
         plugin_bridge_sync_to_bridge(ep);
     }

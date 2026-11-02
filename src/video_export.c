@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "video_export.h"
+#include "avi_tools.h"
 #include "plugin_manager.h"
 #include "plugin_bridge.h"
 #include "builtin_filters.h"
@@ -50,9 +51,29 @@ static volatile LONG *g_shm_total = NULL;
 // VFW video compression & ACM audio compression state (IDs 5127 & 5128)
 static COMPVARS g_vcodec;
 static BOOL g_vcodec_valid = FALSE;
+static wchar_t g_vcodec_name[128] = L"";
 static WAVEFORMATEX *g_acodec_wfx = NULL;
 static DWORD g_acodec_max_sz = 0;
 static BOOL g_acodec_valid = FALSE;
+static AviSaveOptions g_avi_save_opts = {FALSE, FALSE, FALSE, 1, FALSE, FALSE, {{0}, {0}, {0}}};
+
+#define MAX_VFW_CODECS 128
+#define CODEC_CFG_DECODE_YUY2 0x01
+#define CODEC_CFG_COMPRESS_YUY2 0x02
+#define CODEC_CFG_KEEP_STATE 0x04
+
+typedef struct VfwCodecItem
+{
+    DWORD fccHandler;
+    wchar_t name[128];
+    wchar_t driver[128];
+    DWORD vfw_flags;
+    BOOL has_configure;
+    BOOL has_about;
+    int def_quality;
+    int def_keyint;
+    int cfg_flags;
+} VfwCodecItem;
 
 // active encode session state for OUTPUT_INFO callbacks & Esc abort
 typedef struct
@@ -1169,9 +1190,15 @@ void video_export_shutdown(void)
 
     if (g_vcodec_valid)
     {
+        if (g_vcodec.hic)
+        {
+            ICClose(g_vcodec.hic);
+            g_vcodec.hic = NULL;
+        }
         ICCompressorFree(&g_vcodec);
         ZeroMemory(&g_vcodec, sizeof(g_vcodec));
         g_vcodec_valid = FALSE;
+        g_vcodec_name[0] = L'\0';
     }
     if (g_acodec_wfx)
     {
@@ -1304,42 +1331,669 @@ void video_export_populate_menu(HMENU bar, const wchar_t *none_label)
     }
 }
 
+static void format_fcc_ini_key(DWORD fcc, char *out_key, size_t cap)
+{
+    unsigned char b[4];
+    int i;
+    BOOL printable = TRUE;
+
+    b[0] = (unsigned char)(fcc & 0xFFu);
+    b[1] = (unsigned char)((fcc >> 8) & 0xFFu);
+    b[2] = (unsigned char)((fcc >> 16) & 0xFFu);
+    b[3] = (unsigned char)((fcc >> 24) & 0xFFu);
+
+    for (i = 0; i < 4; i++)
+    {
+        if (b[i] < 0x20 || b[i] > 0x7E || b[i] == '=' || b[i] == '[' || b[i] == ']')
+        {
+            printable = FALSE;
+            break;
+        }
+    }
+    if (printable)
+    {
+        char tmp[8];
+        memcpy(tmp, b, 4);
+        tmp[4] = '\0';
+        for (i = 3; i >= 0 && tmp[i] == ' '; i--)
+            tmp[i] = '\0';
+        if (tmp[0])
+        {
+            lstrcpynA(out_key, tmp, (int)cap);
+            return;
+        }
+    }
+    _snprintf(out_key, cap, "fcc_%08X", (unsigned)fcc);
+    out_key[cap - 1] = '\0';
+}
+
+static int read_codec_ini_flags(DWORD fcc, const char *ini_path)
+{
+    char key[32];
+    format_fcc_ini_key(fcc, key, sizeof(key));
+    return GetPrivateProfileIntA("codec", key, 0, ini_path);
+}
+
+static void write_codec_ini_flags(DWORD fcc, int flags, const char *ini_path)
+{
+    char key[32], val[16];
+    format_fcc_ini_key(fcc, key, sizeof(key));
+    wsprintfA(val, "%d", flags);
+    WritePrivateProfileStringA("codec", key, val, ini_path);
+}
+
+static void save_persisted_vcm_state(DWORD fcc, HIC hic, LONG lQ, LONG lKey, LONG lDataRate)
+{
+    char ini[MAX_PATH], base_key[32], kbuf[48], vbuf[32];
+    get_export_ini_path(ini, sizeof(ini));
+    format_fcc_ini_key(fcc, base_key, sizeof(base_key));
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.q", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    wsprintfA(vbuf, "%ld", (long)lQ);
+    WritePrivateProfileStringA("codec", kbuf, vbuf, ini);
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.key", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    wsprintfA(vbuf, "%ld", (long)lKey);
+    WritePrivateProfileStringA("codec", kbuf, vbuf, ini);
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.rate", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    wsprintfA(vbuf, "%ld", (long)lDataRate);
+    WritePrivateProfileStringA("codec", kbuf, vbuf, ini);
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.state", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    if (hic)
+    {
+        LRESULT st_sz = ICGetStateSize(hic);
+        if (st_sz > 0 && st_sz <= 16384)
+        {
+            unsigned char *raw = (unsigned char *)malloc((size_t)st_sz);
+            char *hex = (char *)malloc((size_t)st_sz * 2u + 2u);
+            if (raw && hex && ICGetState(hic, raw, (DWORD_PTR)st_sz) == ICERR_OK)
+            {
+                static const char hd[] = "0123456789ABCDEF";
+                LRESULT i;
+                for (i = 0; i < st_sz; i++)
+                {
+                    hex[i * 2] = hd[(raw[i] >> 4) & 0x0F];
+                    hex[i * 2 + 1] = hd[raw[i] & 0x0F];
+                }
+                hex[st_sz * 2] = '\0';
+                WritePrivateProfileStringA("codec", kbuf, hex, ini);
+            }
+            free(hex);
+            free(raw);
+        }
+    }
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static void load_persisted_vcm_state(DWORD fcc, HIC hic, int *io_q100, int *io_key, int *io_rate)
+{
+    char ini[MAX_PATH], base_key[32], kbuf[48];
+    char *hex;
+    int q, key, rate;
+
+    get_export_ini_path(ini, sizeof(ini));
+    if (!(read_codec_ini_flags(fcc, ini) & CODEC_CFG_KEEP_STATE))
+        return;
+
+    format_fcc_ini_key(fcc, base_key, sizeof(base_key));
+    _snprintf(kbuf, sizeof(kbuf), "%s.q", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    q = GetPrivateProfileIntA("codec", kbuf, -1, ini);
+    if (q >= 0 && io_q100)
+        *io_q100 = (q <= 100) ? q : (q / 100);
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.key", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    key = GetPrivateProfileIntA("codec", kbuf, -1, ini);
+    if (key >= 0 && io_key)
+        *io_key = key;
+
+    _snprintf(kbuf, sizeof(kbuf), "%s.rate", base_key);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+    rate = GetPrivateProfileIntA("codec", kbuf, -1, ini);
+    if (rate >= 0 && io_rate)
+        *io_rate = rate;
+
+    if (hic)
+    {
+        hex = (char *)malloc(32770);
+        if (hex)
+        {
+            size_t hlen;
+            _snprintf(kbuf, sizeof(kbuf), "%s.state", base_key);
+            kbuf[sizeof(kbuf) - 1] = '\0';
+            hex[0] = '\0';
+            GetPrivateProfileStringA("codec", kbuf, "", hex, 32769, ini);
+            hlen = strlen(hex);
+            if (hlen >= 2 && (hlen % 2) == 0)
+            {
+                size_t bsz = hlen / 2;
+                unsigned char *raw = (unsigned char *)malloc(bsz);
+                if (raw)
+                {
+                    size_t i;
+                    BOOL valid_hex = TRUE;
+                    for (i = 0; i < bsz; i++)
+                    {
+                        int hi = hex_nibble(hex[i * 2]);
+                        int lo = hex_nibble(hex[i * 2 + 1]);
+                        if (hi < 0 || lo < 0)
+                        {
+                            valid_hex = FALSE;
+                            break;
+                        }
+                        raw[i] = (unsigned char)((hi << 4) | lo);
+                    }
+                    if (valid_hex)
+                        ICSetState(hic, raw, (DWORD_PTR)bsz);
+                    free(raw);
+                }
+            }
+            free(hex);
+        }
+    }
+}
+
+static int enumerate_vfw_codecs(VfwCodecItem *items, int max_items)
+{
+    char ini[MAX_PATH];
+    int count = 0, idx;
+
+    if (!items || max_items <= 0)
+        return 0;
+    get_export_ini_path(ini, sizeof(ini));
+
+    for (idx = 0; idx < 256 && count < max_items; idx++)
+    {
+        ICINFO info;
+        HIC hic;
+        int k;
+        BOOL dup = FALSE;
+
+        ZeroMemory(&info, sizeof(info));
+        info.dwSize = sizeof(info);
+        if (!ICInfo(ICTYPE_VIDEO, (DWORD)idx, &info))
+            break;
+        if (info.fccHandler == 0 || info.fccHandler == mmioFOURCC('D', 'I', 'B', ' '))
+            continue;
+
+        for (k = 0; k < count; k++)
+        {
+            if (items[k].fccHandler == info.fccHandler)
+            {
+                dup = TRUE;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        hic = ICOpen(ICTYPE_VIDEO, info.fccHandler, ICMODE_QUERY);
+        if (hic)
+        {
+            ICINFO qinfo;
+            LRESULT dq, dk;
+            ZeroMemory(&qinfo, sizeof(qinfo));
+            qinfo.dwSize = sizeof(qinfo);
+            if (ICGetInfo(hic, &qinfo, sizeof(qinfo)) != 0)
+            {
+                VfwCodecItem *it = &items[count++];
+                ZeroMemory(it, sizeof(*it));
+                it->fccHandler = info.fccHandler;
+                lstrcpynW(it->name, qinfo.szDescription[0] ? qinfo.szDescription : qinfo.szName, 128);
+                lstrcpynW(it->driver, qinfo.szDriver[0] ? qinfo.szDriver : info.szDriver, 128);
+                if (!it->name[0])
+                {
+                    wsprintfW(it->name, L"%c%c%c%c",
+                              (int)(info.fccHandler & 0xFF),
+                              (int)((info.fccHandler >> 8) & 0xFF),
+                              (int)((info.fccHandler >> 16) & 0xFF),
+                              (int)((info.fccHandler >> 24) & 0xFF));
+                }
+                it->vfw_flags = qinfo.dwFlags;
+                it->has_configure = (ICQueryConfigure(hic) != 0);
+                it->has_about = (ICQueryAbout(hic) != 0);
+                dq = ICGetDefaultQuality(hic);
+                dk = ICGetDefaultKeyFrameRate(hic);
+                it->def_quality = (dq >= 0 && dq <= 10000) ? (int)dq : 8500;
+                it->def_keyint = (dk >= 0 && dk <= 10000) ? (int)dk : 15;
+                it->cfg_flags = read_codec_ini_flags(it->fccHandler, ini);
+            }
+            ICClose(hic);
+        }
+    }
+    return count;
+}
+
+static void center_modal_over_owner(HWND hdlg, HWND owner)
+{
+    if (owner && IsWindow(owner))
+    {
+        RECT rc_d, rc_o;
+        int x, y;
+        GetWindowRect(hdlg, &rc_d);
+        GetWindowRect(owner, &rc_o);
+        x = ((rc_d.left - rc_d.right) + rc_o.right + rc_o.left) / 2;
+        y = ((rc_d.top - rc_d.bottom) + rc_o.bottom + rc_o.top) / 2;
+        if (x < 0)
+            x = 0;
+        if (y < 0)
+            y = 0;
+        SetWindowPos(hdlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+typedef struct CodecSettingsDlgCtx
+{
+    HWND owner;
+    VfwCodecItem items[MAX_VFW_CODECS];
+    int count;
+    int cur_sel;
+} CodecSettingsDlgCtx;
+
+static void codec_dlg_sync_selection(HWND hdlg, CodecSettingsDlgCtx *ctx, int sel)
+{
+    if (!ctx || ctx->count <= 0)
+    {
+        SetDlgItemTextW(hdlg, 32400, i18n_get_wstr(12));
+        EnableWindow(GetDlgItem(hdlg, 32200), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32201), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32202), FALSE);
+        return;
+    }
+    if (sel < 0 || sel >= ctx->count)
+        sel = 0;
+    ctx->cur_sel = sel;
+    {
+        const VfwCodecItem *it = &ctx->items[sel];
+        wchar_t info_txt[256];
+        DWORD f = it->fccHandler;
+        const wchar_t *drv_base = wcsrchr(it->driver, L'\\');
+        drv_base = drv_base ? (drv_base + 1) : it->driver;
+        wsprintfW(info_txt, L"FOURCC : %c%c%c%c\n%s",
+                  (int)((f & 0xFF) >= 32 ? (f & 0xFF) : '?'),
+                  (int)(((f >> 8) & 0xFF) >= 32 ? ((f >> 8) & 0xFF) : '?'),
+                  (int)(((f >> 16) & 0xFF) >= 32 ? ((f >> 16) & 0xFF) : '?'),
+                  (int)(((f >> 24) & 0xFF) >= 32 ? ((f >> 24) & 0xFF) : '?'),
+                  drv_base);
+        SetDlgItemTextW(hdlg, 32400, info_txt);
+        EnableWindow(GetDlgItem(hdlg, 32200), TRUE);
+        EnableWindow(GetDlgItem(hdlg, 32201), TRUE);
+        EnableWindow(GetDlgItem(hdlg, 32202), TRUE);
+        CheckDlgButton(hdlg, 32200, (it->cfg_flags & CODEC_CFG_DECODE_YUY2) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hdlg, 32201, (it->cfg_flags & CODEC_CFG_COMPRESS_YUY2) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hdlg, 32202, (it->cfg_flags & CODEC_CFG_KEEP_STATE) ? BST_CHECKED : BST_UNCHECKED);
+    }
+}
+
+static void codec_dlg_read_checks(HWND hdlg, CodecSettingsDlgCtx *ctx)
+{
+    int flags = 0;
+    if (!ctx || ctx->cur_sel < 0 || ctx->cur_sel >= ctx->count)
+        return;
+    if (IsDlgButtonChecked(hdlg, 32200) == BST_CHECKED)
+        flags |= CODEC_CFG_DECODE_YUY2;
+    if (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED)
+        flags |= CODEC_CFG_COMPRESS_YUY2;
+    if (IsDlgButtonChecked(hdlg, 32202) == BST_CHECKED)
+        flags |= CODEC_CFG_KEEP_STATE;
+    ctx->items[ctx->cur_sel].cfg_flags = flags;
+}
+
+static INT_PTR CALLBACK CodecSettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    CodecSettingsDlgCtx *ctx = (CodecSettingsDlgCtx *)GetWindowLongPtrW(hdlg, GWLP_USERDATA);
+
+    if (msg == WM_INITDIALOG)
+    {
+        int i;
+        ctx = (CodecSettingsDlgCtx *)lp;
+        SetWindowLongPtrW(hdlg, GWLP_USERDATA, (LONG_PTR)ctx);
+        center_modal_over_owner(hdlg, ctx ? ctx->owner : NULL);
+
+        for (i = 0; ctx && i < ctx->count; i++)
+        {
+            SendDlgItemMessageW(hdlg, 32600, LB_ADDSTRING, 0, (LPARAM)ctx->items[i].name);
+        }
+        if (ctx && ctx->count > 0)
+        {
+            SendDlgItemMessageW(hdlg, 32600, LB_SETCURSEL, 0, 0);
+        }
+        codec_dlg_sync_selection(hdlg, ctx, 0);
+        return TRUE;
+    }
+
+    if (msg == WM_COMMAND && ctx)
+    {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+
+        if (id == 32600 && code == LBN_SELCHANGE)
+        {
+            int sel = (int)SendDlgItemMessageW(hdlg, 32600, LB_GETCURSEL, 0, 0);
+            codec_dlg_read_checks(hdlg, ctx);
+            codec_dlg_sync_selection(hdlg, ctx, sel);
+            return TRUE;
+        }
+        if ((id == 32200 || id == 32201 || id == 32202) && code == BN_CLICKED)
+        {
+            codec_dlg_read_checks(hdlg, ctx);
+            return TRUE;
+        }
+        if (id == IDOK)
+        {
+            char ini[MAX_PATH];
+            int i;
+            codec_dlg_read_checks(hdlg, ctx);
+            get_export_ini_path(ini, sizeof(ini));
+            for (i = 0; i < ctx->count; i++)
+            {
+                write_codec_ini_flags(ctx->items[i].fccHandler, ctx->items[i].cfg_flags, ini);
+            }
+            EndDialog(hdlg, IDOK);
+            return TRUE;
+        }
+        if (id == IDCANCEL)
+        {
+            EndDialog(hdlg, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOL video_export_run_codec_settings_dialog(HWND owner)
+{
+    const DLGTEMPLATE *tpl = i18n_load_dialog_template("CODEC");
+    CodecSettingsDlgCtx ctx;
+
+    if (!tpl)
+        return FALSE;
+    ZeroMemory(&ctx, sizeof(ctx));
+    ctx.owner = owner;
+    ctx.count = enumerate_vfw_codecs(ctx.items, MAX_VFW_CODECS);
+    ctx.cur_sel = -1;
+    return DialogBoxIndirectParamW(GetModuleHandleA(NULL), tpl, owner,
+                                   CodecSettingsDlgProc, (LPARAM)&ctx) == IDOK;
+}
+
+typedef struct VcmSetDlgCtx
+{
+    HWND owner;
+    VfwCodecItem items[MAX_VFW_CODECS];
+    int count;
+    int sel;
+    HIC work_hic;
+    int q100;
+    int keyint;
+    int datarate;
+} VcmSetDlgCtx;
+
+static void vcm_dlg_select(HWND hdlg, VcmSetDlgCtx *ctx, int sel, BOOL reset_defaults)
+{
+    if (!ctx)
+        return;
+    if (ctx->work_hic)
+    {
+        ICClose(ctx->work_hic);
+        ctx->work_hic = NULL;
+    }
+
+    if (sel <= 0 || sel > ctx->count)
+    {
+        ctx->sel = 0;
+        SetDlgItemInt(hdlg, 32000, 100, FALSE);
+        SetDlgItemInt(hdlg, 32001, 0, FALSE);
+        SetDlgItemInt(hdlg, 32002, 0, FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32000), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32001), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32002), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32300), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32301), FALSE);
+        EnableWindow(GetDlgItem(hdlg, 32302), FALSE);
+        return;
+    }
+
+    ctx->sel = sel;
+    {
+        const VfwCodecItem *it = &ctx->items[sel - 1];
+        int q = (it->def_quality + 50) / 100;
+        int key = it->def_keyint;
+        int rate = 0;
+
+        ctx->work_hic = ICOpen(ICTYPE_VIDEO, it->fccHandler, ICMODE_COMPRESS);
+        if (!ctx->work_hic)
+            ctx->work_hic = ICOpen(ICTYPE_VIDEO, it->fccHandler, ICMODE_QUERY);
+
+        if (!reset_defaults)
+        {
+            if (g_vcodec_valid && g_vcodec.fccHandler == it->fccHandler)
+            {
+                q = (int)((g_vcodec.lQ + 50) / 100);
+                key = (int)g_vcodec.lKey;
+                rate = (int)g_vcodec.lDataRate;
+                if (g_vcodec.hic && ctx->work_hic)
+                {
+                    LRESULT sz = ICGetStateSize(g_vcodec.hic);
+                    if (sz > 0)
+                    {
+                        void *st_buf = malloc((size_t)sz);
+                        if (st_buf)
+                        {
+                            if (ICGetState(g_vcodec.hic, st_buf, (DWORD_PTR)sz) == ICERR_OK)
+                                ICSetState(ctx->work_hic, st_buf, (DWORD_PTR)sz);
+                            free(st_buf);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                load_persisted_vcm_state(it->fccHandler, ctx->work_hic, &q, &key, &rate);
+            }
+        }
+        else if (ctx->work_hic)
+        {
+            ICSetState(ctx->work_hic, NULL, 0);
+        }
+
+        if (q < 0)
+            q = 0;
+        if (q > 100)
+            q = 100;
+        if (key < 0)
+            key = 0;
+        if (rate < 0)
+            rate = 0;
+
+        ctx->q100 = q;
+        ctx->keyint = key;
+        ctx->datarate = rate;
+
+        SetDlgItemInt(hdlg, 32000, (UINT)q, FALSE);
+        SetDlgItemInt(hdlg, 32001, (UINT)key, FALSE);
+        SetDlgItemInt(hdlg, 32002, (UINT)rate, FALSE);
+
+        EnableWindow(GetDlgItem(hdlg, 32000), (it->vfw_flags & VIDCF_QUALITY) != 0);
+        EnableWindow(GetDlgItem(hdlg, 32001), (it->vfw_flags & VIDCF_TEMPORAL) != 0);
+        EnableWindow(GetDlgItem(hdlg, 32002), (it->vfw_flags & VIDCF_CRUNCH) != 0);
+        EnableWindow(GetDlgItem(hdlg, 32300), ctx->work_hic && it->has_configure);
+        EnableWindow(GetDlgItem(hdlg, 32301), TRUE);
+        EnableWindow(GetDlgItem(hdlg, 32302), ctx->work_hic && it->has_about);
+    }
+}
+
+static INT_PTR CALLBACK VcmSetDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VcmSetDlgCtx *ctx = (VcmSetDlgCtx *)GetWindowLongPtrW(hdlg, GWLP_USERDATA);
+
+    if (msg == WM_INITDIALOG)
+    {
+        int i, init_sel = 0;
+        const wchar_t *w_uncomp = i18n_get_wstr(32);
+
+        ctx = (VcmSetDlgCtx *)lp;
+        SetWindowLongPtrW(hdlg, GWLP_USERDATA, (LONG_PTR)ctx);
+        center_modal_over_owner(hdlg, ctx ? ctx->owner : NULL);
+
+        SendDlgItemMessageW(hdlg, 32500, CB_ADDSTRING, 0,
+                            (LPARAM)(w_uncomp[0] ? w_uncomp : L"Uncompressed"));
+        for (i = 0; ctx && i < ctx->count; i++)
+        {
+            SendDlgItemMessageW(hdlg, 32500, CB_ADDSTRING, 0, (LPARAM)ctx->items[i].name);
+            if (g_vcodec_valid && g_vcodec.fccHandler == ctx->items[i].fccHandler)
+            {
+                init_sel = i + 1;
+            }
+        }
+        SendDlgItemMessageW(hdlg, 32500, CB_SETCURSEL, (WPARAM)init_sel, 0);
+        vcm_dlg_select(hdlg, ctx, init_sel, FALSE);
+        return TRUE;
+    }
+
+    if (msg == WM_COMMAND && ctx)
+    {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+
+        if (id == 32500 && code == CBN_SELCHANGE)
+        {
+            int sel = (int)SendDlgItemMessageW(hdlg, 32500, CB_GETCURSEL, 0, 0);
+            vcm_dlg_select(hdlg, ctx, sel, FALSE);
+            return TRUE;
+        }
+        if (id == 32300 && ctx->work_hic) // configure
+        {
+            ICConfigure(ctx->work_hic, hdlg);
+            return TRUE;
+        }
+        if (id == 32301) // reset to Default
+        {
+            vcm_dlg_select(hdlg, ctx, ctx->sel, TRUE);
+            return TRUE;
+        }
+        if (id == 32302 && ctx->work_hic) // about
+        {
+            ICAbout(ctx->work_hic, hdlg);
+            return TRUE;
+        }
+        if (id == IDOK)
+        {
+            BOOL ok_i = FALSE;
+            ctx->q100 = (int)GetDlgItemInt(hdlg, 32000, &ok_i, FALSE);
+            ctx->keyint = (int)GetDlgItemInt(hdlg, 32001, &ok_i, FALSE);
+            ctx->datarate = (int)GetDlgItemInt(hdlg, 32002, &ok_i, FALSE);
+            if (ctx->q100 < 0)
+                ctx->q100 = 0;
+            if (ctx->q100 > 100)
+                ctx->q100 = 100;
+            if (ctx->keyint < 0)
+                ctx->keyint = 0;
+            if (ctx->datarate < 0)
+                ctx->datarate = 0;
+            EndDialog(hdlg, IDOK);
+            return TRUE;
+        }
+        if (id == IDCANCEL)
+        {
+            if (ctx->work_hic)
+            {
+                ICClose(ctx->work_hic);
+                ctx->work_hic = NULL;
+            }
+            EndDialog(hdlg, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 BOOL video_export_choose_video_codec(HWND owner, EDITP *ep)
 {
-    BITMAPINFOHEADER bih;
-    int w = 640, h = 480, mw = 0, mh = 0;
+    const DLGTEMPLATE *tpl = i18n_load_dialog_template("VCMSET");
+    VcmSetDlgCtx *ctx;
+    INT_PTR dr;
 
-    if (ep && editp_is_editing(ep))
-    {
-        editp_get_dimensions(ep, &w, &h, &mw, &mh);
-    }
-    if (w <= 0)
-        w = 640;
-    if (h <= 0)
-        h = 480;
+    (void)ep;
+    if (!tpl)
+        return FALSE;
 
-    ZeroMemory(&bih, sizeof(bih));
-    bih.biSize = sizeof(bih);
-    bih.biWidth = w;
-    bih.biHeight = h;
-    bih.biPlanes = 1;
-    bih.biBitCount = 24;
-    bih.biCompression = BI_RGB;
-    bih.biSizeImage = (DWORD)(((w * 3 + 3) & ~3) * h);
+    ctx = (VcmSetDlgCtx *)calloc(1, sizeof(VcmSetDlgCtx));
+    if (!ctx)
+        return FALSE;
+    ctx->owner = owner;
+    ctx->count = enumerate_vfw_codecs(ctx->items, MAX_VFW_CODECS);
 
-    if (!g_vcodec_valid)
+    dr = DialogBoxIndirectParamW(GetModuleHandleA(NULL), tpl, owner,
+                                 VcmSetDlgProc, (LPARAM)ctx);
+    if (dr != IDOK)
     {
-        ZeroMemory(&g_vcodec, sizeof(g_vcodec));
-        g_vcodec.cbSize = sizeof(g_vcodec);
-    }
-    if (!ICCompressorChoose(owner, ICMF_CHOOSE_DATARATE | ICMF_CHOOSE_KEYFRAME,
-                            &bih, NULL, &g_vcodec, "Video Compression"))
-    {
+        if (ctx->work_hic)
+            ICClose(ctx->work_hic);
+        free(ctx);
         return FALSE;
     }
-    g_vcodec_valid = TRUE;
-    dbg_info("Selected VFW video compressor: fccHandler=0x%08X lQ=%ld lKey=%ld",
-             (unsigned)g_vcodec.fccHandler, (long)g_vcodec.lQ, (long)g_vcodec.lKey);
+
+    if (g_vcodec_valid)
+    {
+        if (g_vcodec.hic)
+            ICClose(g_vcodec.hic);
+        ICCompressorFree(&g_vcodec);
+        ZeroMemory(&g_vcodec, sizeof(g_vcodec));
+        g_vcodec_valid = FALSE;
+    }
+
+    if (ctx->sel <= 0 || ctx->sel > ctx->count)
+    {
+        if (ctx->work_hic)
+            ICClose(ctx->work_hic);
+        g_vcodec_name[0] = L'\0';
+        dbg_info("Selected uncompressed video output (DIB)");
+        free(ctx);
+        return TRUE;
+    }
+
+    {
+        const VfwCodecItem *it = &ctx->items[ctx->sel - 1];
+        ZeroMemory(&g_vcodec, sizeof(g_vcodec));
+        g_vcodec.cbSize = sizeof(g_vcodec);
+        g_vcodec.dwFlags = ICMF_COMPVARS_VALID;
+        g_vcodec.fccType = ICTYPE_VIDEO;
+        g_vcodec.fccHandler = it->fccHandler;
+        g_vcodec.hic = ctx->work_hic;
+        g_vcodec.lQ = (LONG)(ctx->q100 * 100);
+        g_vcodec.lKey = (LONG)ctx->keyint;
+        g_vcodec.lDataRate = (LONG)ctx->datarate;
+        g_vcodec_valid = TRUE;
+        lstrcpynW(g_vcodec_name, it->name, 128);
+
+        if (it->cfg_flags & CODEC_CFG_KEEP_STATE)
+        {
+            save_persisted_vcm_state(it->fccHandler, ctx->work_hic,
+                                     g_vcodec.lQ, g_vcodec.lKey, g_vcodec.lDataRate);
+        }
+        dbg_info("Selected VFW video compressor: fccHandler=0x%08X lQ=%ld lKey=%ld lDataRate=%ld",
+                 (unsigned)g_vcodec.fccHandler, (long)g_vcodec.lQ,
+                 (long)g_vcodec.lKey, (long)g_vcodec.lDataRate);
+    }
+
+    free(ctx);
     return TRUE;
 }
 
@@ -1402,13 +2056,191 @@ BOOL video_export_choose_audio_codec(HWND owner, EDITP *ep)
     return TRUE;
 }
 
-BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out_flags)
+void video_export_get_default_avi_options(AviSaveOptions *out_opts)
 {
+    if (!out_opts)
+        return;
+    *out_opts = g_avi_save_opts;
+    if (out_opts->interleave_frames < 1)
+        out_opts->interleave_frames = 1;
+}
+
+BOOL video_export_run_exinfo_dialog(HWND owner, AviExInfoTags *tags)
+{
+    AviUtlDlgState st;
+    if (!tags)
+        return FALSE;
+
+    aviutl_dlg_init(&st);
+    aviutl_dlg_set_str_sjis(&st, 0, tags->title);
+    aviutl_dlg_set_str_sjis(&st, 1, tags->comment);
+    aviutl_dlg_set_str_sjis(&st, 2, tags->copyright);
+
+    if (aviutl_dlg_run(owner, "SAVE_EXINFO", &st) != IDOK)
+        return FALSE;
+
+    aviutl_dlg_get_str_sjis(&st, 0, tags->title, sizeof(tags->title));
+    aviutl_dlg_get_str_sjis(&st, 1, tags->comment, sizeof(tags->comment));
+    aviutl_dlg_get_str_sjis(&st, 2, tags->copyright, sizeof(tags->copyright));
+    return TRUE;
+}
+
+static size_t append_info_subchunk(unsigned char *dst, const char *fcc4, const char *val)
+{
+    uint32_t len;
+    size_t off = 0;
+
+    if (!val || !val[0])
+        return 0;
+    len = (uint32_t)strlen(val) + 1u;
+    memcpy(dst + off, fcc4, 4);
+    off += 4;
+    memcpy(dst + off, &len, 4);
+    off += 4;
+    memcpy(dst + off, val, (size_t)len);
+    off += (size_t)len;
+    if (len & 1u)
+        dst[off++] = 0;
+    return off;
+}
+
+BOOL video_export_write_riff_info_tags(const char *avi_path, const AviExInfoTags *tags)
+{
+    HANDLE hf;
+    unsigned char hdr[12];
+    DWORD got = 0, wr = 0;
+    LARGE_INTEGER fsz;
+    unsigned char list_buf[1600];
+    size_t payload_off = 12;
+    uint32_t list_sz, new_riff_sz;
+
+    if (!avi_path || !avi_path[0] || !tags)
+        return FALSE;
+    if (!tags->title[0] && !tags->comment[0] && !tags->copyright[0])
+        return TRUE;
+
+    payload_off += append_info_subchunk(list_buf + payload_off, "INAM", tags->title);
+    payload_off += append_info_subchunk(list_buf + payload_off, "ICMT", tags->comment);
+    payload_off += append_info_subchunk(list_buf + payload_off, "ICOP", tags->copyright);
+    if (payload_off <= 12)
+        return TRUE;
+
+    list_sz = (uint32_t)(payload_off - 8u);
+    memcpy(list_buf, "LIST", 4);
+    memcpy(list_buf + 4, &list_sz, 4);
+    memcpy(list_buf + 8, "INFO", 4);
+
+    hf = CreateFileA(avi_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart < 12 || fsz.QuadPart > 0xFFF00000LL ||
+        !ReadFile(hf, hdr, 12, &got, NULL) || got != 12 ||
+        memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "AVI ", 4) != 0)
+    {
+        CloseHandle(hf);
+        return FALSE;
+    }
+
+    SetFilePointer(hf, 0, NULL, FILE_END);
+    if (fsz.QuadPart & 1LL)
+    {
+        unsigned char pad = 0;
+        WriteFile(hf, &pad, 1, &wr, NULL);
+        fsz.QuadPart++;
+    }
+    if (!WriteFile(hf, list_buf, (DWORD)payload_off, &wr, NULL) || wr != (DWORD)payload_off)
+    {
+        CloseHandle(hf);
+        return FALSE;
+    }
+    fsz.QuadPart += (LONGLONG)payload_off;
+    new_riff_sz = (uint32_t)(fsz.QuadPart - 8LL);
+    SetFilePointer(hf, 4, NULL, FILE_BEGIN);
+    WriteFile(hf, &new_riff_sz, 4, &wr, NULL);
+    CloseHandle(hf);
+    return TRUE;
+}
+
+static void replace_file_ext(const char *src_path, const char *new_ext, char *out_path, size_t cap)
+{
+    const char *base;
+    char *dot;
+
+    lstrcpynA(out_path, src_path ? src_path : "", (int)cap);
+    base = path_basename_dbcs(out_path);
+    dot = (char *)strrchr(base, '.');
+    if (dot)
+        *dot = '\0';
+    if (new_ext && new_ext[0] && strlen(out_path) + strlen(new_ext) + 2 < cap)
+    {
+        lstrcatA(out_path, ".");
+        lstrcatA(out_path, new_ext);
+    }
+}
+
+static void write_avi_export_log(const char *avi_path, EDITP *ep,
+                                 int w, int h, int fps_r, int fps_s, int out_frames,
+                                 BOOL wrote_audio, const SYSTEMTIME *t_start, DWORD elapsed_ms)
+{
+    char log_path[MAX_PATH];
+    SYSTEMTIME t_end;
+    FILE *fp;
+    char vdesc[128] = "Uncompressed (RGB24)";
+
+    replace_file_ext(avi_path, "log", log_path, sizeof(log_path));
+    GetLocalTime(&t_end);
+    fp = fopen(log_path, "w");
+    if (!fp)
+        return;
+
+    if (g_vcodec_valid && g_vcodec_name[0])
+    {
+        WideCharToMultiByte(932, 0, g_vcodec_name, -1, vdesc, sizeof(vdesc), NULL, NULL);
+    }
+
+    fprintf(fp, "AviUtl64 Export Log\n");
+    fprintf(fp, "Input   : %s\n", ep ? editp_get_edit_path(ep) : "");
+    fprintf(fp, "Output  : %s\n", avi_path);
+    fprintf(fp, "Video   : %dx%d  %.3ffps (%d/%d)  %d frames  [%s]\n",
+            w, h,
+            (fps_s > 0) ? ((double)fps_r / (double)fps_s) : 30.0,
+            fps_r, fps_s, out_frames, vdesc);
+    if (wrote_audio && ep)
+    {
+        fprintf(fp, "Audio   : %dHz  %dch  [%s]\n",
+                editp_get_audio_rate(ep), editp_get_audio_ch(ep),
+                (g_acodec_valid && g_acodec_wfx && g_acodec_wfx->wFormatTag != WAVE_FORMAT_PCM)
+                    ? "ACM Compressed"
+                    : "PCM 16bit");
+    }
+    else
+    {
+        fprintf(fp, "Audio   : None\n");
+    }
+    fprintf(fp, "Start   : %04u/%02u/%02u %02u:%02u:%02u\n",
+            t_start->wYear, t_start->wMonth, t_start->wDay,
+            t_start->wHour, t_start->wMinute, t_start->wSecond);
+    fprintf(fp, "Finish  : %04u/%02u/%02u %02u:%02u:%02u\n",
+            t_end.wYear, t_end.wMonth, t_end.wDay,
+            t_end.wHour, t_end.wMinute, t_end.wSecond);
+    fprintf(fp, "Elapsed : %.2f sec\n", (double)elapsed_ms / 1000.0);
+    fclose(fp);
+}
+
+BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_path,
+                                        int out_flags, const AviSaveOptions *opts)
+{
+    AviSaveOptions eff_opts;
     char abs_path[MAX_PATH];
     int s = 0, e = 0, saved_frame, k;
     int w = 0, h = 0, mw = 0, mh = 0, fps_r = 30, fps_s = 1;
-    int dib_stride, dib_bytes;
+    int dib_stride, dib_bytes, ileave_frames;
+    BOOL use_yuy2_in = FALSE;
     BOOL include_audio, ok = FALSE;
+    SYSTEMTIME st_start;
+    DWORD t0_tick;
     PAVIFILE pfile = NULL;
     PAVISTREAM pvid = NULL;
     PAVISTREAM pvid_cs = NULL;
@@ -1432,6 +2264,15 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     {
         return FALSE;
     }
+    if (opts)
+        eff_opts = *opts;
+    else
+        video_export_get_default_avi_options(&eff_opts);
+
+    ileave_frames = (eff_opts.interleave_frames >= 1) ? eff_opts.interleave_frames : 1;
+    if (ileave_frames > 300)
+        ileave_frames = 300;
+
     if (GetFullPathNameA(save_path, MAX_PATH, abs_path, NULL) == 0)
     {
         lstrcpynA(abs_path, save_path, MAX_PATH);
@@ -1444,6 +2285,10 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     if ((out_flags & (OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO)) == 0)
     {
         out_flags |= OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO;
+    }
+    if (eff_opts.no_audio)
+    {
+        out_flags &= ~OUTPUT_INFO_FLAG_AUDIO;
     }
     include_audio = ((out_flags & OUTPUT_INFO_FLAG_AUDIO) != 0) &&
                     (editp_has_audio(ep) || plugin_manager_has_active_audio_filter());
@@ -1461,6 +2306,9 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     {
         return FALSE;
     }
+
+    GetLocalTime(&st_start);
+    t0_tick = GetTickCount();
 
     saved_frame = editp_get_frame(ep);
     editp_set_output_path(ep, abs_path);
@@ -1511,13 +2359,13 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
 
     ZeroMemory(&vsi, sizeof(vsi));
     vsi.fccType = streamtypeVIDEO;
-    vsi.fccHandler = (g_vcodec_valid && g_vcodec.fccHandler != 0)
+    vsi.fccHandler = (!eff_opts.no_recompress_video && g_vcodec_valid && g_vcodec.fccHandler != 0)
                          ? g_vcodec.fccHandler
                          : mmioFOURCC('D', 'I', 'B', ' ');
     vsi.dwScale = (DWORD)fps_s;
     vsi.dwRate = (DWORD)fps_r;
     vsi.dwSuggestedBufferSize = (DWORD)dib_bytes;
-    vsi.dwQuality = (DWORD)(g_vcodec_valid ? g_vcodec.lQ : (DWORD)-1);
+    vsi.dwQuality = (DWORD)((!eff_opts.no_recompress_video && g_vcodec_valid) ? g_vcodec.lQ : (DWORD)-1);
     SetRect(&vsi.rcFrame, 0, 0, w, h);
 
     if (AVIFileCreateStreamA(pfile, &pvid, &vsi) != 0 || !pvid)
@@ -1527,10 +2375,13 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     }
 
     pvid_wr = pvid;
-    if (g_vcodec_valid && g_vcodec.fccHandler != 0 &&
+    if (!eff_opts.no_recompress_video && g_vcodec_valid && g_vcodec.fccHandler != 0 &&
         g_vcodec.fccHandler != mmioFOURCC('D', 'I', 'B', ' '))
     {
         AVICOMPRESSOPTIONS vopts;
+        char ini[MAX_PATH];
+        get_export_ini_path(ini, sizeof(ini));
+
         ZeroMemory(&vopts, sizeof(vopts));
         vopts.fccType = streamtypeVIDEO;
         vopts.fccHandler = g_vcodec.fccHandler;
@@ -1556,6 +2407,19 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
         if (AVIMakeCompressedStream(&pvid_cs, pvid, &vopts, NULL) == AVIERR_OK && pvid_cs)
         {
             pvid_wr = pvid_cs;
+            if ((w & 1) == 0 && (read_codec_ini_flags(g_vcodec.fccHandler, ini) & CODEC_CFG_COMPRESS_YUY2))
+            {
+                BITMAPINFOHEADER yuy2_bih = bih;
+                yuy2_bih.biBitCount = 16;
+                yuy2_bih.biCompression = mmioFOURCC('Y', 'U', 'Y', '2');
+                yuy2_bih.biSizeImage = (DWORD)(w * 2 * h);
+                if (AVIStreamSetFormat(pvid_wr, 0, &yuy2_bih, (LONG)sizeof(yuy2_bih)) == 0)
+                {
+                    use_yuy2_in = TRUE;
+                    dib_stride = w * 2;
+                    dib_bytes = dib_stride * h;
+                }
+            }
         }
         else
         {
@@ -1564,7 +2428,7 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
         }
     }
 
-    if (AVIStreamSetFormat(pvid_wr, 0, &bih, (LONG)sizeof(bih)) != 0)
+    if (!use_yuy2_in && AVIStreamSetFormat(pvid_wr, 0, &bih, (LONG)sizeof(bih)) != 0)
     {
         dbg_error("AVIStreamSetFormat(vids) failed");
         goto cleanup;
@@ -1590,7 +2454,7 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
         asi.fccType = streamtypeAUDIO;
         asi.dwQuality = (DWORD)-1;
 
-        if (g_acodec_valid && g_acodec_wfx &&
+        if (!eff_opts.no_recompress_audio && g_acodec_valid && g_acodec_wfx &&
             g_acodec_wfx->wFormatTag != WAVE_FORMAT_PCM &&
             acmStreamOpen(&has, NULL, &pcm_wfx, g_acodec_wfx, NULL, 0, 0,
                           ACM_STREAMOPENF_NONREALTIME) == MMSYSERR_NOERROR &&
@@ -1689,8 +2553,16 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
                 }
                 editp_get_dimensions(ep, &cw, &ch_h, &cmw, &cmh);
                 memset(dib_buf, 0, (size_t)dib_bytes);
-                yc2rgb_dib24(dib_buf, dib_stride, editp_get_ycp_edit(ep),
-                             cmw, cw < w ? cw : w, ch_h < h ? ch_h : h, TRUE);
+                if (use_yuy2_in)
+                {
+                    yc48_to_yuy2(dib_buf, dib_stride, editp_get_ycp_edit(ep),
+                                 cmw, cw < w ? cw : w, ch_h < h ? ch_h : h);
+                }
+                else
+                {
+                    yc2rgb_dib24(dib_buf, dib_stride, editp_get_ycp_edit(ep),
+                                 cmw, cw < w ? cw : w, ch_h < h ? ch_h : h, TRUE);
+                }
                 if (AVIStreamWrite(pvid_wr, (LONG)k, 1, dib_buf, (LONG)dib_bytes,
                                    vflags, NULL, NULL) != 0)
                 {
@@ -1704,7 +2576,7 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
                 g_on_preview_update(owner);
             }
 
-            if (paud)
+            if (paud && (((k + 1) % ileave_frames) == 0 || (k + 1) >= g_enc.out_n))
             {
                 int target_aud_end = (k + 1 >= g_enc.out_n)
                                          ? g_enc.aud_frame_n
@@ -1798,50 +2670,448 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     }
 
 cleanup:
-    if (has)
     {
-        if (ash_prep)
+        int out_frames_done = g_enc.out_n;
+        BOOL had_paud = (paud != NULL);
+
+        if (has)
         {
-            ash.cbSrcLength = (DWORD)(16384 * g_enc.audio_ch * 2);
-            ash.cbDstLength = acm_dst_cap;
-            acmStreamUnprepareHeader(has, &ash, 0);
+            if (ash_prep)
+            {
+                ash.cbSrcLength = (DWORD)(16384 * g_enc.audio_ch * 2);
+                ash.cbDstLength = acm_dst_cap;
+                acmStreamUnprepareHeader(has, &ash, 0);
+            }
+            acmStreamClose(has, 0);
         }
-        acmStreamClose(has, 0);
-    }
-    free(acm_src);
-    free(acm_dst);
-    free(pcm_buf);
-    free(codec_par);
-    free(dib_buf);
+        free(acm_src);
+        free(acm_dst);
+        free(pcm_buf);
+        free(codec_par);
+        free(dib_buf);
 
-    if (pvid_cs)
-        AVIStreamRelease(pvid_cs);
-    if (pvid)
-        AVIStreamRelease(pvid);
-    if (paud)
-        AVIStreamRelease(paud);
-    if (pfile)
-        AVIFileRelease(pfile);
-    AVIFileExit();
+        if (pvid_cs)
+            AVIStreamRelease(pvid_cs);
+        if (pvid)
+            AVIStreamRelease(pvid);
+        if (paud)
+            AVIStreamRelease(paud);
+        if (pfile)
+            AVIFileRelease(pfile);
+        AVIFileExit();
 
-    plugin_manager_notify_save_end(ep,
-                                   OUTPUT_INFO_FLAG_VIDEO | (include_audio ? OUTPUT_INFO_FLAG_AUDIO : 0));
-    SetThreadExecutionState(ES_CONTINUOUS);
-    editp_set_frame(ep, saved_frame);
-    plugin_manager_notify_update(ep);
-    teardown_encode_session();
-    if (ok)
-    {
-        notify_export_finished(owner, out_flags);
+        plugin_manager_notify_save_end(ep,
+                                       OUTPUT_INFO_FLAG_VIDEO | (include_audio ? OUTPUT_INFO_FLAG_AUDIO : 0));
+        SetThreadExecutionState(ES_CONTINUOUS);
+        editp_set_frame(ep, saved_frame);
+        plugin_manager_notify_update(ep);
+        teardown_encode_session();
+
+        if (ok)
+        {
+            video_export_write_riff_info_tags(abs_path, &eff_opts.exinfo);
+            if (eff_opts.output_wav_sidecar)
+            {
+                char wav_sidecar[MAX_PATH];
+                replace_file_ext(abs_path, "wav", wav_sidecar, sizeof(wav_sidecar));
+                video_export_wav_file(owner, ep, wav_sidecar);
+                editp_set_output_path(ep, abs_path);
+            }
+            if (eff_opts.output_log)
+            {
+                write_avi_export_log(abs_path, ep, w, h, fps_r, fps_s, out_frames_done,
+                                     had_paud, &st_start, GetTickCount() - t0_tick);
+            }
+            notify_export_finished(owner, out_flags);
+        }
     }
     return ok;
+}
+
+BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out_flags)
+{
+    return video_export_avi_file_with_options(owner, ep, save_path, out_flags, NULL);
+}
+
+typedef struct SaveOptionHookCtx
+{
+    HWND owner;
+    EDITP *ep;
+    int mode; // 0 = AVI, 1 = WAV, 2 = AUO
+    int auo_idx;
+    AuoPluginSummary auo_sum;
+    char def_ext[16];
+    AviSaveOptions opts;
+    BOOL batch_registered;
+} SaveOptionHookCtx;
+
+static void refresh_save_option_labels(HWND hdlg, SaveOptionHookCtx *ctx)
+{
+    const wchar_t *w_uncomp = i18n_get_wstr(32);
+    wchar_t vlabel[196];
+    wchar_t alabel[196];
+    wchar_t sum_txt[256];
+    int w = 0, h = 0, mw = 0, mh = 0, r = 30, sc = 1, s = 0, e = 0, fn = 0, out_f = 0, f;
+    int ar = 44100, ach = 2;
+    BOOL no_aud;
+
+    if (!ctx || !ctx->ep)
+        return;
+
+    no_aud = (ctx->mode != 1) && (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED);
+    if (ctx->mode == 0)
+    {
+        EnableWindow(GetDlgItem(hdlg, 32301), !no_aud);
+        EnableWindow(GetDlgItem(hdlg, 32203), !no_aud);
+        EnableWindow(GetDlgItem(hdlg, 32401), !no_aud);
+
+        if (IsDlgButtonChecked(hdlg, 32200) == BST_CHECKED)
+        {
+            lstrcpynW(vlabel, L"No Recompress", 196);
+        }
+        else if (g_vcodec_valid && g_vcodec_name[0])
+        {
+            wsprintfW(vlabel, L"%s (Q=%ld)", g_vcodec_name, (long)(g_vcodec.lQ / 100));
+        }
+        else
+        {
+            lstrcpynW(vlabel, w_uncomp[0] ? w_uncomp : L"Uncompressed", 196);
+        }
+        SetDlgItemTextW(hdlg, 32400, vlabel);
+    }
+    else if (ctx->mode == 2)
+    {
+        sjis_to_wide_auo(ctx->auo_sum.information[0] ? ctx->auo_sum.information : ctx->auo_sum.name,
+                         vlabel, 196);
+        SetDlgItemTextW(hdlg, 32400, vlabel);
+        EnableWindow(GetDlgItem(hdlg, 32300), ctx->auo_sum.has_config);
+    }
+
+    ar = editp_get_audio_rate(ctx->ep) > 0 ? editp_get_audio_rate(ctx->ep) : 44100;
+    ach = editp_get_audio_ch(ctx->ep) > 0 ? editp_get_audio_ch(ctx->ep) : 2;
+    if (ctx->mode == 0)
+    {
+        if (no_aud)
+        {
+            lstrcpynW(alabel, i18n_get_wstr(12), 196);
+        }
+        else if (g_acodec_valid && g_acodec_wfx && g_acodec_wfx->wFormatTag != WAVE_FORMAT_PCM)
+        {
+            ACMFORMATTAGDETAILSA aftd;
+            ACMFORMATDETAILSA afd;
+            ZeroMemory(&aftd, sizeof(aftd));
+            aftd.cbStruct = sizeof(aftd);
+            aftd.dwFormatTag = g_acodec_wfx->wFormatTag;
+            if (acmFormatTagDetailsA(NULL, &aftd, ACM_FORMATTAGDETAILSF_FORMATTAG) == MMSYSERR_NOERROR)
+            {
+                wchar_t wtag[64];
+                sjis_to_wide_auo(aftd.szFormatTag, wtag, 64);
+                ZeroMemory(&afd, sizeof(afd));
+                afd.cbStruct = sizeof(afd);
+                afd.dwFormatTag = g_acodec_wfx->wFormatTag;
+                afd.pwfx = g_acodec_wfx;
+                afd.cbwfx = sizeof(WAVEFORMATEX) + g_acodec_wfx->cbSize;
+                if (acmFormatDetailsA(NULL, &afd, ACM_FORMATDETAILSF_FORMAT) == MMSYSERR_NOERROR)
+                {
+                    wchar_t wfmt[96];
+                    sjis_to_wide_auo(afd.szFormat, wfmt, 96);
+                    wsprintfW(alabel, L"%s %s", wtag, wfmt);
+                }
+                else
+                {
+                    wsprintfW(alabel, L"%s (%luHz %uch)",
+                              wtag,
+                              (unsigned long)g_acodec_wfx->nSamplesPerSec,
+                              (unsigned)g_acodec_wfx->nChannels);
+                }
+            }
+            else
+            {
+                wsprintfW(alabel, L"ACM 0x%04X (%luHz %uch)",
+                          (unsigned)g_acodec_wfx->wFormatTag,
+                          (unsigned long)g_acodec_wfx->nSamplesPerSec,
+                          (unsigned)g_acodec_wfx->nChannels);
+            }
+        }
+        else
+        {
+            wsprintfW(alabel, L"PCM %dHz 16bit %dch", ar, ach);
+        }
+        SetDlgItemTextW(hdlg, 32401, alabel);
+    }
+
+    editp_get_dimensions(ctx->ep, &w, &h, &mw, &mh);
+    editp_get_fps(ctx->ep, &r, &sc);
+    builtin_filters_adjust_export_fps(&r, &sc);
+    fn = editp_get_frame_n(ctx->ep);
+    if (!editp_get_select_frame(ctx->ep, &s, &e) || s < 0 || e < s || e >= fn)
+    {
+        s = 0;
+        e = fn > 0 ? fn - 1 : 0;
+    }
+    for (f = s; f <= e; f++)
+    {
+        BYTE st = 0;
+        if (editp_get_frame_status(ctx->ep, f, &st) && (st & EDIT_FRAME_EDIT_FLAG_DELFRAME))
+            continue;
+        out_f++;
+    }
+    if (ctx->mode == 1)
+    {
+        wsprintfW(sum_txt, L"PCM %dHz 16bit %dch (%df)", ar, ach, out_f);
+        SetDlgItemTextW(hdlg, 32406, sum_txt);
+    }
+    else
+    {
+        int fps100 = (sc > 0) ? (int)(((long long)r * 100LL + sc / 2) / (long long)sc) : 3000;
+        if (no_aud || (!editp_has_audio(ctx->ep) && !plugin_manager_has_active_audio_filter()))
+        {
+            wsprintfW(sum_txt, L"%dx%d  %d.%02dfps (%df) / No Audio",
+                      w, h, fps100 / 100, fps100 % 100, out_f);
+        }
+        else
+        {
+            wsprintfW(sum_txt, L"%dx%d  %d.%02dfps (%df) / %dHz %dch",
+                      w, h, fps100 / 100, fps100 % 100, out_f, ar, ach);
+        }
+        SetDlgItemTextW(hdlg, 32406, sum_txt);
+    }
+}
+
+static void sync_save_option_controls(HWND hdlg, AviSaveOptions *opts)
+{
+    BOOL ok_i = FALSE;
+    int ileave;
+
+    if (!opts)
+        return;
+    opts->no_recompress_video = (IsDlgButtonChecked(hdlg, 32200) == BST_CHECKED);
+    opts->no_recompress_audio = (IsDlgButtonChecked(hdlg, 32203) == BST_CHECKED);
+    opts->no_audio = (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED);
+    opts->output_wav_sidecar = (IsDlgButtonChecked(hdlg, 32204) == BST_CHECKED);
+    opts->output_log = (IsDlgButtonChecked(hdlg, 32202) == BST_CHECKED);
+    ileave = (int)GetDlgItemInt(hdlg, 32000, &ok_i, FALSE);
+    if (!ok_i || ileave < 1)
+        ileave = 1;
+    if (ileave > 300)
+        ileave = 300;
+    opts->interleave_frames = ileave;
+}
+
+static UINT_PTR CALLBACK SaveOptionHookProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    SaveOptionHookCtx *ctx = (SaveOptionHookCtx *)GetWindowLongPtrA(hdlg, GWLP_USERDATA);
+
+    if (msg == WM_INITDIALOG)
+    {
+        OPENFILENAMEA *pofn = (OPENFILENAMEA *)lp;
+        ctx = pofn ? (SaveOptionHookCtx *)pofn->lCustData : NULL;
+        SetWindowLongPtrA(hdlg, GWLP_USERDATA, (LONG_PTR)ctx);
+        if (ctx)
+        {
+            if (ctx->mode == 1)
+            {
+                HWND hw;
+                for (hw = GetWindow(hdlg, GW_CHILD); hw; hw = GetWindow(hw, GW_HWNDNEXT))
+                {
+                    int cid = GetDlgCtrlID(hw);
+                    if (cid != 1119 && cid != 32406 && cid != 32302)
+                    {
+                        ShowWindow(hw, SW_HIDE);
+                    }
+                }
+            }
+            else if (ctx->mode == 2)
+            {
+                HWND hw, h32400 = GetDlgItem(hdlg, 32400), h32200 = GetDlgItem(hdlg, 32200);
+                HWND h32201 = GetDlgItem(hdlg, 32201);
+                RECT rc_v = {0}, rc_nr = {0};
+                if (h32400)
+                    GetWindowRect(h32400, &rc_v);
+                if (h32200 && h32201)
+                {
+                    POINT pt;
+                    GetWindowRect(h32200, &rc_nr);
+                    pt.x = rc_nr.left;
+                    pt.y = rc_nr.top;
+                    ScreenToClient(hdlg, &pt);
+                    SetWindowPos(h32201, NULL, pt.x, pt.y, 0, 0,
+                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                for (hw = GetWindow(hdlg, GW_CHILD); hw; hw = GetWindow(hw, GW_HWNDNEXT))
+                {
+                    int cid = GetDlgCtrlID(hw);
+                    if (cid == 1119 || cid == 32406 || cid == 32302 ||
+                        cid == 32300 || cid == 32400 || cid == 32201)
+                    {
+                        continue;
+                    }
+                    if (cid == -1 && h32400)
+                    {
+                        RECT rc_c;
+                        GetWindowRect(hw, &rc_c);
+                        if (rc_c.bottom <= rc_v.bottom + 8)
+                            continue;
+                    }
+                    ShowWindow(hw, SW_HIDE);
+                }
+                CheckDlgButton(hdlg, 32201, ctx->opts.no_audio ? BST_CHECKED : BST_UNCHECKED);
+            }
+            else
+            {
+                CheckDlgButton(hdlg, 32200, ctx->opts.no_recompress_video ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hdlg, 32203, ctx->opts.no_recompress_audio ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hdlg, 32201, ctx->opts.no_audio ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hdlg, 32204, ctx->opts.output_wav_sidecar ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hdlg, 32202, ctx->opts.output_log ? BST_CHECKED : BST_UNCHECKED);
+                SetDlgItemInt(hdlg, 32000,
+                              (UINT)(ctx->opts.interleave_frames >= 1 ? ctx->opts.interleave_frames : 1),
+                              FALSE);
+            }
+            refresh_save_option_labels(hdlg, ctx);
+        }
+        return TRUE;
+    }
+
+    if (msg == WM_COMMAND && ctx)
+    {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+        HWND hDlgOwner = GetParent(hdlg);
+        if (!hDlgOwner)
+            hDlgOwner = hdlg;
+
+        if (id == 32300 && code == BN_CLICKED)
+        {
+            if (ctx->mode == 2)
+            {
+                video_export_auo_config_dialog(hDlgOwner, ctx->auo_idx);
+            }
+            else if (ctx->mode == 0 && video_export_choose_video_codec(hDlgOwner, ctx->ep))
+            {
+                refresh_save_option_labels(hdlg, ctx);
+            }
+            return TRUE;
+        }
+        if (id == 32301 && code == BN_CLICKED && ctx->mode == 0)
+        {
+            if (video_export_choose_audio_codec(hDlgOwner, ctx->ep))
+                refresh_save_option_labels(hdlg, ctx);
+            return TRUE;
+        }
+        if ((id == 32200 || id == 32201 || id == 32203) && code == BN_CLICKED)
+        {
+            refresh_save_option_labels(hdlg, ctx);
+            return TRUE;
+        }
+        if (id == 32303 && code == BN_CLICKED && ctx->mode == 0)
+        {
+            video_export_run_exinfo_dialog(hDlgOwner, &ctx->opts.exinfo);
+            return TRUE;
+        }
+        if (id == 32302 && code == BN_CLICKED) // batch Register (バッチ登録)
+        {
+            char sel_path[MAX_PATH] = {0};
+            const char *base;
+            int out_flags;
+
+            if (ctx->mode == 0)
+            {
+                sync_save_option_controls(hdlg, &ctx->opts);
+                g_avi_save_opts = ctx->opts;
+            }
+            else if (ctx->mode == 2)
+            {
+                ctx->opts.no_audio = (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED);
+            }
+
+            if (SendMessageA(hDlgOwner, CDM_GETFILEPATH, MAX_PATH, (LPARAM)sel_path) > 0 &&
+                sel_path[0])
+            {
+                DWORD attr = GetFileAttributesA(sel_path);
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+                {
+                    return TRUE;
+                }
+                base = path_basename_dbcs(sel_path);
+                if (!base[0])
+                    return TRUE;
+                if (!strchr(base, '.') && ctx->def_ext[0] &&
+                    strlen(sel_path) + strlen(ctx->def_ext) + 2 < sizeof(sel_path))
+                {
+                    lstrcatA(sel_path, ".");
+                    lstrcatA(sel_path, ctx->def_ext);
+                }
+                if (is_overwriting_open_edit_file(hDlgOwner, ctx->ep, sel_path))
+                {
+                    return TRUE;
+                }
+                if (ctx->mode == 1)
+                {
+                    out_flags = OUTPUT_INFO_FLAG_AUDIO | OUTPUT_INFO_FLAG_BATCH;
+                    if (avi_tools_batch_register_ex(hDlgOwner, ctx->ep, sel_path, NULL,
+                                                    out_flags, NULL))
+                    {
+                        ctx->batch_registered = TRUE;
+                        PostMessageA(hDlgOwner, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+                    }
+                }
+                else if (ctx->mode == 2)
+                {
+                    out_flags = OUTPUT_INFO_FLAG_VIDEO |
+                                (ctx->opts.no_audio ? 0 : OUTPUT_INFO_FLAG_AUDIO) |
+                                OUTPUT_INFO_FLAG_BATCH;
+                    if (avi_tools_batch_register_ex(hDlgOwner, ctx->ep, sel_path,
+                                                    ctx->auo_sum.name, out_flags, NULL))
+                    {
+                        ctx->batch_registered = TRUE;
+                        PostMessageA(hDlgOwner, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+                    }
+                }
+                else
+                {
+                    out_flags = OUTPUT_INFO_FLAG_VIDEO |
+                                (ctx->opts.no_audio ? 0 : OUTPUT_INFO_FLAG_AUDIO) |
+                                OUTPUT_INFO_FLAG_BATCH;
+                    if (avi_tools_batch_register_current(hDlgOwner, ctx->ep, sel_path,
+                                                         out_flags, &ctx->opts))
+                    {
+                        ctx->batch_registered = TRUE;
+                        PostMessageA(hDlgOwner, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+                    }
+                }
+            }
+            return TRUE;
+        }
+    }
+
+    if (msg == WM_NOTIFY && ctx && lp != 0)
+    {
+        NMHDR *nm = (NMHDR *)lp;
+        if (nm->code == CDN_FILEOK)
+        {
+            if (ctx->mode == 0)
+            {
+                sync_save_option_controls(hdlg, &ctx->opts);
+                g_avi_save_opts = ctx->opts;
+            }
+            else if (ctx->mode == 2)
+            {
+                ctx->opts.no_audio = (IsDlgButtonChecked(hdlg, 32201) == BST_CHECKED);
+            }
+        }
+    }
+    return 0;
 }
 
 BOOL video_export_avi_dialog(HWND owner, EDITP *ep)
 {
     OPENFILENAMEA ofn;
+    SaveOptionHookCtx hook_ctx;
+    const DLGTEMPLATE *tmpl = i18n_load_dialog_template("SAVE_OPTION");
     char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
+    int out_flags;
     static const char filter[] =
         "AVI Video (*.avi)\0*.avi\0"
         "All Files (*.*)\0*.*\0";
@@ -1849,6 +3119,13 @@ BOOL video_export_avi_dialog(HWND owner, EDITP *ep)
     if (!ep || !editp_is_editing(ep) || g_enc.active)
         return FALSE;
     expand_default_save_path(ep, "avi", init_dir, sizeof(init_dir), file, sizeof(file));
+
+    ZeroMemory(&hook_ctx, sizeof(hook_ctx));
+    hook_ctx.owner = owner;
+    hook_ctx.ep = ep;
+    hook_ctx.mode = 0;
+    lstrcpynA(hook_ctx.def_ext, "avi", sizeof(hook_ctx.def_ext));
+    video_export_get_default_avi_options(&hook_ctx.opts);
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -1860,13 +3137,23 @@ BOOL video_export_avi_dialog(HWND owner, EDITP *ep)
     ofn.nMaxFile = sizeof(file);
     ofn.lpstrDefExt = "avi";
     ofn.Flags = get_export_save_ofn_flags();
+    if (tmpl)
+    {
+        ofn.hInstance = (HINSTANCE)tmpl;
+        ofn.lpfnHook = SaveOptionHookProc;
+        ofn.lCustData = (LPARAM)&hook_ctx;
+        ofn.Flags |= OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK | OFN_ENABLETEMPLATEHANDLE;
+    }
 
     if (!GetSaveFileNameA(&ofn))
-        return FALSE;
+    {
+        return hook_ctx.batch_registered;
+    }
     if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
-    return video_export_avi_file(owner, ep, file,
-                                 OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO);
+
+    out_flags = OUTPUT_INFO_FLAG_VIDEO | (hook_ctx.opts.no_audio ? 0 : OUTPUT_INFO_FLAG_AUDIO);
+    return video_export_avi_file_with_options(owner, ep, file, out_flags, &hook_ctx.opts);
 }
 
 BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
@@ -1992,6 +3279,8 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
 BOOL video_export_wav_dialog(HWND owner, EDITP *ep)
 {
     OPENFILENAMEA ofn;
+    SaveOptionHookCtx hook_ctx;
+    const DLGTEMPLATE *tmpl = i18n_load_dialog_template("SAVE_OPTION");
     char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
     static const char filter[] =
@@ -2001,6 +3290,12 @@ BOOL video_export_wav_dialog(HWND owner, EDITP *ep)
     if (!ep || !editp_is_editing(ep) || g_enc.active)
         return FALSE;
     expand_default_save_path(ep, "wav", init_dir, sizeof(init_dir), file, sizeof(file));
+
+    ZeroMemory(&hook_ctx, sizeof(hook_ctx));
+    hook_ctx.owner = owner;
+    hook_ctx.ep = ep;
+    hook_ctx.mode = 1;
+    lstrcpynA(hook_ctx.def_ext, "wav", sizeof(hook_ctx.def_ext));
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -2012,9 +3307,16 @@ BOOL video_export_wav_dialog(HWND owner, EDITP *ep)
     ofn.nMaxFile = sizeof(file);
     ofn.lpstrDefExt = "wav";
     ofn.Flags = get_export_save_ofn_flags();
+    if (tmpl)
+    {
+        ofn.hInstance = (HINSTANCE)tmpl;
+        ofn.lpfnHook = SaveOptionHookProc;
+        ofn.lCustData = (LPARAM)&hook_ctx;
+        ofn.Flags |= OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK | OFN_ENABLETEMPLATEHANDLE;
+    }
 
     if (!GetSaveFileNameA(&ofn))
-        return FALSE;
+        return hook_ctx.batch_registered;
     if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
     return video_export_wav_file(owner, ep, file);
@@ -2187,9 +3489,12 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
 {
     AuoPluginSummary sum;
     OPENFILENAMEA ofn;
+    SaveOptionHookCtx hook_ctx;
+    const DLGTEMPLATE *tmpl = i18n_load_dialog_template("SAVE_OPTION");
     char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
     char def_ext[16] = {0};
+    int out_flags;
 
     if (!ep || !editp_is_editing(ep) || g_enc.active)
         return FALSE;
@@ -2199,6 +3504,14 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
     g_last_auo_idx = auo_idx;
     extract_default_ext(sum.filefilter, def_ext, sizeof(def_ext));
     expand_default_save_path(ep, def_ext, init_dir, sizeof(init_dir), file, sizeof(file));
+
+    ZeroMemory(&hook_ctx, sizeof(hook_ctx));
+    hook_ctx.owner = owner;
+    hook_ctx.ep = ep;
+    hook_ctx.mode = 2;
+    hook_ctx.auo_idx = auo_idx;
+    hook_ctx.auo_sum = sum;
+    lstrcpynA(hook_ctx.def_ext, def_ext, sizeof(hook_ctx.def_ext));
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -2211,13 +3524,20 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
     ofn.lpstrDefExt = def_ext[0] ? def_ext : NULL;
     ofn.lpstrTitle = sum.name;
     ofn.Flags = get_export_save_ofn_flags();
+    if (tmpl)
+    {
+        ofn.hInstance = (HINSTANCE)tmpl;
+        ofn.lpfnHook = SaveOptionHookProc;
+        ofn.lCustData = (LPARAM)&hook_ctx;
+        ofn.Flags |= OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK | OFN_ENABLETEMPLATEHANDLE;
+    }
 
     if (!GetSaveFileNameA(&ofn))
-        return FALSE;
+        return hook_ctx.batch_registered;
     if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
-    return video_export_auo_file(owner, ep, auo_idx, file,
-                                 OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO);
+    out_flags = OUTPUT_INFO_FLAG_VIDEO | (hook_ctx.opts.no_audio ? 0 : OUTPUT_INFO_FLAG_AUDIO);
+    return video_export_auo_file(owner, ep, auo_idx, file, out_flags);
 }
 
 int video_export_get_last_auo_index(void)

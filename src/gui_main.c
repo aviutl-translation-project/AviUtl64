@@ -24,6 +24,7 @@
 #include "color_plugin.h"
 #include "input_plugin.h"
 #include "video_export.h"
+#include "avi_tools.h"
 #include "debug_console.h"
 
 // shift-jis bytes for "拡張編集"
@@ -3049,6 +3050,14 @@ static void sync_edit_menu_states(HMENU hMenu)
 }
 
 // show aviutl right-click "CONTEXT" popup menu (0x00412300)
+static void cb_batch_ui_refresh(HWND hwnd)
+{
+    g_last_auto_w = 0;
+    g_last_auto_h = 0;
+    apply_menu(hwnd);
+    refresh_current_frame(hwnd);
+}
+
 static void show_preview_context_menu(HWND hwnd, int screen_x, int screen_y)
 {
     HMENU hMenu = i18n_load_menu("CONTEXT");
@@ -3597,6 +3606,20 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 1062: // file -> WAV Output (WAV出力)
             reaviutl_wav_export(hwnd);
             return 0;
+        case 1025: // file -> Batch Output (バッチ出力)
+            stop_playback(hwnd);
+            avi_tools_run_batch_dialog(hwnd, g_editp, cb_batch_ui_refresh);
+            return 0;
+        case 1057: // file -> AVI File Operations -> Concatenate AVI Files
+            stop_playback(hwnd);
+            avi_tools_run_avichain_dialog(hwnd);
+            update_window_title(hwnd);
+            return 0;
+        case 1058: // file -> AVI File Operations -> Multiplex AVI File
+            stop_playback(hwnd);
+            avi_tools_run_avimix_dialog(hwnd);
+            update_window_title(hwnd);
+            return 0;
         case 1009: // file -> Abort Output (Esc)
             video_export_request_abort();
             return 0;
@@ -3652,6 +3675,9 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             winsnap_set_enabled(preview_get_sys_config()->windowsnap != 0);
             apply_menu(hwnd);
             builtin_filters_refresh_tool_window();
+            return 0;
+        case 109: // file -> settings -> Codec Settings (コーデックの設定)
+            video_export_run_codec_settings_dialog(hwnd);
             return 0;
         case 1006: // other -> File Information
             show_current_file_info(hwnd);

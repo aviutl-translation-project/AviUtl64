@@ -23,6 +23,7 @@ set(REAVIUTL_CORE_SOURCES
 	src/color_plugin.c
 	src/input_plugin.c
 	src/video_export.c
+	src/avi_tools.c
 	src/aup_project.c
 	src/debug_console.c
 	src/exfunc.c

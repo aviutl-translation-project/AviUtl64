@@ -22,6 +22,24 @@ typedef struct AuoPluginSummary
     BOOL bridged_x86;
 } AuoPluginSummary;
 
+typedef struct AviExInfoTags
+{
+    char title[260];
+    char comment[260];
+    char copyright[260];
+} AviExInfoTags;
+
+typedef struct AviSaveOptions
+{
+    BOOL no_recompress_video;
+    BOOL no_recompress_audio;
+    BOOL no_audio;
+    int interleave_frames;
+    BOOL output_wav_sidecar;
+    BOOL output_log;
+    AviExInfoTags exinfo;
+} AviSaveOptions;
+
 typedef void (*VideoExportPreviewUpdateFn)(HWND owner);
 typedef void (*VideoExportProgressFn)(HWND owner, int now, int total);
 
@@ -45,6 +63,12 @@ void video_export_populate_menu(HMENU bar, const wchar_t *none_label);
 
 BOOL video_export_avi_dialog(HWND owner, EDITP *ep);
 BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out_flags);
+BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_path,
+                                        int out_flags, const AviSaveOptions *opts);
+void video_export_get_default_avi_options(AviSaveOptions *out_opts);
+BOOL video_export_run_exinfo_dialog(HWND owner, AviExInfoTags *tags);
+BOOL video_export_write_riff_info_tags(const char *avi_path, const AviExInfoTags *tags);
+BOOL video_export_run_codec_settings_dialog(HWND owner);
 
 BOOL video_export_wav_dialog(HWND owner, EDITP *ep);
 BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path);

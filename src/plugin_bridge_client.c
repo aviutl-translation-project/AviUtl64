@@ -513,6 +513,45 @@ HWND plugin_bridge_get_filter_hwnd(int idx)
     return (HWND)(uintptr_t)g_shm->filters[idx].hwnd32;
 }
 
+BOOL plugin_bridge_get_filter_has_proc(int idx)
+{
+    if (!g_active || !g_shm || idx < 0 || idx >= g_shm->filter_count)
+        return FALSE;
+    return g_shm->filters[idx].has_func_proc != 0;
+}
+
+int plugin_bridge_get_filter_priority(int idx)
+{
+    if (!g_active || !g_shm || idx < 0 || idx >= g_shm->filter_count)
+        return 64;
+    return g_shm->filters[idx].priority;
+}
+
+BOOL plugin_bridge_set_filter_priority(int idx, int priority, BOOL save_ini)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active)
+        return FALSE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_SET_FILTER_PRIORITY;
+    req.arg0 = idx;
+    req.arg1 = priority;
+    req.arg2 = save_ini ? 1 : 0;
+    return bridge_rpc(&req, &resp, 5000);
+}
+
+BOOL plugin_bridge_invalidate_caches(void)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active)
+        return FALSE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_INVALIDATE_CACHES;
+    return bridge_rpc(&req, &resp, 3000);
+}
+
 int plugin_bridge_get_menu_item_count(void)
 {
     return (g_active && g_shm) ? g_shm->menu_item_count : 0;
@@ -796,11 +835,12 @@ BOOL plugin_bridge_sync_from_bridge(EDITP *ep)
     return TRUE;
 }
 
-BOOL plugin_bridge_render_frame(EDITP *ep, int frame_num, BOOL push_host_frame)
+BOOL plugin_bridge_render_frame_subset(EDITP *ep, int frame_num, BOOL push_host_frame,
+                                       const int *filter_indices, int count)
 {
     BridgeRpcReq req;
     BridgeRpcResp resp;
-    int w = 0, h = 0, max_w = 0, max_h = 0, y;
+    int w = 0, h = 0, max_w = 0, max_h = 0, y, i;
     PIXEL_YC *dst;
 
     if (!g_active || !g_shm || !ep)
@@ -824,12 +864,23 @@ BOOL plugin_bridge_render_frame(EDITP *ep, int frame_num, BOOL push_host_frame)
                    &src[y * max_w],
                    (size_t)copy_w * sizeof(PIXEL_YC));
         }
+        g_shm->w = w;
+        g_shm->h = h;
     }
 
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_RENDER_FRAME;
     req.arg0 = frame_num;
     req.arg1 = push_host_frame ? 1 : 0;
+    if (filter_indices && count > 0)
+    {
+        int lim = (count < BRIDGE_MAX_FILTERS) ? count : BRIDGE_MAX_FILTERS;
+        req.arg2 = lim;
+        for (i = 0; i < lim; i++)
+        {
+            req.str[i] = (char)(unsigned char)filter_indices[i];
+        }
+    }
     if (!bridge_rpc(&req, &resp, 15000))
         return FALSE;
 
@@ -850,11 +901,17 @@ BOOL plugin_bridge_render_frame(EDITP *ep, int frame_num, BOOL push_host_frame)
     return TRUE;
 }
 
-int plugin_bridge_render_audio(EDITP *ep, int frame_num, short *buf, int samples, int ch)
+BOOL plugin_bridge_render_frame(EDITP *ep, int frame_num, BOOL push_host_frame)
+{
+    return plugin_bridge_render_frame_subset(ep, frame_num, push_host_frame, NULL, 0);
+}
+
+int plugin_bridge_render_audio_subset(EDITP *ep, int frame_num, short *buf, int samples, int ch,
+                                      const int *filter_indices, int count)
 {
     BridgeRpcReq req;
     BridgeRpcResp resp;
-    int copy_smp, copy_ch;
+    int copy_smp, copy_ch, i;
 
     if (!g_active || !g_shm || !ep || !buf || samples <= 0)
         return samples;
@@ -874,6 +931,15 @@ int plugin_bridge_render_audio(EDITP *ep, int frame_num, short *buf, int samples
     req.arg0 = frame_num;
     req.arg1 = copy_smp;
     req.arg2 = copy_ch;
+    if (filter_indices && count > 0)
+    {
+        int lim = (count < BRIDGE_MAX_FILTERS) ? count : BRIDGE_MAX_FILTERS;
+        req.arg3 = lim;
+        for (i = 0; i < lim; i++)
+        {
+            req.str[i] = (char)(unsigned char)filter_indices[i];
+        }
+    }
     if (!bridge_rpc(&req, &resp, 10000))
     {
         return samples;
@@ -885,6 +951,11 @@ int plugin_bridge_render_audio(EDITP *ep, int frame_num, short *buf, int samples
     }
     memcpy(buf, g_shm->pcm_audio, (size_t)copy_smp * (size_t)copy_ch * sizeof(short));
     return copy_smp;
+}
+
+int plugin_bridge_render_audio(EDITP *ep, int frame_num, short *buf, int samples, int ch)
+{
+    return plugin_bridge_render_audio_subset(ep, frame_num, buf, samples, ch, NULL, 0);
 }
 
 BOOL plugin_bridge_debug_cmd(const char *cmd_str)
@@ -1254,6 +1325,27 @@ HWND plugin_bridge_get_filter_hwnd(int i)
     (void)i;
     return NULL;
 }
+BOOL plugin_bridge_get_filter_has_proc(int i)
+{
+    (void)i;
+    return FALSE;
+}
+int plugin_bridge_get_filter_priority(int i)
+{
+    (void)i;
+    return 64;
+}
+BOOL plugin_bridge_set_filter_priority(int i, int p, BOOL s)
+{
+    (void)i;
+    (void)p;
+    (void)s;
+    return FALSE;
+}
+BOOL plugin_bridge_invalidate_caches(void)
+{
+    return FALSE;
+}
 int plugin_bridge_get_menu_item_count(void)
 {
     return 0;
@@ -1349,12 +1441,31 @@ BOOL plugin_bridge_render_frame(EDITP *e, int n, BOOL p)
     (void)p;
     return FALSE;
 }
+BOOL plugin_bridge_render_frame_subset(EDITP *e, int n, BOOL p, const int *f, int c)
+{
+    (void)e;
+    (void)n;
+    (void)p;
+    (void)f;
+    (void)c;
+    return FALSE;
+}
 int plugin_bridge_render_audio(EDITP *e, int n, short *b, int s, int c)
 {
     (void)e;
     (void)n;
     (void)b;
     (void)c;
+    return s;
+}
+int plugin_bridge_render_audio_subset(EDITP *e, int n, short *b, int s, int c, const int *f, int fc)
+{
+    (void)e;
+    (void)n;
+    (void)b;
+    (void)c;
+    (void)f;
+    (void)fc;
     return s;
 }
 BOOL plugin_bridge_debug_cmd(const char *c)

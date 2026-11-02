@@ -11,7 +11,7 @@
 #include "editp.h"
 
 #define BRIDGE_MAGIC 0x52415542u // "RAUB"
-#define BRIDGE_VERSION 6u
+#define BRIDGE_VERSION 7u
 #define BRIDGE_MAX_FILTERS 64
 #define BRIDGE_MAX_MENU_ITEMS 256
 #define BRIDGE_MAX_AUOS 32
@@ -56,6 +56,8 @@ enum BridgeCmd
     BRIDGE_CMD_AUI_READ_VIDEO = 32,
     BRIDGE_CMD_AUI_READ_AUDIO = 33,
     BRIDGE_CMD_AUI_IS_KEYFRAME = 34,
+    BRIDGE_CMD_SET_FILTER_PRIORITY = 35,
+    BRIDGE_CMD_INVALIDATE_CACHES = 36,
     BRIDGE_CMD_SHUTDOWN = 99
 };
 
@@ -70,6 +72,8 @@ typedef struct BridgeFilterInfo
     int32_t has_window;
     int32_t window_visible;
     uint32_t hwnd32;
+    int32_t has_func_proc;
+    int32_t priority;
 } BridgeFilterInfo;
 
 typedef struct BridgeMenuItemInfo
@@ -207,6 +211,10 @@ const char *plugin_bridge_get_filter_info(int idx);
 const char *plugin_bridge_get_filter_path(int idx);
 int plugin_bridge_get_filter_flags(int idx);
 HWND plugin_bridge_get_filter_hwnd(int idx);
+BOOL plugin_bridge_get_filter_has_proc(int idx);
+int plugin_bridge_get_filter_priority(int idx);
+BOOL plugin_bridge_set_filter_priority(int idx, int priority, BOOL save_ini);
+BOOL plugin_bridge_invalidate_caches(void);
 
 int plugin_bridge_get_menu_item_count(void);
 BOOL plugin_bridge_get_menu_item(int idx, BridgeMenuItemInfo *out_info);
@@ -228,7 +236,11 @@ BOOL plugin_bridge_save_aup(const char *aup_path, EDITP *ep);
 BOOL plugin_bridge_sync_to_bridge(EDITP *ep);
 BOOL plugin_bridge_sync_from_bridge(EDITP *ep);
 BOOL plugin_bridge_render_frame(EDITP *ep, int frame_num, BOOL push_host_frame);
+BOOL plugin_bridge_render_frame_subset(EDITP *ep, int frame_num, BOOL push_host_frame,
+                                       const int *filter_indices, int count);
 int plugin_bridge_render_audio(EDITP *ep, int frame_num, short *buf, int samples, int ch);
+int plugin_bridge_render_audio_subset(EDITP *ep, int frame_num, short *buf, int samples, int ch,
+                                      const int *filter_indices, int count);
 BOOL plugin_bridge_debug_cmd(const char *cmd_str);
 
 typedef void (*BridgeEncodeProgressFn)(int now, int total, void *user);

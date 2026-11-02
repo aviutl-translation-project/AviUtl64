@@ -58,6 +58,10 @@ typedef struct AviUtlSystemConfig
     int movieplaymain;
     int trackbarclick;
     int windowsnap;
+    int overwritecheck;
+    int dragdropdialog;
+    int openprojectaup;
+    int closedialog;
 } AviUtlSystemConfig;
 
 BOOL preview_register_classes(HINSTANCE hInst);

@@ -51,6 +51,7 @@ static int g_audio_buf_cap = 0;
 static BOOL g_playing = FALSE;
 static BOOL g_dragging_canvas = FALSE;
 static BOOL g_peeking_unfiltered = FALSE;
+static BOOL g_smoke_exit = FALSE;
 static int g_last_auto_w = 0;
 static int g_last_auto_h = 0;
 
@@ -1149,15 +1150,52 @@ static void toggle_playback(HWND hwnd)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-static BOOL open_media_or_exo(HWND hwnd, const char *path)
+static BOOL confirm_discard_current_edit(HWND hwnd)
+{
+    const AviUtlSystemConfig *scfg;
+    if (g_smoke_exit || !g_editp || !editp_is_editing(g_editp) || editp_is_saving(g_editp))
+        return TRUE;
+    scfg = preview_get_sys_config();
+    if (!scfg || scfg->closedialog == 0)
+        return TRUE;
+    return aviutl_msgbox_w(hwnd, i18n_get_wstr(1046), L"AviUtl",
+                           MB_OKCANCEL | MB_ICONQUESTION) == IDOK;
+}
+
+static BOOL open_media_or_exo_ex(HWND hwnd, const char *path, BOOL force_project_aup)
 {
     const char *ext;
+    BOOL treat_as_aup;
+
     if (!g_editp || !path || !path[0])
         return FALSE;
     stop_playback(hwnd);
 
     ext = strrchr(path, '.');
-    if (ext && lstrcmpiA(ext, ".aup") == 0)
+    if (ext && lstrcmpiA(ext, ".exo") == 0)
+    {
+        int ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
+        if (ex_idx >= 0)
+        {
+            plugin_manager_show_window(ex_idx, TRUE);
+            if (plugin_manager_import_exo(ex_idx, path, g_editp))
+            {
+                g_last_auto_w = 0;
+                g_last_auto_h = 0;
+                refresh_current_frame(hwnd);
+                return TRUE;
+            }
+        }
+    }
+
+    if (!confirm_discard_current_edit(hwnd))
+    {
+        return FALSE;
+    }
+
+    treat_as_aup = (ext && lstrcmpiA(ext, ".aup") == 0) &&
+                   (force_project_aup || preview_get_sys_config()->openprojectaup != 0);
+    if (treat_as_aup)
     {
         int ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
         if (ex_idx >= 0)
@@ -1177,22 +1215,6 @@ static BOOL open_media_or_exo(HWND hwnd, const char *path)
         return TRUE;
     }
 
-    if (ext && lstrcmpiA(ext, ".exo") == 0)
-    {
-        int ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
-        if (ex_idx >= 0)
-        {
-            plugin_manager_show_window(ex_idx, TRUE);
-            if (plugin_manager_import_exo(ex_idx, path, g_editp))
-            {
-                g_last_auto_w = 0;
-                g_last_auto_h = 0;
-                refresh_current_frame(hwnd);
-                return TRUE;
-            }
-        }
-    }
-
     if (!editp_open_video(g_editp, path))
     {
         aviutl_msgbox_w(hwnd, i18n_get_wstr(1038), L"AviUtl", MB_OK | MB_ICONWARNING);
@@ -1208,13 +1230,23 @@ static BOOL open_media_or_exo(HWND hwnd, const char *path)
     return TRUE;
 }
 
-void reaviutl_file_open(HWND owner)
+static BOOL open_media_or_exo(HWND hwnd, const char *path)
+{
+    return open_media_or_exo_ex(hwnd, path, FALSE);
+}
+
+static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH] = {0};
     char flt_buf[4096];
     const char *base_flt = input_plugin_get_file_filter(0);
     int p = 0;
+
+    if (initial_path && initial_path[0])
+    {
+        lstrcpynA(file, initial_path, sizeof(file));
+    }
 
     memset(flt_buf, 0, sizeof(flt_buf));
     if (base_flt && base_flt[0])
@@ -1257,11 +1289,42 @@ void reaviutl_file_open(HWND owner)
 
     if (GetOpenFileNameA(&ofn))
     {
-        open_media_or_exo(owner, file);
+        open_media_or_exo_ex(owner, file, FALSE);
     }
 }
 
-static void reaviutl_audio_open(HWND owner)
+void reaviutl_file_open(HWND owner)
+{
+    reaviutl_file_open_with_initial(owner, NULL);
+}
+
+static BOOL load_audio_into_current_edit(HWND owner, const char *file)
+{
+    if (!g_editp || !file || !file[0])
+        return FALSE;
+
+    stop_playback(owner);
+    if (!editp_is_editing(g_editp))
+    {
+        return open_media_or_exo_ex(owner, file, FALSE);
+    }
+    if (!editp_open_audio(g_editp, file))
+    {
+        char msg[MAX_PATH + 128];
+        wsprintfA(msg, "Failed to load audio file:\n%s", file);
+        MessageBoxA(owner, msg, "AviUtl", MB_OK | MB_ICONWARNING);
+        return FALSE;
+    }
+    if (plugin_manager_is_bridged())
+    {
+        plugin_bridge_open_audio(file, g_editp);
+    }
+    plugin_manager_notify_update(g_editp);
+    refresh_current_frame(owner);
+    return TRUE;
+}
+
+static void reaviutl_audio_open_with_initial(HWND owner, const char *initial_path)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH] = {0};
@@ -1269,6 +1332,10 @@ static void reaviutl_audio_open(HWND owner)
 
     if (!g_editp)
         return;
+    if (initial_path && initial_path[0])
+    {
+        lstrcpynA(file, initial_path, sizeof(file));
+    }
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -1283,26 +1350,12 @@ static void reaviutl_audio_open(HWND owner)
     {
         return;
     }
+    load_audio_into_current_edit(owner, file);
+}
 
-    stop_playback(owner);
-    if (!editp_is_editing(g_editp))
-    {
-        open_media_or_exo(owner, file);
-        return;
-    }
-    if (!editp_open_audio(g_editp, file))
-    {
-        char msg[MAX_PATH + 128];
-        wsprintfA(msg, "Failed to load audio file:\n%s", file);
-        MessageBoxA(owner, msg, "AviUtl", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    if (plugin_manager_is_bridged())
-    {
-        plugin_bridge_open_audio(file, g_editp);
-    }
-    plugin_manager_notify_update(g_editp);
-    refresh_current_frame(owner);
+static void reaviutl_audio_open(HWND owner)
+{
+    reaviutl_audio_open_with_initial(owner, NULL);
 }
 
 static BOOL reaviutl_wav_export(HWND owner)
@@ -1341,7 +1394,7 @@ static void reaviutl_project_open(HWND owner)
 
     if (GetOpenFileNameA(&ofn))
     {
-        open_media_or_exo(owner, file);
+        open_media_or_exo_ex(owner, file, TRUE);
     }
 }
 
@@ -1393,7 +1446,8 @@ static BOOL reaviutl_project_save(HWND owner, BOOL force_save_as)
         ofn.lpstrFile = file;
         ofn.nMaxFile = sizeof(file);
         ofn.lpstrDefExt = "aup";
-        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
+        ofn.Flags = OFN_HIDEREADONLY | OFN_PATHMUSTEXIST |
+                    ((preview_get_sys_config()->overwritecheck == 0) ? OFN_OVERWRITEPROMPT : 0);
 
         if (!GetSaveFileNameA(&ofn))
         {
@@ -1663,7 +1717,7 @@ static void run_system_settings_dialog(HWND owner)
     st.ints[9] = GetPrivateProfileIntA("system", "saveunitsize", 64, ini);
     st.ints[10] = GetPrivateProfileIntA("system", "multithread", 0, ini);
 
-    GetPrivateProfileStringA("system", "defaultsavefile", "", sbuf, sizeof(sbuf), ini);
+    GetPrivateProfileStringA("system", "defaultsavefile", "%p", sbuf, sizeof(sbuf), ini);
     aviutl_dlg_set_str_sjis(&st, 1, sbuf);
     GetPrivateProfileStringA("system", "finishsound", "", sbuf, sizeof(sbuf), ini);
     aviutl_dlg_set_str_sjis(&st, 2, sbuf);
@@ -1686,7 +1740,7 @@ static void run_system_settings_dialog(HWND owner)
     st.checks[10] = GetPrivateProfileIntA("system", "fpsnoconvert", 0, ini) ? 1 : 0;
     st.checks[11] = GetPrivateProfileIntA("system", "tempconfig", 0, ini) ? 1 : 0;
     st.checks[12] = GetPrivateProfileIntA("system", "load30fps", 0, ini) ? 1 : 0;
-    st.checks[13] = GetPrivateProfileIntA("system", "loadfpsadjust", 1, ini) ? 1 : 0;
+    st.checks[13] = GetPrivateProfileIntA("system", "loadfpsadjust", 0, ini) ? 1 : 0;
     st.checks[14] = GetPrivateProfileIntA("system", "yuy2limit", 1, ini) ? 1 : 0;
     st.checks[15] = GetPrivateProfileIntA("system", "overwritecheck", 0, ini) ? 1 : 0;
     st.checks[17] = GetPrivateProfileIntA("system", "threadcpuseparate", 0, ini) ? 1 : 0;
@@ -1753,8 +1807,12 @@ static void run_system_settings_dialog(HWND owner)
     WritePrivateProfileStringA("system", "fpslist", sbuf, ini);
 
     preview_reload_sys_config(owner);
-    update_window_title(owner);
-    InvalidateRect(owner, NULL, FALSE);
+    exfunc_reload_system_settings();
+    if (plugin_manager_is_bridged())
+    {
+        plugin_bridge_invalidate_caches();
+    }
+    refresh_current_frame(owner);
 }
 
 static BOOL on_exout_dlg_cmd(HWND hdlg, int cmd_id, AviUtlDlgState *st, void *user)
@@ -2428,7 +2486,27 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (DragQueryFileA(hDrop, 0, path, MAX_PATH) > 0)
         {
-            open_media_or_exo(hwnd, path);
+            const char *ext = strrchr(path, '.');
+            if (ext && lstrcmpiA(ext, ".wav") == 0 && g_editp && editp_is_editing(g_editp))
+            {
+                if (scfg && scfg->dragdropdialog)
+                {
+                    reaviutl_audio_open_with_initial(hwnd, path);
+                }
+                else
+                {
+                    load_audio_into_current_edit(hwnd, path);
+                }
+            }
+            else if (scfg && scfg->dragdropdialog &&
+                     !(ext && (lstrcmpiA(ext, ".aup") == 0 || lstrcmpiA(ext, ".exo") == 0)))
+            {
+                reaviutl_file_open_with_initial(hwnd, path);
+            }
+            else
+            {
+                open_media_or_exo_ex(hwnd, path, TRUE);
+            }
         }
         DragFinish(hDrop);
         return 0;
@@ -2828,6 +2906,18 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 5399: // settings -> compression -> Plugin Output Settings
             run_exout_config_dialog(hwnd);
             return 0;
+        case 5139: // settings -> Video Filter Order
+            if (plugin_manager_run_priority_dialog(hwnd, FALSE))
+            {
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+        case 5181: // settings -> Audio Filter Order
+            if (plugin_manager_run_priority_dialog(hwnd, TRUE))
+            {
+                refresh_current_frame(hwnd);
+            }
+            return 0;
         case 5131: // edit -> Jump to Frame (Ctrl+G)
             run_move_dialog(hwnd);
             return 0;
@@ -2887,6 +2977,8 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             reaviutl_project_save(hwnd, FALSE);
             return 0;
         case 5157: // file -> Close
+            if (!confirm_discard_current_edit(hwnd))
+                return 0;
             stop_playback(hwnd);
             if (g_editp && editp_is_editing(g_editp))
             {
@@ -2896,6 +2988,8 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         case 1002: // file -> Exit
+            if (!confirm_discard_current_edit(hwnd))
+                return 0;
             shutdown_main_window(hwnd);
             return 0;
 
@@ -3059,6 +3153,8 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_CLOSE:
+        if (!confirm_discard_current_edit(hwnd))
+            return 0;
         shutdown_main_window(hwnd);
         return 0;
 
@@ -3099,6 +3195,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     int ex_idx;
 
     (void)hPrev;
+    g_smoke_exit = (cmdline && strstr(cmdline, "--smoke-exit") != NULL);
 
     // init console before loading plugins so early stdout/lua output is visible
     debug_console_init(FALSE);
@@ -3125,6 +3222,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     }
 
     preview_load_ini(&win_x, &win_y, &win_w, &win_h, &win_max);
+    exfunc_reload_system_settings();
     winsnap_set_enabled(preview_get_sys_config()->windowsnap != 0);
 
     hwnd = CreateWindowExA(

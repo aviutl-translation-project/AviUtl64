@@ -10,6 +10,7 @@
 #include "editp.h"
 #include "exfunc.h"
 #include "i18n.h"
+#include "aviutl_dlg.h"
 #include "winsnap.h"
 #include "debug_console.h"
 
@@ -39,6 +40,7 @@ typedef struct
     HWND hwnd;
     int index;
     int cmd_id;
+    int priority;
     BOOL stage1_initialized;
     BOOL stage2_initialized;
     BOOL faulted;
@@ -255,94 +257,229 @@ static BOOL cb_host_edit_close(EDITP *ep)
     return TRUE;
 }
 
-static BOOL apply_native_video_filters(EDITP *ep, const FILTER *stop_before_fp)
+static void get_plugin_ini_path(char *out_path, size_t out_sz)
 {
-    int i;
-    FILTER_PROC_INFO fpip;
-
-    if (!ep || !editp_is_editing(ep))
-        return FALSE;
-
-    for (i = 0; i < g_plugin_count; i++)
+    char mod_path[MAX_PATH];
+    char *slash;
+    if (GetModuleFileNameA(NULL, mod_path, MAX_PATH) > 0)
     {
-        PluginEntry *e = &g_plugins[i];
-        FILTER *fp = &e->runtime;
+        slash = strrchr(mod_path, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod_path[0] = '\0';
+        _snprintf(out_path, out_sz, "%saviutl.ini", mod_path);
+        out_path[out_sz - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.ini", (int)out_sz);
+    }
+}
 
-        if (stop_before_fp && (fp == stop_before_fp ||
-                               (const FILTER *)e->src_dll == stop_before_fp))
+static void invalidate_downstream_from_entry(int plugin_index)
+{
+    int order[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    const FILTER *downstream[MAX_PLUGINS];
+    int cnt, i, pos = -1, dcnt = 0;
+    BOOL touch_bridge = (plugin_index >= g_plugin_count);
+
+    cnt = plugin_manager_get_execution_order(FALSE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
+    for (i = 0; i < cnt; i++)
+    {
+        if (order[i] == plugin_index)
         {
+            pos = i;
             break;
         }
-        if (!e->stage1_initialized || e->faulted)
-            continue;
-        if (!(fp->flag & FILTER_FLAG_ACTIVE))
-            continue;
-        if (fp->flag & FILTER_FLAG_AUDIO_FILTER)
-            continue;
-        if (!fp->func_proc)
-            continue;
-
-        ZeroMemory(&fpip, sizeof(fpip));
-        fpip.flag = 0;
-        fpip.ycp_edit = editp_get_ycp_edit(ep);
-        fpip.ycp_temp = editp_get_ycp_temp(ep);
-        editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
-        fpip.frame = editp_get_frame(ep);
-        fpip.frame_n = editp_get_frame_n(ep);
-        fpip.org_w = fpip.w;
-        fpip.org_h = fpip.h;
-        fpip.audiop = NULL;
-        fpip.audio_n = 0;
-        fpip.audio_ch = editp_get_audio_ch(ep);
-        fpip.pixelp = NULL;
-        fpip.editp = ep;
-        fpip.yc_size = (int)sizeof(PIXEL_YC);
-        fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
-
-        safe_call_func_proc(e, &fpip);
-
-        // plugins such as exedit may swap fpip.ycp_edit and fpip.ycp_temp
-        if (fpip.ycp_edit == editp_get_ycp_temp(ep))
+    }
+    if (pos >= 0)
+    {
+        for (i = pos + 1; i < cnt; i++)
         {
-            editp_swap_ycp(ep, fpip.ycp_edit, fpip.ycp_temp);
+            int idx = order[i];
+            if (idx >= 0 && idx < g_plugin_count)
+            {
+                downstream[dcnt++] = &g_plugins[idx].runtime;
+            }
+            else if (idx >= g_plugin_count)
+            {
+                touch_bridge = TRUE;
+            }
         }
-        if (fpip.w > 0 && fpip.h > 0 &&
-            fpip.w <= fpip.max_w && fpip.h <= fpip.max_h)
+        if (dcnt > 0)
         {
-            editp_set_dimensions(ep, fpip.w, fpip.h);
+            exfunc_invalidate_filtering_caches_from(downstream, dcnt);
         }
     }
-    return TRUE;
+    if (touch_bridge && plugin_bridge_is_active())
+    {
+        plugin_bridge_invalidate_caches();
+    }
+}
+
+static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep)
+{
+    FILTER_PROC_INFO fpip;
+
+    if (!e || !ep || !e->stage1_initialized || e->faulted || !e->runtime.func_proc)
+        return;
+
+    ZeroMemory(&fpip, sizeof(fpip));
+    fpip.flag = 0;
+    fpip.ycp_edit = editp_get_ycp_edit(ep);
+    fpip.ycp_temp = editp_get_ycp_temp(ep);
+    editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
+    fpip.frame = editp_get_frame(ep);
+    fpip.frame_n = editp_get_frame_n(ep);
+    fpip.org_w = fpip.w;
+    fpip.org_h = fpip.h;
+    fpip.audiop = NULL;
+    fpip.audio_n = 0;
+    fpip.audio_ch = editp_get_audio_ch(ep);
+    fpip.pixelp = NULL;
+    fpip.editp = ep;
+    fpip.yc_size = (int)sizeof(PIXEL_YC);
+    fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+
+    safe_call_func_proc(e, &fpip);
+
+    // plugins such as exedit may swap fpip.ycp_edit and fpip.ycp_temp
+    if (fpip.ycp_edit == editp_get_ycp_temp(ep))
+    {
+        editp_swap_ycp(ep, fpip.ycp_edit, fpip.ycp_temp);
+    }
+    if (fpip.w > 0 && fpip.h > 0 &&
+        fpip.w <= fpip.max_w && fpip.h <= fpip.max_h)
+    {
+        editp_set_dimensions(ep, fpip.w, fpip.h);
+    }
 }
 
 static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_before_fp)
 {
+    int order[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    int k, cnt;
+    BOOL host_loaded = FALSE;
+
     if (!ep || !editp_is_editing(ep))
         return FALSE;
-    editp_load_frame(ep, frame_num);
-    return apply_native_video_filters(ep, stop_before_fp);
+
+    cnt = plugin_manager_get_execution_order(FALSE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
+    for (k = 0; k < cnt; k++)
+    {
+        int idx = order[k];
+        if (idx >= 0 && idx < g_plugin_count)
+        {
+            PluginEntry *e = &g_plugins[idx];
+            FILTER *fp = &e->runtime;
+            if (stop_before_fp && (fp == stop_before_fp ||
+                                   (const FILTER *)e->src_dll == stop_before_fp))
+            {
+                break;
+            }
+            if (!e->stage1_initialized || e->faulted || !fp->func_proc)
+                continue;
+            if (!(fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
+                continue;
+            if (fp->flag & FILTER_FLAG_AUDIO_FILTER)
+                continue;
+
+            if (!host_loaded)
+            {
+                editp_load_frame(ep, frame_num);
+                host_loaded = TRUE;
+            }
+            apply_single_native_video_entry(e, ep);
+        }
+        else if (plugin_bridge_is_active())
+        {
+            int bidx = idx - g_plugin_count;
+            int b_run[BRIDGE_MAX_FILTERS];
+            int run_n = 0;
+            int fl = plugin_bridge_get_filter_flags(bidx);
+
+            if (!(fl & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) ||
+                (fl & FILTER_FLAG_AUDIO_FILTER))
+            {
+                continue;
+            }
+
+            b_run[run_n++] = bidx;
+            while (k + 1 < cnt && order[k + 1] >= g_plugin_count && run_n < BRIDGE_MAX_FILTERS)
+            {
+                int nb = order[k + 1] - g_plugin_count;
+                int nfl = plugin_bridge_get_filter_flags(nb);
+                k++;
+                if ((nfl & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) &&
+                    !(nfl & FILTER_FLAG_AUDIO_FILTER))
+                {
+                    b_run[run_n++] = nb;
+                }
+            }
+            if (!plugin_bridge_render_frame_subset(ep, frame_num, host_loaded, b_run, run_n))
+            {
+                if (!host_loaded)
+                {
+                    editp_load_frame(ep, frame_num);
+                    host_loaded = TRUE;
+                }
+            }
+            else
+            {
+                host_loaded = TRUE;
+            }
+        }
+    }
+
+    if (!host_loaded)
+    {
+        editp_load_frame(ep, frame_num);
+    }
+    return TRUE;
 }
 
 static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
                                  int frame_num, PIXEL_YC *out_ycp)
 {
     int saved_frame;
-    int w = 0, h = 0, max_w = 0, max_h = 0;
+    int saved_w = 0, saved_h = 0, max_w = 0, max_h = 0;
+    int w = 0, h = 0;
+    PIXEL_YC *saved_edit, *saved_temp;
+    PIXEL_YC *tmp_edit = NULL, *tmp_temp = NULL;
 
     if (!ep || !out_ycp || !editp_is_editing(ep))
         return FALSE;
+
     saved_frame = editp_get_frame(ep);
-    if (stop_before_fp == NULL)
+    editp_get_dimensions(ep, &saved_w, &saved_h, &max_w, &max_h);
+    saved_edit = editp_get_ycp_edit(ep);
+    saved_temp = editp_get_ycp_temp(ep);
+
+    // isolate temporary VRAM buffers so nested get_ycp_filtering* calls inside func_proc never clobber outer fpip->ycp_edit
+    if (max_w > 0 && max_h > 0)
     {
-        plugin_manager_render_video_frame(ep, frame_num);
+        tmp_edit = (PIXEL_YC *)calloc((size_t)max_w * (size_t)max_h, sizeof(PIXEL_YC));
+        tmp_temp = (PIXEL_YC *)calloc((size_t)max_w * (size_t)max_h, sizeof(PIXEL_YC));
     }
-    else
+    if (tmp_edit && tmp_temp)
     {
-        render_pipeline_range(ep, frame_num, stop_before_fp);
+        editp_swap_ycp(ep, tmp_edit, tmp_temp);
     }
+
+    render_pipeline_range(ep, frame_num, stop_before_fp);
+
     editp_get_dimensions(ep, &w, &h, &max_w, &max_h);
     memcpy(out_ycp, editp_get_ycp_edit(ep),
            (size_t)max_w * (size_t)max_h * sizeof(PIXEL_YC));
+
+    if (tmp_edit && tmp_temp)
+    {
+        editp_swap_ycp(ep, saved_edit, saved_temp);
+    }
+    free(tmp_edit);
+    free(tmp_temp);
+
     if (saved_frame != frame_num)
     {
         editp_set_frame(ep, saved_frame);
@@ -442,6 +579,7 @@ static void apply_track_value_change(PluginEntry *e, HWND hwnd, int t, int new_v
         safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
                           exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
     }
+    invalidate_downstream_from_entry(e->index);
     post_host_redraw(1);
 }
 
@@ -502,6 +640,7 @@ static void reset_filter_entry_defaults(PluginEntry *e, HWND hwnd)
         safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
                           exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
     }
+    invalidate_downstream_from_entry(e->index);
     InvalidateRect(hwnd, NULL, FALSE);
     post_host_redraw(1);
 }
@@ -707,6 +846,7 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                         safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
                                           exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
                     }
+                    invalidate_downstream_from_entry(e->index);
                     post_host_redraw(1);
                     return 0;
                 }
@@ -720,6 +860,7 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             e, hwnd, msg, wp, lp, exfunc_get_editp(), "AviUtlFilterWndProc");
         if (need_redraw)
         {
+            invalidate_downstream_from_entry(e->index);
             post_host_redraw(1);
         }
         if (msg == WM_CONTEXTMENU && need_redraw)
@@ -1076,14 +1217,47 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
     bind_host_exfunc_callbacks(owner_hwnd, editp);
 
     // create owned tool windows & populate runtime FILTER structs for ALL plugins before calling func_init on any of them (so get_filterp(0..N-1) works)
-    for (i = 0; i < g_plugin_count; i++)
     {
-        PluginEntry *e = &g_plugins[i];
-        e->hwnd = create_filter_window(e, owner_hwnd);
-        plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
-        dbg_plugin("Filter[%d] '%s' | HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X",
-                   i, e->name, (void *)e->module, (void *)&e->runtime,
-                   (void *)e->hwnd, (unsigned)e->runtime.flag);
+        char ini[MAX_PATH];
+        int next_vid_prio = 1;
+        int next_aud_prio = 1;
+        get_plugin_ini_path(ini, sizeof(ini));
+
+        for (i = 0; i < g_plugin_count; i++)
+        {
+            PluginEntry *e = &g_plugins[i];
+            int fl, def_prio;
+            e->hwnd = create_filter_window(e, owner_hwnd);
+            plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
+            fl = e->runtime.flag;
+            if (fl & FILTER_FLAG_PRIORITY_HIGHEST)
+            {
+                def_prio = 0;
+            }
+            else if (fl & FILTER_FLAG_PRIORITY_LOWEST)
+            {
+                def_prio = 127;
+            }
+            else if (fl & FILTER_FLAG_AUDIO_FILTER)
+            {
+                def_prio = (next_aud_prio < 126) ? next_aud_prio++ : 126;
+            }
+            else
+            {
+                def_prio = (next_vid_prio < 126) ? next_vid_prio++ : 126;
+            }
+            if (e->name[0])
+            {
+                e->priority = (int)GetPrivateProfileIntA(e->name, "priority", def_prio, ini);
+            }
+            else
+            {
+                e->priority = def_prio;
+            }
+            dbg_plugin("Filter[%d] '%s' | HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X prio=%d",
+                       i, e->name, (void *)e->module, (void *)&e->runtime,
+                       (void *)e->hwnd, (unsigned)e->runtime.flag, e->priority);
+        }
     }
 
     // run func_init(fp) on each filter in order
@@ -1519,6 +1693,212 @@ int plugin_manager_get_flags(int index)
     return 0;
 }
 
+BOOL plugin_manager_has_func_proc(int index)
+{
+    if (index < 0)
+        return FALSE;
+    if (index < g_plugin_count)
+    {
+        return g_plugins[index].stage1_initialized && !g_plugins[index].faulted &&
+               g_plugins[index].runtime.func_proc != NULL;
+    }
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_get_filter_has_proc(index - g_plugin_count);
+    }
+    return FALSE;
+}
+
+int plugin_manager_get_priority(int index)
+{
+    if (index < 0)
+        return 64;
+    if (index < g_plugin_count)
+        return g_plugins[index].priority;
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_priority(index - g_plugin_count);
+    return 64;
+}
+
+BOOL plugin_manager_set_priority(int index, int priority, BOOL save_ini)
+{
+    if (index < 0)
+        return FALSE;
+    if (index < g_plugin_count)
+    {
+        PluginEntry *e = &g_plugins[index];
+        e->priority = priority;
+        if (save_ini && e->name[0])
+        {
+            char ini[MAX_PATH], val[32];
+            get_plugin_ini_path(ini, sizeof(ini));
+            wsprintfA(val, "%d", priority);
+            WritePrivateProfileStringA(e->name, "priority", val, ini);
+        }
+        exfunc_invalidate_all_caches();
+        return TRUE;
+    }
+    if (plugin_bridge_is_active())
+    {
+        BOOL ok = plugin_bridge_set_filter_priority(index - g_plugin_count, priority, save_ini);
+        exfunc_invalidate_all_caches();
+        return ok;
+    }
+    return FALSE;
+}
+
+static int filter_priority_tier(int flags)
+{
+    if (flags & FILTER_FLAG_PRIORITY_HIGHEST)
+        return 0;
+    if (flags & FILTER_FLAG_PRIORITY_LOWEST)
+        return 2;
+    return 1;
+}
+
+// 0x00430770: sorted filter execution order across native & bridged filters
+int plugin_manager_get_execution_order(BOOL audio_mode, int *out_indices, int max_count)
+{
+    int cand[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    int prios[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    int tiers[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    int n = 0, i, j, total = plugin_manager_get_count();
+
+    if (!out_indices || max_count <= 0)
+        return 0;
+
+    for (i = 0; i < total && n < (int)(sizeof(cand) / sizeof(cand[0])); i++)
+    {
+        int fl = plugin_manager_get_flags(i);
+        BOOL is_aud = (fl & FILTER_FLAG_AUDIO_FILTER) != 0;
+        if (is_aud != (audio_mode != 0))
+            continue;
+        if (fl & FILTER_FLAG_DISP_FILTER)
+            continue;
+        if (!plugin_manager_has_func_proc(i))
+            continue;
+        cand[n] = i;
+        prios[n] = plugin_manager_get_priority(i);
+        tiers[n] = filter_priority_tier(fl);
+        n++;
+    }
+
+    // stable insertion sort by (priority, tier, registration order)
+    for (i = 1; i < n; i++)
+    {
+        int ci = cand[i], pi = prios[i], ti = tiers[i];
+        j = i - 1;
+        while (j >= 0 && (prios[j] > pi || (prios[j] == pi && tiers[j] > ti)))
+        {
+            cand[j + 1] = cand[j];
+            prios[j + 1] = prios[j];
+            tiers[j + 1] = tiers[j];
+            j--;
+        }
+        cand[j + 1] = ci;
+        prios[j + 1] = pi;
+        tiers[j + 1] = ti;
+    }
+
+    if (n > max_count)
+        n = max_count;
+    for (i = 0; i < n; i++)
+    {
+        out_indices[i] = cand[i];
+    }
+    return n;
+}
+
+// 0x00431210: Video (5139) / Audio (5181) Filter Execution Order ("PRIORITYLIST") dialog
+BOOL plugin_manager_run_priority_dialog(HWND owner, BOOL audio_mode)
+{
+    enum
+    {
+        MAX_PRIO_DLG = MAX_PLUGINS + BRIDGE_MAX_FILTERS
+    };
+    wchar_t names[MAX_PRIO_DLG][256];
+    const wchar_t *ptrs[MAX_PRIO_DLG + 1];
+    int reg_idx[MAX_PRIO_DLG];
+    int ord[MAX_PRIO_DLG];
+    int exec_order[MAX_PRIO_DLG];
+    int count = 0, exec_n, pass, i, k, rank, total;
+    AviUtlDlgState st;
+
+    total = plugin_manager_get_count();
+    // populate reg_idx in 3 passes (HIGHEST, normal, LOWEST) so IDC_DLG_LST_RESET (32700) ord[k]=k matches 0x00430fe0
+    for (pass = 0; pass < 3; pass++)
+    {
+        for (i = 0; i < total && count < MAX_PRIO_DLG; i++)
+        {
+            int fl = plugin_manager_get_flags(i);
+            BOOL is_aud = (fl & FILTER_FLAG_AUDIO_FILTER) != 0;
+            if (is_aud != (audio_mode != 0))
+                continue;
+            if (fl & (FILTER_FLAG_INTERLACE_FILTER | FILTER_FLAG_DISP_FILTER))
+                continue;
+            if (!plugin_manager_has_func_proc(i))
+                continue;
+            if (filter_priority_tier(fl) != pass)
+                continue;
+
+            sjis_to_wide(plugin_manager_get_name(i), names[count], 256);
+            if (!names[count][0])
+                lstrcpyW(names[count], L"Filter");
+            ptrs[count] = names[count];
+            reg_idx[count] = i;
+            ord[count] = count;
+            count++;
+        }
+    }
+    ptrs[count] = NULL;
+    if (count <= 0)
+        return FALSE;
+
+    exec_n = plugin_manager_get_execution_order(audio_mode, exec_order, MAX_PRIO_DLG);
+    rank = 0;
+    for (i = 0; i < exec_n; i++)
+    {
+        for (k = 0; k < count; k++)
+        {
+            if (reg_idx[k] == exec_order[i])
+            {
+                ord[k] = rank++;
+                break;
+            }
+        }
+    }
+
+    aviutl_dlg_init(&st);
+    st.list_items[0] = ptrs;
+    st.list_order[0] = ord;
+    st.list_count[0] = count;
+
+    if (aviutl_dlg_run(owner, "PRIORITYLIST", &st) != IDOK)
+        return FALSE;
+
+    for (rank = 0; rank < count; rank++)
+    {
+        int chosen = reg_idx[rank];
+        for (k = 0; k < count; k++)
+        {
+            if (ord[k] == rank)
+            {
+                chosen = reg_idx[k];
+                break;
+            }
+        }
+        // assign 1..count so any unlisted INTERLACE_FILTER (priority 0) stays ahead
+        plugin_manager_set_priority(chosen, rank + 1, TRUE);
+    }
+
+    exfunc_invalidate_all_caches();
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_invalidate_caches();
+    }
+    return TRUE;
+}
+
 FILTER *plugin_manager_get_filter(int index)
 {
     if (index < 0 || index >= g_plugin_count)
@@ -1653,7 +2033,10 @@ BOOL plugin_manager_set_active(int index, BOOL active)
         {
             BOOL ok = plugin_bridge_set_filter_active(index - g_plugin_count, active ? 1 : 0);
             if (ok)
+            {
+                invalidate_downstream_from_entry(index);
                 post_host_redraw(3);
+            }
             return ok;
         }
         return FALSE;
@@ -1687,6 +2070,7 @@ BOOL plugin_manager_set_active(int index, BOOL active)
             safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
                               exfunc_get_editp(), "WM_FILTER_CHANGE_ACTIVE");
         }
+        invalidate_downstream_from_entry(index);
     }
     post_host_redraw(3);
     post_host_redraw(1);
@@ -1704,6 +2088,7 @@ BOOL plugin_manager_toggle_active(int index)
             BOOL ok = plugin_bridge_set_filter_active(index - g_plugin_count, 2);
             if (ok)
             {
+                invalidate_downstream_from_entry(index);
                 post_host_redraw(3);
                 post_host_redraw(1);
             }
@@ -1729,6 +2114,8 @@ void plugin_manager_disable_all_filters(void)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_set_filter_active(0, 3);
+        exfunc_invalidate_all_caches();
+        plugin_bridge_invalidate_caches();
         post_host_redraw(3);
         post_host_redraw(1);
     }
@@ -1747,7 +2134,11 @@ BOOL plugin_manager_exec_import_export(int index, BOOL is_export)
         {
             BOOL ok = plugin_bridge_filter_io(index - g_plugin_count, is_export, exfunc_get_editp());
             if (ok)
+            {
+                if (!is_export)
+                    invalidate_downstream_from_entry(index);
                 post_host_redraw(1);
+            }
             return ok;
         }
         return FALSE;
@@ -1758,6 +2149,8 @@ BOOL plugin_manager_exec_import_export(int index, BOOL is_export)
     if (safe_call_wndproc(e, e->hwnd, msg, 0, 0, exfunc_get_editp(),
                           is_export ? "WM_FILTER_EXPORT" : "WM_FILTER_IMPORT"))
     {
+        if (!is_export)
+            invalidate_downstream_from_entry(index);
         post_host_redraw(1);
     }
     return TRUE;
@@ -2011,53 +2404,100 @@ void plugin_manager_modify_title(EDITP *ep, int frame, char *title, int max_titl
     }
 }
 
+int plugin_manager_apply_audio_filter(int filter_id, EDITP *ep, int frame_num,
+                                      short *buf, int samples)
+{
+    PluginEntry *e;
+    FILTER *fp;
+    FILTER_PROC_INFO fpip;
+
+    if (!ep || !buf || samples <= 0 || filter_id < 0 || filter_id >= g_plugin_count)
+        return samples;
+
+    e = &g_plugins[filter_id];
+    fp = &e->runtime;
+    if (!e->stage1_initialized || e->faulted || !fp->func_proc)
+        return samples;
+    if (!(fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
+        return samples;
+    if (!(fp->flag & FILTER_FLAG_AUDIO_FILTER))
+        return samples;
+
+    ZeroMemory(&fpip, sizeof(fpip));
+    fpip.ycp_edit = editp_get_ycp_edit(ep);
+    fpip.ycp_temp = editp_get_ycp_temp(ep);
+    editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
+    fpip.frame = frame_num;
+    fpip.frame_n = editp_get_frame_n(ep);
+    fpip.org_w = fpip.w;
+    fpip.org_h = fpip.h;
+    fpip.audiop = buf;
+    fpip.audio_n = samples;
+    fpip.audio_ch = editp_get_audio_ch(ep);
+    fpip.editp = ep;
+    fpip.yc_size = (int)sizeof(PIXEL_YC);
+    fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+
+    safe_call_func_proc(e, &fpip);
+    if (fpip.audio_n > 0)
+    {
+        samples = fpip.audio_n;
+    }
+    return samples;
+}
+
 int plugin_manager_apply_audio_filters(EDITP *ep, int frame_num, short *buf,
                                        int samples, const FILTER *stop_before_fp)
 {
-    int i;
-    FILTER_PROC_INFO fpip;
+    int order[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
+    int k, cnt;
 
     if (!ep || !buf || samples <= 0 || !editp_is_editing(ep))
     {
         return samples;
     }
 
-    for (i = 0; i < g_plugin_count; i++)
+    cnt = plugin_manager_get_execution_order(TRUE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
+    for (k = 0; k < cnt; k++)
     {
-        PluginEntry *e = &g_plugins[i];
-        FILTER *fp = &e->runtime;
-
-        if (stop_before_fp && (fp == stop_before_fp ||
-                               (const FILTER *)e->src_dll == stop_before_fp))
+        int idx = order[k];
+        if (idx >= 0 && idx < g_plugin_count)
         {
-            break;
+            PluginEntry *e = &g_plugins[idx];
+            FILTER *fp = &e->runtime;
+            if (stop_before_fp && (fp == stop_before_fp ||
+                                   (const FILTER *)e->src_dll == stop_before_fp))
+            {
+                break;
+            }
+            samples = plugin_manager_apply_audio_filter(idx, ep, frame_num, buf, samples);
         }
-        if (!e->stage1_initialized || e->faulted || !fp->func_proc)
-            continue;
-        if (!(fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
-            continue;
-        if (!(fp->flag & FILTER_FLAG_AUDIO_FILTER))
-            continue;
-
-        ZeroMemory(&fpip, sizeof(fpip));
-        fpip.ycp_edit = editp_get_ycp_edit(ep);
-        fpip.ycp_temp = editp_get_ycp_temp(ep);
-        editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
-        fpip.frame = frame_num;
-        fpip.frame_n = editp_get_frame_n(ep);
-        fpip.org_w = fpip.w;
-        fpip.org_h = fpip.h;
-        fpip.audiop = buf;
-        fpip.audio_n = samples;
-        fpip.audio_ch = editp_get_audio_ch(ep);
-        fpip.editp = ep;
-        fpip.yc_size = (int)sizeof(PIXEL_YC);
-        fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
-
-        safe_call_func_proc(e, &fpip);
-        if (fpip.audio_n > 0)
+        else if (plugin_bridge_is_active())
         {
-            samples = fpip.audio_n;
+            int bidx = idx - g_plugin_count;
+            int b_run[BRIDGE_MAX_FILTERS];
+            int run_n = 0;
+            int fl = plugin_bridge_get_filter_flags(bidx);
+
+            if (!(fl & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) ||
+                !(fl & FILTER_FLAG_AUDIO_FILTER))
+            {
+                continue;
+            }
+            b_run[run_n++] = bidx;
+            while (k + 1 < cnt && order[k + 1] >= g_plugin_count && run_n < BRIDGE_MAX_FILTERS)
+            {
+                int nb = order[k + 1] - g_plugin_count;
+                int nfl = plugin_bridge_get_filter_flags(nb);
+                k++;
+                if ((nfl & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) &&
+                    (nfl & FILTER_FLAG_AUDIO_FILTER))
+                {
+                    b_run[run_n++] = nb;
+                }
+            }
+            samples = plugin_bridge_render_audio_subset(
+                ep, frame_num, buf, samples, editp_get_audio_ch(ep), b_run, run_n);
         }
     }
     return samples;
@@ -2073,10 +2513,6 @@ int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL
     if (!buf || samples <= 0 || nofilter)
     {
         return samples;
-    }
-    if (plugin_bridge_is_active())
-    {
-        samples = plugin_bridge_render_audio(ep, frame_num, buf, samples, editp_get_audio_ch(ep));
     }
     return plugin_manager_apply_audio_filters(ep, frame_num, buf, samples, NULL);
 }
@@ -2168,6 +2604,9 @@ BOOL plugin_manager_load_aup(const char *aup_path, EDITP *ep)
     }
     if (ok)
     {
+        exfunc_invalidate_all_caches();
+        if (plugin_bridge_is_active())
+            plugin_bridge_invalidate_caches();
         post_host_redraw(2);
     }
     return ok;
@@ -2197,6 +2636,7 @@ BOOL plugin_manager_save_aup(const char *aup_path, EDITP *ep)
 void plugin_manager_notify_file_open(EDITP *ep)
 {
     int i;
+    exfunc_invalidate_all_caches();
     if (plugin_bridge_is_active())
     {
         if (ep && editp_get_edit_path(ep)[0])
@@ -2218,6 +2658,7 @@ void plugin_manager_notify_file_open(EDITP *ep)
 void plugin_manager_notify_file_close(EDITP *ep)
 {
     int i;
+    exfunc_invalidate_all_caches();
     aup_clear_preserved_chunks();
     if (plugin_bridge_is_active())
     {
@@ -2364,18 +2805,7 @@ BOOL plugin_manager_sync_from_bridge(EDITP *ep)
 
 BOOL plugin_manager_render_video_frame(EDITP *ep, int frame_num)
 {
-    if (!ep)
-        return FALSE;
-
-    if (plugin_bridge_is_active())
-    {
-        if (!plugin_bridge_render_frame(ep, frame_num, FALSE))
-            return FALSE;
-        apply_native_video_filters(ep, NULL);
-        return TRUE;
-    }
-
-    if (!editp_is_editing(ep))
+    if (!ep || !editp_is_editing(ep))
         return FALSE;
     return render_pipeline_range(ep, frame_num, NULL);
 }
@@ -2384,34 +2814,16 @@ BOOL plugin_manager_apply_filter(int filter_id, void *editp_ptr)
 {
     EDITP *ep = (EDITP *)editp_ptr;
     PluginEntry *e;
-    FILTER_PROC_INFO fpip;
 
     if (!ep || filter_id < 0 || filter_id >= g_plugin_count)
         return FALSE;
     e = &g_plugins[filter_id];
-    if (!e->stage1_initialized || !e->runtime.func_proc)
+    if (!e->stage1_initialized || e->faulted || !e->runtime.func_proc)
         return FALSE;
     if (e->runtime.flag & FILTER_FLAG_AUDIO_FILTER)
         return FALSE;
 
-    ZeroMemory(&fpip, sizeof(fpip));
-    fpip.ycp_edit = editp_get_ycp_edit(ep);
-    fpip.ycp_temp = editp_get_ycp_temp(ep);
-    editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
-    fpip.frame = editp_get_frame(ep);
-    fpip.frame_n = editp_get_frame_n(ep);
-    fpip.org_w = fpip.w;
-    fpip.org_h = fpip.h;
-    fpip.editp = ep;
-    fpip.yc_size = (int)sizeof(PIXEL_YC);
-    fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
-
-    if (!e->runtime.func_proc(&e->runtime, &fpip))
-        return FALSE;
-    if (fpip.ycp_edit == editp_get_ycp_temp(ep))
-    {
-        editp_swap_ycp(ep, fpip.ycp_edit, fpip.ycp_temp);
-    }
+    apply_single_native_video_entry(e, ep);
     return TRUE;
 }
 

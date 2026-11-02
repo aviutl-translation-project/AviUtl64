@@ -37,7 +37,7 @@ static HICON g_icon_play = NULL;
 static HICON g_icon_stop = NULL;
 
 static AviUtlSystemConfig g_sys_cfg = {
-    5, 30, 899, 8991, 1, 1, 1, 0, 1, 1};
+    5, 30, 899, 8991, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0};
 
 static uint32_t g_preview_flags = PREVIEW_FLAG_AUDIO | PREVIEW_FLAG_SIZEAUTO;
 static int g_zoom = PREVIEW_ZOOM_100;
@@ -343,6 +343,10 @@ void preview_load_ini(int *out_x, int *out_y, int *out_w, int *out_h, BOOL *out_
     g_sys_cfg.movieplaymain = GetPrivateProfileIntA("system", "movieplaymain", 0, ini);
     g_sys_cfg.trackbarclick = GetPrivateProfileIntA("system", "trackbarclick", 1, ini);
     g_sys_cfg.windowsnap = GetPrivateProfileIntA("system", "windowsnap", 1, ini);
+    g_sys_cfg.overwritecheck = GetPrivateProfileIntA("system", "overwritecheck", 0, ini);
+    g_sys_cfg.dragdropdialog = GetPrivateProfileIntA("system", "dragdropdialog", 0, ini);
+    g_sys_cfg.openprojectaup = GetPrivateProfileIntA("system", "openprojectaup", 1, ini);
+    g_sys_cfg.closedialog = GetPrivateProfileIntA("system", "closedialog", 0, ini);
 
     // [window] section (0x00460960)
     x = GetPrivateProfileIntA("window", "x", CW_USEDEFAULT, ini);
@@ -499,6 +503,10 @@ void preview_reload_sys_config(HWND main_hwnd)
     g_sys_cfg.movieplaymain = GetPrivateProfileIntA("system", "movieplaymain", 0, ini);
     g_sys_cfg.trackbarclick = GetPrivateProfileIntA("system", "trackbarclick", 1, ini);
     g_sys_cfg.windowsnap = GetPrivateProfileIntA("system", "windowsnap", 1, ini);
+    g_sys_cfg.overwritecheck = GetPrivateProfileIntA("system", "overwritecheck", 0, ini);
+    g_sys_cfg.dragdropdialog = GetPrivateProfileIntA("system", "dragdropdialog", 0, ini);
+    g_sys_cfg.openprojectaup = GetPrivateProfileIntA("system", "openprojectaup", 1, ini);
+    g_sys_cfg.closedialog = GetPrivateProfileIntA("system", "closedialog", 0, ini);
 
     page_sz = abs(g_sys_cfg.moveA);
     if (page_sz < 1)

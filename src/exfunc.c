@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commdlg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,8 +26,8 @@ static PIXEL_YC *g_filtering_yc_buf = NULL;
 static unsigned char *g_disp_bgr_buf = NULL;
 static size_t g_disp_bgr_cap = 0;
 
-// persistent multithreaded worker pool for exec_multi_thread_func
-#define MT_MAX_THREADS 8
+// persistent multithreaded worker pool for exec_multi_thread_func (0x00434b80)
+#define MT_MAX_THREADS 64
 
 typedef struct
 {
@@ -40,10 +41,204 @@ static BOOL g_mt_init = FALSE;
 static volatile LONG g_mt_busy = 0;
 static volatile BOOL g_mt_quit = FALSE;
 static int g_mt_thread_num = 1;
+static int g_mt_cfg_threads = 0;
+static BOOL g_mt_cpu_sep = FALSE;
+static DWORD_PTR g_mt_core0_mask = 0;
 static MULTI_THREAD_FUNC g_mt_func = NULL;
 static void *g_mt_param1 = NULL;
 static void *g_mt_param2 = NULL;
 static MtWorker g_mt_workers[MT_MAX_THREADS];
+
+// cached [system] settings for EXFUNC dialogs & LRU cache budget
+static BOOL g_sys_cfg_loaded = FALSE;
+static int g_cfg_overwritecheck = 0;
+static size_t g_cache_budget_bytes = 32u * 1024u * 1024u;
+static size_t g_cache_used_bytes = 0;
+static uint64_t g_cache_lru_clock = 1;
+static int g_filtering_cache_depth = 0;
+
+#define MAX_FILTER_CACHES 128
+#define MAX_SOURCE_CACHE_SLOTS 64
+
+typedef struct FilterCacheSlot
+{
+    int frame_plus1; // 0 = empty, frame + 1 when valid (0x00432070)
+    int orig_w;
+    int orig_h;
+    uint64_t lru_seq;
+    void *raw_alloc;
+    PIXEL_YC *ret_ptr;
+    size_t alloc_bytes;
+} FilterCacheSlot;
+
+typedef struct FilterCacheEntry
+{
+    FILTER *fp;
+    int w;
+    int h;
+    int d;
+    int flag;
+    FilterCacheSlot *slots;
+    int slot_cap;
+} FilterCacheEntry;
+
+typedef struct SourceCacheSlot
+{
+    int frame_plus1;
+    uint64_t lru_seq;
+    PIXEL_YC *ycp;
+    size_t alloc_bytes;
+} SourceCacheSlot;
+
+static FilterCacheEntry g_filter_caches[MAX_FILTER_CACHES];
+static int g_filter_cache_count = 0;
+static SourceCacheSlot g_source_cache[MAX_SOURCE_CACHE_SLOTS];
+
+static const char *ensure_ini_path(void);
+
+static void mt_shutdown_pool(void)
+{
+    int i;
+    if (g_mt_init && g_mt_thread_num > 1)
+    {
+        g_mt_quit = TRUE;
+        for (i = 1; i < g_mt_thread_num; i++)
+        {
+            if (g_mt_workers[i].thread)
+            {
+                SetEvent(g_mt_workers[i].start_ev);
+                WaitForSingleObject(g_mt_workers[i].thread, 2000);
+                CloseHandle(g_mt_workers[i].thread);
+                CloseHandle(g_mt_workers[i].start_ev);
+                CloseHandle(g_mt_workers[i].done_ev);
+                memset(&g_mt_workers[i], 0, sizeof(MtWorker));
+            }
+        }
+    }
+    g_mt_init = FALSE;
+    g_mt_thread_num = 1;
+    g_mt_core0_mask = 0;
+}
+
+static void ensure_sys_cfg_loaded(void)
+{
+    if (!g_sys_cfg_loaded)
+    {
+        exfunc_reload_system_settings();
+    }
+}
+
+static void free_filter_cache_slot_buf(FilterCacheSlot *s)
+{
+    if (!s)
+        return;
+    if (s->raw_alloc)
+    {
+        free(s->raw_alloc);
+        s->raw_alloc = NULL;
+        s->ret_ptr = NULL;
+        if (g_cache_used_bytes >= s->alloc_bytes)
+            g_cache_used_bytes -= s->alloc_bytes;
+        else
+            g_cache_used_bytes = 0;
+        s->alloc_bytes = 0;
+    }
+    s->frame_plus1 = 0;
+    s->lru_seq = 0;
+}
+
+static void free_filter_cache_entry(FilterCacheEntry *ce)
+{
+    int i;
+    if (!ce)
+        return;
+    if (ce->slots)
+    {
+        for (i = 0; i < ce->slot_cap; i++)
+        {
+            free_filter_cache_slot_buf(&ce->slots[i]);
+        }
+        free(ce->slots);
+        ce->slots = NULL;
+    }
+    ce->slot_cap = 0;
+}
+
+static void free_source_cache_slot_buf(SourceCacheSlot *s)
+{
+    if (!s)
+        return;
+    if (s->ycp)
+    {
+        free(s->ycp);
+        s->ycp = NULL;
+        if (g_cache_used_bytes >= s->alloc_bytes)
+            g_cache_used_bytes -= s->alloc_bytes;
+        else
+            g_cache_used_bytes = 0;
+        s->alloc_bytes = 0;
+    }
+    s->frame_plus1 = 0;
+    s->lru_seq = 0;
+}
+
+// evict oldest allocated cache slot across all filtering + source caches to stay within sharecache MB
+static BOOL cache_evict_one_oldest(const void *protect_ptr)
+{
+    uint64_t best_seq = ~(uint64_t)0;
+    FilterCacheSlot *best_fs = NULL;
+    SourceCacheSlot *best_ss = NULL;
+    int i, j;
+
+    for (i = 0; i < g_filter_cache_count; i++)
+    {
+        FilterCacheEntry *ce = &g_filter_caches[i];
+        if (!ce->slots)
+            continue;
+        for (j = 0; j < ce->slot_cap; j++)
+        {
+            FilterCacheSlot *s = &ce->slots[j];
+            if (s->raw_alloc && s->ret_ptr != protect_ptr && s->lru_seq < best_seq)
+            {
+                best_seq = s->lru_seq;
+                best_fs = s;
+                best_ss = NULL;
+            }
+        }
+    }
+    for (i = 0; i < MAX_SOURCE_CACHE_SLOTS; i++)
+    {
+        SourceCacheSlot *s = &g_source_cache[i];
+        if (s->ycp && s->ycp != protect_ptr && s->lru_seq < best_seq)
+        {
+            best_seq = s->lru_seq;
+            best_ss = s;
+            best_fs = NULL;
+        }
+    }
+
+    if (best_fs)
+    {
+        free_filter_cache_slot_buf(best_fs);
+        return TRUE;
+    }
+    if (best_ss)
+    {
+        free_source_cache_slot_buf(best_ss);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void cache_enforce_budget(size_t incoming_bytes, const void *protect_ptr)
+{
+    ensure_sys_cfg_loaded();
+    while (g_cache_used_bytes + incoming_bytes > g_cache_budget_bytes)
+    {
+        if (!cache_evict_one_oldest(protect_ptr))
+            break;
+    }
+}
 
 static DWORD WINAPI mt_worker_proc(LPVOID arg)
 {
@@ -68,19 +263,48 @@ static DWORD WINAPI mt_worker_proc(LPVOID arg)
 static void mt_ensure_pool(void)
 {
     SYSTEM_INFO sysinfo;
+    DWORD_PTR proc_mask = 0, sys_mask = 0;
+    DWORD_PTR core_masks[MT_MAX_THREADS];
+    int core_count = 0;
     int n, i;
 
+    ensure_sys_cfg_loaded();
     if (g_mt_init)
         return;
     g_mt_init = TRUE;
     g_mt_quit = FALSE;
+    g_mt_core0_mask = 0;
 
     GetSystemInfo(&sysinfo);
-    n = (int)sysinfo.dwNumberOfProcessors;
+    if (g_mt_cfg_threads > 0)
+    {
+        n = g_mt_cfg_threads;
+    }
+    else
+    {
+        n = (int)sysinfo.dwNumberOfProcessors;
+    }
     if (n < 1)
         n = 1;
-    if (n > 4)
-        n = 4; // 4 threads matches typical aviutl sweet spot without contention
+    if (n > MT_MAX_THREADS)
+        n = MT_MAX_THREADS;
+
+    if (g_mt_cpu_sep && GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) && proc_mask != 0)
+    {
+        int b;
+        for (b = 0; b < (int)(sizeof(DWORD_PTR) * 8) && core_count < MT_MAX_THREADS; b++)
+        {
+            DWORD_PTR bit = ((DWORD_PTR)1u) << b;
+            if (proc_mask & bit)
+            {
+                core_masks[core_count++] = bit;
+            }
+        }
+        if (core_count > 0)
+        {
+            g_mt_core0_mask = core_masks[0];
+        }
+    }
 
     g_mt_thread_num = n;
     for (i = 1; i < n; i++)
@@ -92,8 +316,17 @@ static void mt_ensure_pool(void)
                                               &g_mt_workers[i], 0, NULL);
         if (!g_mt_workers[i].thread)
         {
+            if (g_mt_workers[i].start_ev)
+                CloseHandle(g_mt_workers[i].start_ev);
+            if (g_mt_workers[i].done_ev)
+                CloseHandle(g_mt_workers[i].done_ev);
+            memset(&g_mt_workers[i], 0, sizeof(MtWorker));
             g_mt_thread_num = i;
             break;
+        }
+        if (g_mt_cpu_sep && core_count > 0)
+        {
+            SetThreadAffinityMask(g_mt_workers[i].thread, core_masks[i % core_count]);
         }
     }
 }
@@ -556,6 +789,7 @@ static BOOL __cdecl impl_dlg_get_save_name(LPSTR name, LPSTR filter, LPSTR def)
     char flt_buf[512];
     if (!name)
         return FALSE;
+    ensure_sys_cfg_loaded();
     if (def && def[0])
         lstrcpynA(name, def, MAX_PATH);
     else
@@ -567,7 +801,9 @@ static BOOL __cdecl impl_dlg_get_save_name(LPSTR name, LPSTR filter, LPSTR def)
     ofn.lpstrFilter = prepare_dlg_filter(filter, flt_buf, sizeof(flt_buf));
     ofn.lpstrFile = name;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    // 0x00412020: overwritecheck != 0 means "Do NOT confirm overwrite"
+    ofn.Flags = OFN_HIDEREADONLY | OFN_NOCHANGEDIR |
+                ((g_cfg_overwritecheck == 0) ? OFN_OVERWRITEPROMPT : 0);
     return GetSaveFileNameA(&ofn);
 }
 
@@ -728,27 +964,314 @@ static int __cdecl impl_get_audio_filtering(FILTER *fp, void *editp, int n, void
     return editp_read_audio_frame(ep, n, (short *)buf);
 }
 
-// +0x0b0
+static FilterCacheEntry *find_or_create_filter_cache(FILTER *fp, BOOL create_if_missing)
+{
+    int i;
+    if (!fp)
+        return NULL;
+    for (i = 0; i < g_filter_cache_count; i++)
+    {
+        if (g_filter_caches[i].fp == fp)
+            return &g_filter_caches[i];
+    }
+    if (!create_if_missing || g_filter_cache_count >= MAX_FILTER_CACHES)
+        return NULL;
+    memset(&g_filter_caches[g_filter_cache_count], 0, sizeof(FilterCacheEntry));
+    g_filter_caches[g_filter_cache_count].fp = fp;
+    return &g_filter_caches[g_filter_cache_count++];
+}
+
+static PIXEL_YC *query_filtering_cache_internal(FILTER *fp, void *editp, int n,
+                                                int *out_w, int *out_h)
+{
+    EDITP *ep = resolve_ep(editp);
+    FilterCacheEntry *ce;
+    FilterCacheSlot *slot = NULL;
+    int fn, i, best_idx = 0;
+    uint64_t oldest_seq = ~(uint64_t)0;
+    int fw = 0, fh = 0, mw = 0, mh = 0;
+    int copy_w, copy_h, y;
+    size_t slot_yc_count, alloc_bytes;
+    PIXEL_YC *scratch = NULL;
+    BOOL own_scratch = FALSE;
+
+    if (!ep || !editp_is_editing(ep))
+        return NULL;
+
+    fn = editp_get_frame_n(ep);
+    if (fn <= 0)
+        return NULL;
+    if (n < 0)
+        n = 0;
+    if (n >= fn)
+        n = fn - 1;
+
+    ce = find_or_create_filter_cache(fp, FALSE);
+    if (!ce || ce->d <= 0 || ce->w <= 0 || ce->h <= 0 || g_filtering_cache_depth >= 8)
+    {
+        editp_get_dimensions(ep, out_w, out_h, NULL, NULL);
+        return (PIXEL_YC *)impl_get_ycp_filtering(fp, editp, n, NULL);
+    }
+
+    if (!ce->slots || ce->slot_cap != ce->d)
+    {
+        free_filter_cache_entry(ce);
+        ce->slots = (FilterCacheSlot *)calloc((size_t)ce->d, sizeof(FilterCacheSlot));
+        if (!ce->slots)
+        {
+            editp_get_dimensions(ep, out_w, out_h, NULL, NULL);
+            return (PIXEL_YC *)impl_get_ycp_filtering(fp, editp, n, NULL);
+        }
+        ce->slot_cap = ce->d;
+    }
+
+    // check lru cache hit (frame_plus1 == n + 1)
+    for (i = 0; i < ce->slot_cap; i++)
+    {
+        if (ce->slots[i].frame_plus1 == n + 1 && ce->slots[i].ret_ptr)
+        {
+            ce->slots[i].lru_seq = ++g_cache_lru_clock;
+            if (out_w)
+                *out_w = ce->slots[i].orig_w;
+            if (out_h)
+                *out_h = ce->slots[i].orig_h;
+            return ce->slots[i].ret_ptr;
+        }
+    }
+
+    // cache miss: render upstream pipeline into scratch buffer before selecting slot
+    editp_get_dimensions(ep, &fw, &fh, &mw, &mh);
+    if (g_filtering_cache_depth == 0)
+    {
+        scratch = ensure_filtering_yc_buf();
+    }
+    if (!scratch || mw > REAVIUTL_VRAM_W || mh > REAVIUTL_VRAM_H)
+    {
+        int smw = (mw > REAVIUTL_VRAM_W) ? mw : REAVIUTL_VRAM_W;
+        int smh = (mh > REAVIUTL_VRAM_H) ? mh : REAVIUTL_VRAM_H;
+        scratch = (PIXEL_YC *)calloc((size_t)smw * (size_t)smh, sizeof(PIXEL_YC));
+        own_scratch = TRUE;
+    }
+    if (!scratch)
+        return NULL;
+
+    g_filtering_cache_depth++;
+    if (g_on_render_up_to)
+    {
+        g_on_render_up_to(fp, ep, n, scratch);
+        editp_get_dimensions(ep, &fw, &fh, &mw, &mh);
+    }
+    else
+    {
+        editp_read_source_frame(ep, n, scratch, mw > 0 ? mw : REAVIUTL_VRAM_W);
+    }
+    g_filtering_cache_depth--;
+
+    // re-check slot table in case set_ycp_filtering_cache_size ran during upstream render
+    if (!ce->slots || ce->slot_cap <= 0)
+    {
+        if (out_w)
+            *out_w = fw;
+        if (out_h)
+            *out_h = fh;
+        if (own_scratch)
+        {
+            PIXEL_YC *fb = ensure_filtering_yc_buf();
+            if (fb && mw <= REAVIUTL_VRAM_W && mh <= REAVIUTL_VRAM_H)
+                memcpy(fb, scratch, (size_t)mw * (size_t)mh * sizeof(PIXEL_YC));
+            free(scratch);
+            return fb;
+        }
+        return scratch;
+    }
+
+    // pick empty slot or oldest LRU slot in this filter's ring (0x00432070)
+    for (i = 0; i < ce->slot_cap; i++)
+    {
+        if (ce->slots[i].frame_plus1 == 0 || !ce->slots[i].raw_alloc)
+        {
+            best_idx = i;
+            break;
+        }
+        if (ce->slots[i].lru_seq < oldest_seq)
+        {
+            oldest_seq = ce->slots[i].lru_seq;
+            best_idx = i;
+        }
+    }
+    slot = &ce->slots[best_idx];
+
+    slot_yc_count = (size_t)ce->w * (size_t)ce->h + 32u;
+    alloc_bytes = slot_yc_count * sizeof(PIXEL_YC) + 64u;
+    if (!slot->raw_alloc || slot->alloc_bytes != alloc_bytes)
+    {
+        free_filter_cache_slot_buf(slot);
+        cache_enforce_budget(alloc_bytes, NULL);
+        slot->raw_alloc = calloc(1, alloc_bytes);
+        if (!slot->raw_alloc)
+        {
+            if (own_scratch)
+                free(scratch);
+            return NULL;
+        }
+        slot->alloc_bytes = alloc_bytes;
+        g_cache_used_bytes += alloc_bytes;
+
+        if ((ce->flag & 1) != 0)
+        {
+            size_t border_ofs = (size_t)(4 * ce->w + 4) * sizeof(PIXEL_YC);
+            uintptr_t aligned = ((uintptr_t)slot->raw_alloc + border_ofs + 15u) & ~(uintptr_t)15u;
+            slot->ret_ptr = (PIXEL_YC *)aligned;
+        }
+        else
+        {
+            uintptr_t aligned = ((uintptr_t)slot->raw_alloc + 15u) & ~(uintptr_t)15u;
+            slot->ret_ptr = (PIXEL_YC *)aligned;
+        }
+    }
+    else if ((ce->flag & 1) != 0)
+    {
+        // keep 4-pixel border zeroed on slot reuse
+        memset(slot->raw_alloc, 0, slot->alloc_bytes);
+    }
+
+    // 0x00432070 lines 56..73: copy into cache_w-strided slot (clamping to w-8, h-8 when flag & 1)
+    copy_w = fw;
+    copy_h = fh;
+    if ((ce->flag & 1) != 0)
+    {
+        int max_cw = ce->w - 8;
+        int max_ch = ce->h - 8;
+        if (copy_w > max_cw)
+            copy_w = max_cw;
+        if (copy_h > max_ch)
+            copy_h = max_ch;
+    }
+    else
+    {
+        if (copy_w > ce->w)
+            copy_w = ce->w;
+        if (copy_h > ce->h)
+            copy_h = ce->h;
+    }
+    if (copy_w > 0 && copy_h > 0 && mw > 0)
+    {
+        for (y = 0; y < copy_h; y++)
+        {
+            memcpy(slot->ret_ptr + (size_t)y * (size_t)ce->w,
+                   scratch + (size_t)y * (size_t)mw,
+                   (size_t)copy_w * sizeof(PIXEL_YC));
+        }
+    }
+
+    if (own_scratch)
+        free(scratch);
+
+    slot->frame_plus1 = n + 1;
+    slot->orig_w = fw;
+    slot->orig_h = fh;
+    slot->lru_seq = ++g_cache_lru_clock;
+
+    if (out_w)
+        *out_w = fw;
+    if (out_h)
+        *out_h = fh;
+    return slot->ret_ptr;
+}
+
+// +0x0b0 (0x00421250)
 static BOOL __cdecl impl_set_ycp_filtering_cache_size(FILTER *fp, int w, int h, int d, int flag)
 {
-    (void)fp;
-    (void)w;
-    (void)h;
-    (void)d;
-    (void)flag;
+    FilterCacheEntry *ce;
+    if (!fp)
+        return FALSE;
+    ce = find_or_create_filter_cache(fp, TRUE);
+    if (!ce)
+        return FALSE;
+    if (ce->w != w || ce->h != h || ce->d != d || ce->flag != flag)
+    {
+        if (g_filtering_cache_depth > 0 && ce->slots)
+        {
+            return FALSE;
+        }
+        free_filter_cache_entry(ce);
+        ce->w = w;
+        ce->h = h;
+        ce->d = d;
+        ce->flag = flag;
+    }
     return TRUE;
 }
 
-// +0x0b4
+// +0x0b4 (0x00421330)
 static void *__cdecl impl_get_ycp_filtering_cache(FILTER *fp, void *editp, int n)
 {
-    return impl_get_ycp_filtering(fp, editp, n, NULL);
+    return query_filtering_cache_internal(fp, editp, n, NULL, NULL);
 }
 
-// +0x0b8
+// +0x0b8 (0x00420450): LRU cache for raw unfiltered source frames (VRAM stride)
 static void *__cdecl impl_get_ycp_source_cache(void *editp, int n, int ofs)
 {
-    return impl_get_ycp_ofs(editp, n, ofs);
+    EDITP *ep = resolve_ep(editp);
+    int fn, target, i, best_idx = 0;
+    uint64_t oldest_seq = ~(uint64_t)0;
+    SourceCacheSlot *slot;
+    size_t frame_bytes;
+
+    if (!ep || !editp_is_editing(ep))
+        return NULL;
+    fn = editp_get_frame_n(ep);
+    if (fn <= 0)
+        return NULL;
+
+    target = n + ofs;
+    if (target < 0)
+        target = 0;
+    if (target >= fn)
+        target = fn - 1;
+
+    for (i = 0; i < MAX_SOURCE_CACHE_SLOTS; i++)
+    {
+        if (g_source_cache[i].frame_plus1 == target + 1 && g_source_cache[i].ycp)
+        {
+            g_source_cache[i].lru_seq = ++g_cache_lru_clock;
+            return g_source_cache[i].ycp;
+        }
+    }
+
+    for (i = 0; i < MAX_SOURCE_CACHE_SLOTS; i++)
+    {
+        if (g_source_cache[i].frame_plus1 == 0 || !g_source_cache[i].ycp)
+        {
+            best_idx = i;
+            break;
+        }
+        if (g_source_cache[i].lru_seq < oldest_seq)
+        {
+            oldest_seq = g_source_cache[i].lru_seq;
+            best_idx = i;
+        }
+    }
+    slot = &g_source_cache[best_idx];
+    frame_bytes = (size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H * sizeof(PIXEL_YC);
+
+    if (!slot->ycp)
+    {
+        cache_enforce_budget(frame_bytes, NULL);
+        slot->ycp = (PIXEL_YC *)calloc((size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H,
+                                       sizeof(PIXEL_YC));
+        if (!slot->ycp)
+        {
+            return impl_get_ycp_ofs(editp, n, ofs);
+        }
+        slot->alloc_bytes = frame_bytes;
+        g_cache_used_bytes += frame_bytes;
+    }
+
+    editp_read_source_frame(ep, target, slot->ycp, REAVIUTL_VRAM_W);
+    slot->frame_plus1 = target + 1;
+    slot->lru_seq = ++g_cache_lru_clock;
+    return slot->ycp;
 }
 
 // +0x0bc
@@ -820,21 +1343,18 @@ static BOOL __cdecl impl_get_pixel_filtered_ex(void *editp, int n, void *pixelp,
     return yc48_convert_to_format(pixelp, ycp, mw, fw, fh, format);
 }
 
-// +0x0c8
+// +0x0c8 (0x00421680)
 static PIXEL_YC *__cdecl impl_get_ycp_filtering_cache_ex(FILTER *fp, void *editp, int n,
                                                          int *w, int *h)
 {
-    EDITP *ep = resolve_ep(editp);
-    if (!ep || !editp_is_editing(ep))
-        return NULL;
-    editp_get_dimensions(ep, w, h, NULL, NULL);
-    return (PIXEL_YC *)impl_get_ycp_filtering(fp, editp, n, NULL);
+    return query_filtering_cache_internal(fp, editp, n, w, h);
 }
 
 // +0x0cc
 static BOOL __cdecl impl_exec_multi_thread_func(MULTI_THREAD_FUNC func, void *param1, void *param2)
 {
     int i;
+    DWORD_PTR prev_aff = 0;
     HANDLE done_handles[MT_MAX_THREADS];
 
     if (!func)
@@ -859,8 +1379,16 @@ static BOOL __cdecl impl_exec_multi_thread_func(MULTI_THREAD_FUNC func, void *pa
         SetEvent(g_mt_workers[i].start_ev);
     }
 
-    // thread 0 runs right on the caller thread
+    // thread 0 runs right on the caller thread (pinned to core 0 if threadcpuseparate)
+    if (g_mt_cpu_sep && g_mt_core0_mask != 0)
+    {
+        prev_aff = SetThreadAffinityMask(GetCurrentThread(), g_mt_core0_mask);
+    }
     func(0, g_mt_thread_num, param1, param2);
+    if (prev_aff != 0)
+    {
+        SetThreadAffinityMask(GetCurrentThread(), prev_aff);
+    }
 
     if (g_mt_thread_num > 1)
     {
@@ -1426,6 +1954,7 @@ void exfunc_set_ini_file(const char *path)
     if (path && path[0])
     {
         lstrcpynA(g_ini_path, path, MAX_PATH);
+        g_sys_cfg_loaded = FALSE;
     }
 }
 
@@ -1460,27 +1989,96 @@ void exfunc_set_edit_output_callback(ExfuncEditOutputFn on_edit_output)
     g_on_edit_output = on_edit_output;
 }
 
+void exfunc_reload_system_settings(void)
+{
+    const char *ini = ensure_ini_path();
+    int mt = (int)GetPrivateProfileIntA("system", "multithread", 0, ini);
+    BOOL sep = GetPrivateProfileIntA("system", "threadcpuseparate", 0, ini) != 0;
+    int share_mb = (int)GetPrivateProfileIntA("system", "sharecache", 32, ini);
+
+    if (mt < 0)
+        mt = 0;
+    if (mt > MT_MAX_THREADS)
+        mt = MT_MAX_THREADS;
+    if (share_mb < 8)
+        share_mb = 8;
+    if (share_mb > 4096)
+        share_mb = 4096;
+
+    g_cfg_overwritecheck = (int)GetPrivateProfileIntA("system", "overwritecheck", 0, ini);
+    g_cache_budget_bytes = (size_t)share_mb * 1024u * 1024u;
+    g_sys_cfg_loaded = TRUE;
+
+    cache_enforce_budget(0, NULL);
+
+    if (mt != g_mt_cfg_threads || sep != g_mt_cpu_sep)
+    {
+        g_mt_cfg_threads = mt;
+        g_mt_cpu_sep = sep;
+        if (g_mt_init && InterlockedCompareExchange(&g_mt_busy, 0, 0) == 0)
+        {
+            mt_shutdown_pool();
+        }
+    }
+}
+
+void exfunc_invalidate_all_caches(void)
+{
+    int i, j;
+    for (i = 0; i < g_filter_cache_count; i++)
+    {
+        FilterCacheEntry *ce = &g_filter_caches[i];
+        if (!ce->slots)
+            continue;
+        for (j = 0; j < ce->slot_cap; j++)
+        {
+            ce->slots[j].frame_plus1 = 0;
+        }
+    }
+    for (i = 0; i < MAX_SOURCE_CACHE_SLOTS; i++)
+    {
+        g_source_cache[i].frame_plus1 = 0;
+    }
+}
+
+void exfunc_invalidate_filtering_caches_from(const FILTER *const *ordered_after, int count)
+{
+    int i, j, k;
+    if (!ordered_after || count <= 0)
+        return;
+    for (k = 0; k < count; k++)
+    {
+        const FILTER *fp = ordered_after[k];
+        if (!fp)
+            continue;
+        for (i = 0; i < g_filter_cache_count; i++)
+        {
+            FilterCacheEntry *ce = &g_filter_caches[i];
+            if (ce->fp == fp && ce->slots)
+            {
+                for (j = 0; j < ce->slot_cap; j++)
+                {
+                    ce->slots[j].frame_plus1 = 0;
+                }
+            }
+        }
+    }
+}
+
 void exfunc_shutdown(void)
 {
     int i;
-    if (g_mt_init && g_mt_thread_num > 1)
+    mt_shutdown_pool();
+    for (i = 0; i < g_filter_cache_count; i++)
     {
-        g_mt_quit = TRUE;
-        for (i = 1; i < g_mt_thread_num; i++)
-        {
-            if (g_mt_workers[i].thread)
-            {
-                SetEvent(g_mt_workers[i].start_ev);
-                WaitForSingleObject(g_mt_workers[i].thread, 2000);
-                CloseHandle(g_mt_workers[i].thread);
-                CloseHandle(g_mt_workers[i].start_ev);
-                CloseHandle(g_mt_workers[i].done_ev);
-                memset(&g_mt_workers[i], 0, sizeof(MtWorker));
-            }
-        }
-        g_mt_init = FALSE;
-        g_mt_thread_num = 1;
+        free_filter_cache_entry(&g_filter_caches[i]);
     }
+    g_filter_cache_count = 0;
+    for (i = 0; i < MAX_SOURCE_CACHE_SLOTS; i++)
+    {
+        free_source_cache_slot_buf(&g_source_cache[i]);
+    }
+    g_cache_used_bytes = 0;
     free(g_filtering_yc_buf);
     g_filtering_yc_buf = NULL;
     free(g_disp_bgr_buf);

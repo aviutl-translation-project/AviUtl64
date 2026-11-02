@@ -90,6 +90,8 @@ static void sync_shm_from_local(void)
         g_shm->filters[i].has_window = (hw != NULL) ? 1 : 0;
         g_shm->filters[i].window_visible = ((fl & FILTER_FLAG_WINDOW_DISP) != 0) ? 1 : 0;
         g_shm->filters[i].hwnd32 = (uint32_t)(uintptr_t)hw;
+        g_shm->filters[i].has_func_proc = plugin_manager_has_func_proc(i) ? 1 : 0;
+        g_shm->filters[i].priority = plugin_manager_get_priority(i);
     }
 
     mcount = plugin_manager_get_menu_item_count();
@@ -547,6 +549,16 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
         }
         break;
 
+    case BRIDGE_CMD_SET_FILTER_PRIORITY:
+        resp->ok = plugin_manager_set_priority(req->arg0, req->arg1, req->arg2 != 0) ? 1 : 0;
+        break;
+
+    case BRIDGE_CMD_INVALIDATE_CACHES:
+        exfunc_reload_system_settings();
+        exfunc_invalidate_all_caches();
+        resp->ok = 1;
+        break;
+
     case BRIDGE_CMD_EXEC_MENU_ITEM:
         resp->ok = plugin_manager_exec_menu_item_index(req->arg0) ? 1 : 0;
         break;
@@ -583,6 +595,10 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
             {
                 // host supplied pre-filtered ycp_frame in shared memory
                 PIXEL_YC *dst = editp_get_ycp_edit(g_editp);
+                if (g_shm->w > 0 && g_shm->h > 0)
+                {
+                    editp_set_dimensions(g_editp, g_shm->w, g_shm->h);
+                }
                 editp_set_frame(g_editp, req->arg0);
                 editp_get_dimensions(g_editp, &w, &h, &max_w, &max_h);
                 if (dst && w > 0 && h > 0)
@@ -596,16 +612,41 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
                                (size_t)copy_w * sizeof(PIXEL_YC));
                     }
                 }
+            }
+            else if (req->arg2 > 0)
+            {
+                editp_load_frame(g_editp, req->arg0);
+            }
+
+            if (req->arg2 > 0)
+            {
+                int k, cnt = req->arg2;
+                if (cnt > BRIDGE_MAX_FILTERS)
+                    cnt = BRIDGE_MAX_FILTERS;
+                for (k = 0; k < cnt; k++)
                 {
-                    int fi, fn = plugin_manager_get_count();
-                    for (fi = 0; fi < fn; fi++)
+                    int fi = (int)(unsigned char)req->str[k];
+                    FILTER *fp = plugin_manager_get_filter(fi);
+                    if (fp && (fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) &&
+                        !(fp->flag & FILTER_FLAG_AUDIO_FILTER))
                     {
-                        FILTER *fp = plugin_manager_get_filter(fi);
-                        if (fp && (fp->flag & FILTER_FLAG_ACTIVE) &&
-                            !(fp->flag & FILTER_FLAG_AUDIO_FILTER))
-                        {
-                            plugin_manager_apply_filter(fi, g_editp);
-                        }
+                        plugin_manager_apply_filter(fi, g_editp);
+                    }
+                }
+                resp->ok = 1;
+            }
+            else if (req->arg1 != 0)
+            {
+                int order[BRIDGE_MAX_FILTERS];
+                int k, cnt = plugin_manager_get_execution_order(FALSE, order, BRIDGE_MAX_FILTERS);
+                for (k = 0; k < cnt; k++)
+                {
+                    int fi = order[k];
+                    FILTER *fp = plugin_manager_get_filter(fi);
+                    if (fp && (fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)) &&
+                        !(fp->flag & FILTER_FLAG_AUDIO_FILTER))
+                    {
+                        plugin_manager_apply_filter(fi, g_editp);
                     }
                 }
                 resp->ok = 1;
@@ -640,8 +681,24 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
             int smp = req->arg1;
             if (smp > BRIDGE_MAX_AUDIO_SAMPLES)
                 smp = BRIDGE_MAX_AUDIO_SAMPLES;
-            resp->val0 = plugin_manager_apply_audio_filters(
-                g_editp, req->arg0, g_shm->pcm_audio, smp, NULL);
+            if (req->arg3 > 0)
+            {
+                int k, cnt = req->arg3;
+                if (cnt > BRIDGE_MAX_FILTERS)
+                    cnt = BRIDGE_MAX_FILTERS;
+                for (k = 0; k < cnt; k++)
+                {
+                    int fi = (int)(unsigned char)req->str[k];
+                    smp = plugin_manager_apply_audio_filter(fi, g_editp, req->arg0,
+                                                            g_shm->pcm_audio, smp);
+                }
+                resp->val0 = smp;
+            }
+            else
+            {
+                resp->val0 = plugin_manager_apply_audio_filters(
+                    g_editp, req->arg0, g_shm->pcm_audio, smp, NULL);
+            }
             resp->ok = 1;
         }
         break;

@@ -14,6 +14,8 @@
 #include "plugin_bridge.h"
 #include "yc48_convert.h"
 #include "exfunc.h"
+#include "i18n.h"
+#include "aviutl_dlg.h"
 #include "debug_console.h"
 
 // local .auo registry entry (in-process)
@@ -181,46 +183,273 @@ static const char *path_basename_dbcs(const char *path)
     return base;
 }
 
-static void build_default_save_filename(EDITP *ep, const char *def_ext, char *out_buf, size_t cap)
+static void get_export_ini_path(char *out_path, size_t out_sz)
 {
-    const char *cur_out;
-    const char *ed;
-    char *dot;
+    char mod_path[MAX_PATH];
+    char *slash;
+    if (GetModuleFileNameA(NULL, mod_path, MAX_PATH) > 0)
+    {
+        slash = strrchr(mod_path, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod_path[0] = '\0';
+        _snprintf(out_path, out_sz, "%saviutl.ini", mod_path);
+        out_path[out_sz - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.ini", (int)out_sz);
+    }
+}
 
-    if (!out_buf || cap == 0)
+static DWORD get_export_save_ofn_flags(void)
+{
+    char ini[MAX_PATH];
+    DWORD flags = OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    get_export_ini_path(ini, sizeof(ini));
+    if (GetPrivateProfileIntA("system", "overwritecheck", 0, ini) == 0)
+    {
+        flags |= OFN_OVERWRITEPROMPT;
+    }
+    return flags;
+}
+
+static BOOL is_overwriting_open_edit_file(HWND owner, EDITP *ep, const char *save_path)
+{
+    const char *ed;
+    char ed_abs[MAX_PATH], save_abs[MAX_PATH];
+
+    if (!ep || !save_path || !save_path[0] || g_shm_now != NULL)
+        return FALSE;
+    ed = editp_get_edit_path(ep);
+    if (!ed || !ed[0])
+        return FALSE;
+
+    if (GetFullPathNameA(ed, MAX_PATH, ed_abs, NULL) == 0)
+        lstrcpynA(ed_abs, ed, MAX_PATH);
+    if (GetFullPathNameA(save_path, MAX_PATH, save_abs, NULL) == 0)
+        lstrcpynA(save_abs, save_path, MAX_PATH);
+
+    if (lstrcmpiA(ed_abs, save_abs) == 0)
+    {
+        aviutl_msgbox_w(owner, i18n_get_wstr(1015), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// 0x0041a010: flash main window and optionally play [system] finishsound on non-batch completion
+static void notify_export_finished(HWND owner, int out_flags)
+{
+    char ini[MAX_PATH];
+    char snd[MAX_PATH];
+
+    if (g_shm_now != NULL || (out_flags & OUTPUT_INFO_FLAG_BATCH) != 0)
         return;
-    out_buf[0] = '\0';
-    if (!ep)
+
+    if (owner && IsWindow(owner))
+    {
+        FlashWindow(owner, TRUE);
+    }
+
+    get_export_ini_path(ini, sizeof(ini));
+    GetPrivateProfileStringA("system", "finishsound", "", snd, sizeof(snd), ini);
+    if (snd[0])
+    {
+        PlaySoundA(snd, NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+// 0x00415820: expand [system] defaultsavefile (%p, %f/%a, %w, %h, %t, %b, %e, leading '*')
+static void expand_default_save_path(EDITP *ep, const char *def_ext,
+                                     char *out_dir, size_t dir_cap,
+                                     char *out_file, size_t file_cap)
+{
+    char ini[MAX_PATH];
+    char tpl_buf[MAX_PATH];
+    char expanded[MAX_PATH * 2];
+    const char *tpl;
+    const char *cur_out;
+    const char *ed_path;
+    const char *ed_base;
+    char in_dir[MAX_PATH];
+    char in_stem[MAX_PATH];
+    BOOL force_tpl = FALSE;
+    int w = 0, h = 0, mw = 0, mh = 0, s = 0, e = 0, fn = 0, sf = 1;
+    size_t pos = 0;
+    const unsigned char *p;
+
+    if (out_dir && dir_cap > 0)
+        out_dir[0] = '\0';
+    if (out_file && file_cap > 0)
+        out_file[0] = '\0';
+    if (!ep || !out_file || file_cap == 0)
         return;
+
+    get_export_ini_path(ini, sizeof(ini));
+    GetPrivateProfileStringA("system", "defaultsavefile", "%p", tpl_buf, sizeof(tpl_buf), ini);
+    sf = GetPrivateProfileIntA("system", "startframe", 1, ini) ? 1 : 0;
+
+    tpl = tpl_buf;
+    if (tpl[0] == '*')
+    {
+        force_tpl = TRUE;
+        tpl++;
+    }
 
     cur_out = editp_get_output_path(ep);
-    if (cur_out && cur_out[0])
+    if (!force_tpl && cur_out && cur_out[0])
     {
-        lstrcpynA(out_buf, cur_out, (int)cap);
-        dot = strrchr(out_buf, '.');
+        char *dot;
+        const char *base_chk;
+        lstrcpynA(out_file, cur_out, (int)file_cap);
+        base_chk = path_basename_dbcs(out_file);
+        dot = (char *)strrchr(base_chk, '.');
         if (dot && def_ext && def_ext[0])
         {
             *dot = '\0';
-            if (strlen(out_buf) + strlen(def_ext) + 2 < cap)
+            if (strlen(out_file) + strlen(def_ext) + 2 < file_cap)
             {
-                lstrcatA(out_buf, ".");
-                lstrcatA(out_buf, def_ext);
+                lstrcatA(out_file, ".");
+                lstrcatA(out_file, def_ext);
             }
         }
         return;
     }
 
-    ed = path_basename_dbcs(editp_get_edit_path(ep));
-    lstrcpynA(out_buf, ed[0] ? ed : "output", (int)cap);
-    dot = strrchr(out_buf, '.');
-    if (dot)
-        *dot = '\0';
-    if (!out_buf[0])
-        lstrcpynA(out_buf, "output", (int)cap);
-    if (def_ext && def_ext[0] && strlen(out_buf) + strlen(def_ext) + 2 < cap)
+    ed_path = editp_get_edit_path(ep);
+    ed_base = path_basename_dbcs(ed_path);
     {
-        lstrcatA(out_buf, ".");
-        lstrcatA(out_buf, def_ext);
+        size_t dir_len = (size_t)(ed_base - (ed_path ? ed_path : ""));
+        if (dir_len >= sizeof(in_dir))
+            dir_len = sizeof(in_dir) - 1;
+        if (ed_path && dir_len > 0)
+            memcpy(in_dir, ed_path, dir_len);
+        in_dir[dir_len] = '\0';
+    }
+    lstrcpynA(in_stem, ed_base[0] ? ed_base : "output", sizeof(in_stem));
+    {
+        char *dot = strrchr(in_stem, '.');
+        if (dot)
+            *dot = '\0';
+    }
+
+    editp_get_dimensions(ep, &w, &h, &mw, &mh);
+    fn = editp_get_frame_n(ep);
+    if (!editp_get_select_frame(ep, &s, &e) || s < 0 || e < s)
+    {
+        s = 0;
+        e = fn > 0 ? fn - 1 : 0;
+    }
+
+    p = (const unsigned char *)tpl;
+    while (*p && pos + 2 < sizeof(expanded))
+    {
+        if (IsDBCSLeadByte(*p))
+        {
+            expanded[pos++] = (char)*p++;
+            if (*p && pos + 1 < sizeof(expanded))
+                expanded[pos++] = (char)*p++;
+            continue;
+        }
+        if (*p == '%')
+        {
+            char tok = (char)p[1];
+            char num[32];
+            const char *ins = NULL;
+
+            if (tok == '\0')
+            {
+                expanded[pos++] = '%';
+                break;
+            }
+            p += 2;
+            if (tok == 'e' || tok == 'E')
+            {
+                break;
+            }
+            switch (tok)
+            {
+            case 'p':
+            case 'P':
+                ins = in_dir;
+                break;
+            case 'f':
+            case 'F':
+            case 'a':
+            case 'A':
+                ins = in_stem;
+                break;
+            case 'w':
+            case 'W':
+                wsprintfA(num, "%d", w);
+                ins = num;
+                break;
+            case 'h':
+            case 'H':
+                wsprintfA(num, "%d", h);
+                ins = num;
+                break;
+            case 't':
+            case 'T':
+                wsprintfA(num, "%d", s + sf);
+                ins = num;
+                break;
+            case 'b':
+            case 'B':
+                wsprintfA(num, "%d", e + sf);
+                ins = num;
+                break;
+            case '%':
+                ins = "%";
+                break;
+            default:
+                num[0] = '%';
+                num[1] = tok;
+                num[2] = '\0';
+                ins = num;
+                break;
+            }
+            if (ins)
+            {
+                size_t ilen = strlen(ins);
+                if (pos + ilen >= sizeof(expanded))
+                    ilen = sizeof(expanded) - 1 - pos;
+                if (ilen > 0)
+                {
+                    memcpy(expanded + pos, ins, ilen);
+                    pos += ilen;
+                }
+            }
+        }
+        else
+        {
+            expanded[pos++] = (char)*p++;
+        }
+    }
+    expanded[pos] = '\0';
+
+    {
+        const char *ebase = path_basename_dbcs(expanded);
+        if (!ebase[0])
+        {
+            if (out_dir && dir_cap > 0 && expanded[0])
+            {
+                lstrcpynA(out_dir, expanded, (int)dir_cap);
+            }
+            out_file[0] = '\0';
+        }
+        else
+        {
+            if (!strchr(ebase, '.') && def_ext && def_ext[0] &&
+                strlen(expanded) + strlen(def_ext) + 2 < sizeof(expanded))
+            {
+                lstrcatA(expanded, ".");
+                lstrcatA(expanded, def_ext);
+            }
+            lstrcpynA(out_file, expanded, (int)file_cap);
+        }
     }
 }
 
@@ -1181,6 +1410,10 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     {
         lstrcpynA(abs_path, save_path, MAX_PATH);
     }
+    if (is_overwriting_open_edit_file(owner, ep, abs_path))
+    {
+        return FALSE;
+    }
 
     if ((out_flags & (OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO)) == 0)
     {
@@ -1548,12 +1781,17 @@ cleanup:
     editp_set_frame(ep, saved_frame);
     plugin_manager_notify_update(ep);
     teardown_encode_session();
+    if (ok)
+    {
+        notify_export_finished(owner, out_flags);
+    }
     return ok;
 }
 
 BOOL video_export_avi_dialog(HWND owner, EDITP *ep)
 {
     OPENFILENAMEA ofn;
+    char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
     static const char filter[] =
         "AVI Video (*.avi)\0*.avi\0"
@@ -1561,19 +1799,22 @@ BOOL video_export_avi_dialog(HWND owner, EDITP *ep)
 
     if (!ep || !editp_is_editing(ep) || g_enc.active)
         return FALSE;
-    build_default_save_filename(ep, "avi", file, sizeof(file));
+    expand_default_save_path(ep, "avi", init_dir, sizeof(init_dir), file, sizeof(file));
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter;
     ofn.nFilterIndex = 1;
+    ofn.lpstrInitialDir = init_dir[0] ? init_dir : NULL;
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file);
     ofn.lpstrDefExt = "avi";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = get_export_save_ofn_flags();
 
     if (!GetSaveFileNameA(&ofn))
+        return FALSE;
+    if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
     return video_export_avi_file(owner, ep, file,
                                  OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO);
@@ -1598,6 +1839,10 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
     if (GetFullPathNameA(save_path, MAX_PATH, abs_path, NULL) == 0)
     {
         lstrcpynA(abs_path, save_path, MAX_PATH);
+    }
+    if (is_overwriting_open_edit_file(owner, ep, abs_path))
+    {
+        return FALSE;
     }
     if (!setup_encode_session(owner, ep, &s, &e))
     {
@@ -1690,6 +1935,7 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
     {
         dbg_info("Exported WAV '%s' (%lu bytes, %d Hz, %d ch)",
                  abs_path, (unsigned long)data_bytes, rate, ch);
+        notify_export_finished(owner, 0);
     }
     return ok;
 }
@@ -1697,6 +1943,7 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
 BOOL video_export_wav_dialog(HWND owner, EDITP *ep)
 {
     OPENFILENAMEA ofn;
+    char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
     static const char filter[] =
         "Wave Audio (*.wav)\0*.wav\0"
@@ -1704,19 +1951,22 @@ BOOL video_export_wav_dialog(HWND owner, EDITP *ep)
 
     if (!ep || !editp_is_editing(ep) || g_enc.active)
         return FALSE;
-    build_default_save_filename(ep, "wav", file, sizeof(file));
+    expand_default_save_path(ep, "wav", init_dir, sizeof(init_dir), file, sizeof(file));
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter;
     ofn.nFilterIndex = 1;
+    ofn.lpstrInitialDir = init_dir[0] ? init_dir : NULL;
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file);
     ofn.lpstrDefExt = "wav";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = get_export_save_ofn_flags();
 
     if (!GetSaveFileNameA(&ofn))
+        return FALSE;
+    if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
     return video_export_wav_file(owner, ep, file);
 }
@@ -1767,6 +2017,10 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
     {
         lstrcpynA(save_buf, save_path, MAX_PATH);
     }
+    if (is_overwriting_open_edit_file(owner, ep, save_buf))
+    {
+        return FALSE;
+    }
 
     eff_flags = out_flags & (OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO | OUTPUT_INFO_FLAG_BATCH);
     if ((eff_flags & (OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO)) == 0)
@@ -1785,6 +2039,10 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
                                       cb_bridge_auo_progress, (void *)owner);
         SetThreadExecutionState(ES_CONTINUOUS);
         editp_set_saving(ep, FALSE);
+        if (ok)
+        {
+            notify_export_finished(owner, eff_flags);
+        }
         return ok;
     }
 
@@ -1856,6 +2114,10 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
     teardown_encode_session();
 
     dbg_plugin("Plugin output '%s' finished: %s", entry->name, ok ? "OK" : "FAILED/ABORTED");
+    if (ok)
+    {
+        notify_export_finished(owner, eff_flags);
+    }
     return ok;
 }
 
@@ -1863,6 +2125,7 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
 {
     AuoPluginSummary sum;
     OPENFILENAMEA ofn;
+    char init_dir[MAX_PATH] = {0};
     char file[MAX_PATH] = {0};
     char def_ext[16] = {0};
 
@@ -1873,20 +2136,23 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
 
     g_last_auo_idx = auo_idx;
     extract_default_ext(sum.filefilter, def_ext, sizeof(def_ext));
-    build_default_save_filename(ep, def_ext, file, sizeof(file));
+    expand_default_save_path(ep, def_ext, init_dir, sizeof(init_dir), file, sizeof(file));
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = sum.filefilter;
     ofn.nFilterIndex = 1;
+    ofn.lpstrInitialDir = init_dir[0] ? init_dir : NULL;
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file);
     ofn.lpstrDefExt = def_ext[0] ? def_ext : NULL;
     ofn.lpstrTitle = sum.name;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = get_export_save_ofn_flags();
 
     if (!GetSaveFileNameA(&ofn))
+        return FALSE;
+    if (is_overwriting_open_edit_file(owner, ep, file))
         return FALSE;
     return video_export_auo_file(owner, ep, auo_idx, file,
                                  OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO);

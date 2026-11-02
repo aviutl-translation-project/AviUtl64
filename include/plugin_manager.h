@@ -36,6 +36,11 @@ const char *plugin_manager_get_name(int index);
 const char *plugin_manager_get_information(int index);
 const char *plugin_manager_get_path(int index);
 int plugin_manager_get_flags(int index);
+BOOL plugin_manager_has_func_proc(int index);
+int plugin_manager_get_priority(int index);
+BOOL plugin_manager_set_priority(int index, int priority, BOOL save_ini);
+int plugin_manager_get_execution_order(BOOL audio_mode, int *out_indices, int max_count);
+BOOL plugin_manager_run_priority_dialog(HWND owner, BOOL audio_mode);
 FILTER *plugin_manager_get_filter(int index);
 HWND plugin_manager_get_window(int index);
 int plugin_manager_find_by_name(const char *name);
@@ -65,6 +70,8 @@ BOOL plugin_manager_forward_main_misc(UINT filter_msg, WPARAM wp, LPARAM lp);
 void plugin_manager_modify_title(EDITP *ep, int frame, char *title, int max_title);
 
 int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL nofilter);
+int plugin_manager_apply_audio_filter(int filter_id, EDITP *ep, int frame_num,
+                                      short *buf, int samples);
 int plugin_manager_apply_audio_filters(EDITP *ep, int frame_num, short *buf,
                                        int samples, const FILTER *stop_before_fp);
 

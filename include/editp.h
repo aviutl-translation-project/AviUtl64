@@ -27,6 +27,7 @@ void editp_set_main_hwnd(EDITP *ep, HWND hwnd);
 HWND editp_get_main_hwnd(EDITP *ep);
 
 BOOL editp_load_frame(EDITP *ep, int frame_num);
+BOOL editp_read_source_frame(EDITP *ep, int frame_num, PIXEL_YC *dst, int dst_stride);
 
 BOOL editp_is_editing(EDITP *ep);
 BOOL editp_is_saving(EDITP *ep);

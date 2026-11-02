@@ -36,6 +36,10 @@ void exfunc_set_host_callbacks(ExfuncHostNotifyFn on_state_changed,
 void exfunc_set_audio_render_callback(ExfuncRenderAudioUpToFn on_render_audio_up_to);
 void exfunc_set_edit_output_callback(ExfuncEditOutputFn on_edit_output);
 
+void exfunc_reload_system_settings(void);
+void exfunc_invalidate_all_caches(void);
+void exfunc_invalidate_filtering_caches_from(const FILTER *const *ordered_after, int count);
+
 void exfunc_shutdown(void);
 
 #endif

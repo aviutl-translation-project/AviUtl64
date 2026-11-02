@@ -1,9 +1,12 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "editp.h"
+#include "exfunc.h"
 #include "vfw_input.h"
 
 // 0x0048717c, aviutl 1.10 EDIT_HANDLE layout accessed directly by exedit
@@ -321,6 +324,26 @@ EDITP *editp_create(int w, int h, int frame_n, int fps_scale, int fps_rate)
     return ep;
 }
 
+static void editp_get_ini_path(char *out_path, size_t out_sz)
+{
+    char mod_path[MAX_PATH];
+    char *slash;
+    if (GetModuleFileNameA(NULL, mod_path, MAX_PATH) > 0)
+    {
+        slash = strrchr(mod_path, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod_path[0] = '\0';
+        _snprintf(out_path, out_sz, "%saviutl.ini", mod_path);
+        out_path[out_sz - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.ini", (int)out_sz);
+    }
+}
+
 BOOL editp_open_video(EDITP *ep, const char *filepath)
 {
     VFWInput *video;
@@ -355,6 +378,42 @@ BOOL editp_open_video(EDITP *ep, const char *filepath)
         fps_s = 1;
         proj_fn = (int)(((long long)fi.audio_n * fps_r + (long long)aud_r * fps_s - 1) /
                         ((long long)aud_r * fps_s));
+    }
+    else if ((fi.flag & FILE_INFO_FLAG_VIDEO) != 0 && strstr(filepath, ".exedit") == NULL)
+    {
+        char ini[MAX_PATH];
+        int load30, loadadj;
+        editp_get_ini_path(ini, sizeof(ini));
+        load30 = (int)GetPrivateProfileIntA("system", "load30fps", 0, ini);
+        loadadj = (int)GetPrivateProfileIntA("system", "loadfpsadjust", 0, ini);
+
+        // 0x00401d10: auto-adjust fps when video & audio durations diverge by >= 0.1s
+        if (loadadj != 0 && (fi.flag & FILE_INFO_FLAG_AUDIO) != 0 &&
+            proj_fn > 0 && fi.audio_n > 0 && aud_r > 0)
+        {
+            double vid_sec = ((double)proj_fn * (double)fps_s) / (double)fps_r;
+            double aud_sec = (double)fi.audio_n / (double)aud_r;
+            if (aud_sec > 0.1 && fabs(vid_sec - aud_sec) >= 0.1)
+            {
+                double nfps = (double)proj_fn / aud_sec;
+                if (nfps > 0.01 && nfps <= 10000.0)
+                {
+                    fps_r = (int)(nfps * 100000.0 + 0.5);
+                    fps_s = 100000;
+                }
+            }
+        }
+
+        // 0x00416b70 lines 219..223: open near-30fps video as NTSC 29.97fps (30000/1001)
+        if (load30 != 0)
+        {
+            double fps_val = (double)fps_r / (double)fps_s;
+            if (fps_val >= 29.90 && fps_val <= 30.05)
+            {
+                fps_r = 30000;
+                fps_s = 1001;
+            }
+        }
     }
     if (proj_fn <= 0)
         proj_fn = 1;
@@ -398,6 +457,7 @@ BOOL editp_open_video(EDITP *ep, const char *filepath)
     lstrcpynA(ep->abi.edit_name, filepath, MAX_PATH);
     memset(ep->frame_status, 0, (size_t)ep->frame_n);
     editp_sync_abi(ep);
+    exfunc_invalidate_all_caches();
     editp_load_frame(ep, 0);
     return TRUE;
 }
@@ -475,6 +535,7 @@ void editp_close_video(EDITP *ep)
         memset(ep->ycp_edit, 0, (size_t)ep->max_w * (size_t)ep->max_h * sizeof(PIXEL_YC));
     }
     editp_sync_abi(ep);
+    exfunc_invalidate_all_caches();
 }
 
 EDITP *editp_create_from_video(const char *filepath)
@@ -552,6 +613,35 @@ BOOL editp_load_frame(EDITP *ep, int frame_num)
             memset(ep->ycp_edit + (size_t)y * (size_t)ep->max_w, 0,
                    (size_t)ep->w * sizeof(PIXEL_YC));
         }
+    }
+    return TRUE;
+}
+
+BOOL editp_read_source_frame(EDITP *ep, int frame_num, PIXEL_YC *dst, int dst_stride)
+{
+    int y, cw;
+    if (!ep || !ep->is_editing || ep->frame_n <= 0 || !dst || dst_stride <= 0)
+    {
+        return FALSE;
+    }
+    if (frame_num < 0)
+        frame_num = 0;
+    if (frame_num >= ep->frame_n)
+        frame_num = ep->frame_n - 1;
+
+    if (ep->video_source)
+    {
+        if (vfw_input_read_frame_stride(ep->video_source, frame_num, dst, dst_stride))
+        {
+            return TRUE;
+        }
+    }
+    cw = (ep->org_w > 0 ? ep->org_w : ep->w);
+    if (cw > dst_stride)
+        cw = dst_stride;
+    for (y = 0; y < (ep->org_h > 0 ? ep->org_h : ep->h); y++)
+    {
+        memset(dst + (size_t)y * (size_t)dst_stride, 0, (size_t)cw * sizeof(PIXEL_YC));
     }
     return TRUE;
 }

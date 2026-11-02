@@ -246,14 +246,13 @@ static BOOL cb_host_edit_close(EDITP *ep)
     return TRUE;
 }
 
-static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_before_fp)
+static BOOL apply_native_video_filters(EDITP *ep, const FILTER *stop_before_fp)
 {
     int i;
     FILTER_PROC_INFO fpip;
 
     if (!ep || !editp_is_editing(ep))
         return FALSE;
-    editp_load_frame(ep, frame_num);
 
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -305,6 +304,14 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
         }
     }
     return TRUE;
+}
+
+static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_before_fp)
+{
+    if (!ep || !editp_is_editing(ep))
+        return FALSE;
+    editp_load_frame(ep, frame_num);
+    return apply_native_video_filters(ep, stop_before_fp);
 }
 
 static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
@@ -719,6 +726,7 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
     {
         PluginEntry *e = &g_plugins[i];
         DWORD t0 = GetTickCount();
+        e->stage1_initialized = TRUE;
         if (e->runtime.func_init)
         {
             if (!safe_call_func_init(e))
@@ -726,6 +734,7 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                 dbg_warn("Filter[%d] '%s' Stage 1 func_init() %s (%lu ms) -> disabled",
                          i, e->name, e->faulted ? "FAULTED" : "returned FALSE",
                          (unsigned long)(GetTickCount() - t0));
+                e->stage1_initialized = FALSE;
                 e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
                 if (e->hwnd && IsWindow(e->hwnd))
                 {
@@ -736,7 +745,6 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
             dbg_plugin("Filter[%d] '%s' Stage 1 func_init() OK (%lu ms)",
                        i, e->name, (unsigned long)(GetTickCount() - t0));
         }
-        e->stage1_initialized = TRUE;
     }
 
     // stage 2: send WM_FILTER_INIT (0x0467) to each initialized filter
@@ -768,7 +776,15 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
     // if a project/video is already open in editp, notify newly initialized filters
     if (editp && editp_is_editing(editp))
     {
-        plugin_manager_notify_file_open(editp);
+        for (i = 0; i < g_plugin_count; i++)
+        {
+            PluginEntry *e = &g_plugins[i];
+            if (e->stage2_initialized && e->runtime.func_WndProc)
+            {
+                e->runtime.func_WndProc(e->hwnd, WM_FILTER_FILE_OPEN, 0, 0,
+                                        editp, &e->runtime);
+            }
+        }
     }
 }
 
@@ -817,6 +833,7 @@ static void scan_auf_directory(const char *dir, BOOL *saw_32bit_plugin_on_x64)
         rc = plugin_inspect_auf(full_path, &rep);
         if (rc < 0)
         {
+#if REAVIUTL_X64
             if (rep.last_error == ERROR_BAD_EXE_FORMAT && saw_32bit_plugin_on_x64)
             {
                 *saw_32bit_plugin_on_x64 = TRUE;
@@ -827,6 +844,17 @@ static void scan_auf_directory(const char *dir, BOOL *saw_32bit_plugin_on_x64)
             {
                 dbg_warn("Failed to load plugin '%s': %s", full_path, rep.err);
             }
+#else
+            (void)saw_32bit_plugin_on_x64;
+            if (rep.last_error == ERROR_BAD_EXE_FORMAT)
+            {
+                dbg_plugin("Skipping 64-bit plugin '%s' in 32-bit process", fd.cFileName);
+            }
+            else
+            {
+                dbg_warn("Failed to load plugin '%s': %s", full_path, rep.err);
+            }
+#endif
             continue;
         }
         dbg_plugin("Loaded '%s' @ HMODULE=0x%p (%d filter%s)",
@@ -858,7 +886,10 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
     HWND owner_hwnd;
     BOOL saw_32bit_plugin_on_x64 = FALSE;
 
-    plugin_manager_shutdown();
+    if (g_plugin_count > 0 || plugin_bridge_get_filter_count() > 0)
+    {
+        plugin_manager_shutdown();
+    }
     ensure_window_classes();
 
     g_main_hwnd = main_hwnd;
@@ -891,7 +922,6 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
     if (g_plugin_count > 0)
     {
         initialize_registered_plugins(owner_hwnd, editp);
-        return TRUE;
     }
 
 #if REAVIUTL_X64
@@ -899,18 +929,19 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
     if (saw_32bit_plugin_on_x64)
     {
         bind_host_exfunc_callbacks(owner_hwnd, editp);
-        if (plugin_bridge_load_dir(plugin_dir, owner_hwnd, editp) ||
-            (has_parent_dir && plugin_bridge_load_dir(parent_dir, owner_hwnd, editp)))
+        if (!plugin_bridge_load_dir(plugin_dir, owner_hwnd, editp) && has_parent_dir)
         {
-            editp_set_registered_filter_count(plugin_bridge_get_filter_count());
-            return TRUE;
+            plugin_bridge_load_dir(parent_dir, owner_hwnd, editp);
         }
     }
 #else
     (void)saw_32bit_plugin_on_x64;
 #endif
 
-    return FALSE;
+    editp_set_registered_filter_count(
+        g_plugin_count + (plugin_bridge_is_active() ? plugin_bridge_get_filter_count() : 0));
+
+    return (g_plugin_count > 0 || plugin_bridge_is_active());
 }
 
 BOOL plugin_manager_init(const char *plugin_dir)
@@ -924,7 +955,10 @@ BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP 
     HWND owner_hwnd;
     int rc, i;
 
-    plugin_manager_shutdown();
+    if (g_plugin_count > 0 || plugin_bridge_get_filter_count() > 0)
+    {
+        plugin_manager_shutdown();
+    }
     ensure_window_classes();
 
     g_main_hwnd = main_hwnd;
@@ -1067,33 +1101,61 @@ BOOL plugin_manager_is_bridged(void)
 
 int plugin_manager_get_count(void)
 {
-    if (plugin_bridge_is_active())
-        return plugin_bridge_get_filter_count();
-    return g_plugin_count;
+    return g_plugin_count + (plugin_bridge_is_active() ? plugin_bridge_get_filter_count() : 0);
 }
 
 const char *plugin_manager_get_name(int index)
 {
-    if (plugin_bridge_is_active())
-        return plugin_bridge_get_filter_name(index);
-    if (index < 0 || index >= g_plugin_count)
+    if (index < 0)
         return NULL;
-    return g_plugins[index].name;
+    if (index < g_plugin_count)
+        return g_plugins[index].name;
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_name(index - g_plugin_count);
+    return NULL;
+}
+
+const char *plugin_manager_get_information(int index)
+{
+    if (index < 0)
+        return NULL;
+    if (index < g_plugin_count)
+    {
+        if (g_plugins[index].runtime.information && g_plugins[index].runtime.information[0])
+        {
+            return g_plugins[index].runtime.information;
+        }
+        return g_plugins[index].name;
+    }
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_info(index - g_plugin_count);
+    return NULL;
+}
+
+const char *plugin_manager_get_path(int index)
+{
+    if (index < 0)
+        return NULL;
+    if (index < g_plugin_count)
+        return g_plugins[index].path;
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_path(index - g_plugin_count);
+    return NULL;
 }
 
 int plugin_manager_get_flags(int index)
 {
-    if (plugin_bridge_is_active())
-        return plugin_bridge_get_filter_flags(index);
-    if (index < 0 || index >= g_plugin_count)
+    if (index < 0)
         return 0;
-    return g_plugins[index].runtime.flag;
+    if (index < g_plugin_count)
+        return g_plugins[index].runtime.flag;
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_flags(index - g_plugin_count);
+    return 0;
 }
 
 FILTER *plugin_manager_get_filter(int index)
 {
-    if (plugin_bridge_is_active())
-        return NULL;
     if (index < 0 || index >= g_plugin_count)
         return NULL;
     if (!g_plugins[index].stage1_initialized)
@@ -1103,11 +1165,13 @@ FILTER *plugin_manager_get_filter(int index)
 
 HWND plugin_manager_get_window(int index)
 {
-    if (plugin_bridge_is_active())
-        return plugin_bridge_get_filter_hwnd(index);
-    if (index < 0 || index >= g_plugin_count)
+    if (index < 0)
         return NULL;
-    return g_plugins[index].hwnd;
+    if (index < g_plugin_count)
+        return g_plugins[index].hwnd;
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_hwnd(index - g_plugin_count);
+    return NULL;
 }
 
 int plugin_manager_find_by_name(const char *name)
@@ -1126,32 +1190,32 @@ int plugin_manager_find_by_name(const char *name)
 
 int plugin_manager_get_menu_item_count(void)
 {
-    if (plugin_bridge_is_active())
-        return plugin_bridge_get_menu_item_count();
-    return g_menu_item_count;
+    return g_menu_item_count + (plugin_bridge_is_active() ? plugin_bridge_get_menu_item_count() : 0);
 }
 
 BOOL plugin_manager_get_menu_item(int index, PluginMenuItem *out_item)
 {
-    if (!out_item)
+    if (!out_item || index < 0)
         return FALSE;
+    if (index < g_menu_item_count)
+    {
+        *out_item = g_menu_items[index];
+        return TRUE;
+    }
     if (plugin_bridge_is_active())
     {
         BridgeMenuItemInfo bi;
-        if (!plugin_bridge_get_menu_item(index, &bi))
+        if (!plugin_bridge_get_menu_item(index - g_menu_item_count, &bi))
             return FALSE;
         ZeroMemory(out_item, sizeof(*out_item));
-        out_item->filter_index = bi.filter_index;
+        out_item->filter_index = bi.filter_index + g_plugin_count;
         lstrcpynA(out_item->name, bi.name, sizeof(out_item->name));
         out_item->cmd_id = bi.cmd_id;
         out_item->def_key = bi.def_key;
         out_item->flag = bi.flag;
         return TRUE;
     }
-    if (index < 0 || index >= g_menu_item_count)
-        return FALSE;
-    *out_item = g_menu_items[index];
-    return TRUE;
+    return FALSE;
 }
 
 BOOL plugin_manager_show_window(int index, BOOL show)
@@ -1159,12 +1223,14 @@ BOOL plugin_manager_show_window(int index, BOOL show)
     PluginEntry *e;
     BOOL changed;
 
-    if (plugin_bridge_is_active())
-    {
-        return plugin_bridge_show_window(index, show ? 1 : 0);
-    }
-    if (index < 0 || index >= g_plugin_count)
+    if (index < 0)
         return FALSE;
+    if (index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+            return plugin_bridge_show_window(index - g_plugin_count, show ? 1 : 0);
+        return FALSE;
+    }
 
     e = &g_plugins[index];
     if (!e->hwnd || !IsWindow(e->hwnd))
@@ -1197,14 +1263,139 @@ BOOL plugin_manager_show_window(int index, BOOL show)
 
 BOOL plugin_manager_toggle_window(int index)
 {
-    if (plugin_bridge_is_active())
-    {
-        return plugin_bridge_show_window(index, 2);
-    }
-    if (index < 0 || index >= g_plugin_count)
+    if (index < 0)
         return FALSE;
+    if (index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+            return plugin_bridge_show_window(index - g_plugin_count, 2);
+        return FALSE;
+    }
     return plugin_manager_show_window(
         index, (g_plugins[index].runtime.flag & FILTER_FLAG_WINDOW_DISP) == 0);
+}
+
+BOOL plugin_manager_set_active(int index, BOOL active)
+{
+    PluginEntry *e;
+    BOOL was_active;
+
+    if (index < 0)
+        return FALSE;
+    if (index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_set_filter_active(index - g_plugin_count, active ? 1 : 0);
+            if (ok)
+                post_host_redraw(3);
+            return ok;
+        }
+        return FALSE;
+    }
+
+    e = &g_plugins[index];
+    if (e->faulted || (e->runtime.flag & FILTER_FLAG_ALWAYS_ACTIVE))
+        return FALSE;
+
+    was_active = (e->runtime.flag & FILTER_FLAG_ACTIVE) != 0;
+    if (active)
+        e->runtime.flag |= FILTER_FLAG_ACTIVE;
+    else
+        e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+
+    if (e->src_dll)
+        e->src_dll->flag = e->runtime.flag;
+    if (e->hwnd_active_chk && IsWindow(e->hwnd_active_chk))
+    {
+        SendMessageA(e->hwnd_active_chk, BM_SETCHECK,
+                     active ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (was_active != (active != 0))
+    {
+        if (e->stage1_initialized && e->runtime.func_update)
+        {
+            e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
+        }
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
+                              exfunc_get_editp(), "WM_FILTER_CHANGE_ACTIVE");
+        }
+    }
+    post_host_redraw(3);
+    post_host_redraw(1);
+    return TRUE;
+}
+
+BOOL plugin_manager_toggle_active(int index)
+{
+    if (index < 0)
+        return FALSE;
+    if (index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_set_filter_active(index - g_plugin_count, 2);
+            if (ok)
+            {
+                post_host_redraw(3);
+                post_host_redraw(1);
+            }
+            return ok;
+        }
+        return FALSE;
+    }
+    return plugin_manager_set_active(
+        index, (g_plugins[index].runtime.flag & FILTER_FLAG_ACTIVE) == 0);
+}
+
+void plugin_manager_disable_all_filters(void)
+{
+    int i;
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        if (!(g_plugins[i].runtime.flag & FILTER_FLAG_ALWAYS_ACTIVE) &&
+            (g_plugins[i].runtime.flag & FILTER_FLAG_ACTIVE))
+        {
+            plugin_manager_set_active(i, FALSE);
+        }
+    }
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_set_filter_active(0, 3);
+        post_host_redraw(3);
+        post_host_redraw(1);
+    }
+}
+
+BOOL plugin_manager_exec_import_export(int index, BOOL is_export)
+{
+    PluginEntry *e;
+    UINT msg = is_export ? WM_FILTER_EXPORT : WM_FILTER_IMPORT;
+
+    if (index < 0)
+        return FALSE;
+    if (index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_filter_io(index - g_plugin_count, is_export, exfunc_get_editp());
+            if (ok)
+                post_host_redraw(1);
+            return ok;
+        }
+        return FALSE;
+    }
+    e = &g_plugins[index];
+    if (!e->stage2_initialized || e->faulted || !e->runtime.func_WndProc)
+        return FALSE;
+    if (safe_call_wndproc(e, e->hwnd, msg, 0, 0, exfunc_get_editp(),
+                          is_export ? "WM_FILTER_EXPORT" : "WM_FILTER_IMPORT"))
+    {
+        post_host_redraw(1);
+    }
+    return TRUE;
 }
 
 HMENU plugin_manager_build_menu(void)
@@ -1230,7 +1421,7 @@ HMENU plugin_manager_build_menu(void)
         if (flags & FILTER_FLAG_NO_CONFIG)
             continue;
         sjis_to_wide(name ? name : "(unnamed)", wlabel, 256);
-        if (plugin_bridge_is_active())
+        if (i >= g_plugin_count && plugin_bridge_is_active())
         {
             lstrcatW(wlabel, L" [x86 Bridge]");
         }
@@ -1265,16 +1456,20 @@ BOOL plugin_manager_exec_menu_item_index(int menu_index)
     PluginMenuItem *it;
     PluginEntry *e;
 
-    if (plugin_bridge_is_active())
+    if (menu_index < 0)
+        return FALSE;
+    if (menu_index >= g_menu_item_count)
     {
-        BOOL ok = plugin_bridge_exec_menu_item(menu_index);
-        if (ok)
-            post_host_redraw(1);
-        return ok;
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_exec_menu_item(menu_index - g_menu_item_count);
+            if (ok)
+                post_host_redraw(1);
+            return ok;
+        }
+        return FALSE;
     }
 
-    if (menu_index < 0 || menu_index >= g_menu_item_count)
-        return FALSE;
     it = &g_menu_items[menu_index];
     if (it->filter_index >= 0 && it->filter_index < g_plugin_count)
     {
@@ -1300,11 +1495,24 @@ BOOL plugin_manager_exec_menu_item_index(int menu_index)
 
 BOOL plugin_manager_handle_command(HWND hwnd, int cmd_id)
 {
+    int count = plugin_manager_get_count();
     (void)hwnd;
-    if (cmd_id >= PLUGIN_CMD_WINDOW_BASE &&
-        cmd_id < PLUGIN_CMD_WINDOW_BASE + plugin_manager_get_count())
+
+    if (cmd_id >= PLUGIN_CMD_TOGGLE_BASE && cmd_id < PLUGIN_CMD_TOGGLE_BASE + count)
+    {
+        return plugin_manager_toggle_active(cmd_id - PLUGIN_CMD_TOGGLE_BASE);
+    }
+    if (cmd_id >= PLUGIN_CMD_WINDOW_BASE && cmd_id < PLUGIN_CMD_WINDOW_BASE + count)
     {
         return plugin_manager_toggle_window(cmd_id - PLUGIN_CMD_WINDOW_BASE);
+    }
+    if (cmd_id >= PLUGIN_CMD_IMPORT_BASE && cmd_id < PLUGIN_CMD_IMPORT_BASE + count)
+    {
+        return plugin_manager_exec_import_export(cmd_id - PLUGIN_CMD_IMPORT_BASE, FALSE);
+    }
+    if (cmd_id >= PLUGIN_CMD_EXPORT_BASE && cmd_id < PLUGIN_CMD_EXPORT_BASE + count)
+    {
+        return plugin_manager_exec_import_export(cmd_id - PLUGIN_CMD_EXPORT_BASE, TRUE);
     }
     if (cmd_id >= PLUGIN_CMD_MENU_ITEM_BASE &&
         cmd_id < PLUGIN_CMD_MENU_ITEM_BASE + plugin_manager_get_menu_item_count())
@@ -1320,17 +1528,7 @@ BOOL plugin_manager_handle_key(HWND hwnd, UINT vk, BOOL is_down, LPARAM key_lpar
     BOOL handled = FALSE;
     (void)hwnd;
 
-    if (plugin_bridge_is_active())
-    {
-        if (plugin_bridge_forward_key(vk, is_down, key_lparam))
-        {
-            post_host_redraw(1);
-            return TRUE;
-        }
-        return FALSE;
-    }
-
-    // check registered add_menu_item default shortcuts on key down
+    // check registered native add_menu_item default shortcuts on key down
     if (is_down)
     {
         BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -1357,7 +1555,7 @@ BOOL plugin_manager_handle_key(HWND hwnd, UINT vk, BOOL is_down, LPARAM key_lpar
         }
     }
 
-    // forward WM_FILTER_MAIN_KEY_DOWN / UP to MAIN_MESSAGE filters
+    // forward WM_FILTER_MAIN_KEY_DOWN / UP to native MAIN_MESSAGE filters
     for (i = 0; i < g_plugin_count; i++)
     {
         PluginEntry *e = &g_plugins[i];
@@ -1374,6 +1572,15 @@ BOOL plugin_manager_handle_key(HWND hwnd, UINT vk, BOOL is_down, LPARAM key_lpar
             handled = TRUE;
         }
     }
+
+    if (plugin_bridge_is_active())
+    {
+        if (plugin_bridge_forward_key(vk, is_down, key_lparam))
+        {
+            handled = TRUE;
+        }
+    }
+
     if (handled)
         post_host_redraw(1);
     return handled;
@@ -1385,16 +1592,6 @@ BOOL plugin_manager_forward_main_mouse(UINT filter_mouse_msg, WPARAM mk_flags,
     int i;
     BOOL need_redraw = FALSE;
     LPARAM lp = MAKELPARAM((short)img_x, (short)img_y);
-
-    if (plugin_bridge_is_active())
-    {
-        if (plugin_bridge_forward_mouse(filter_mouse_msg, mk_flags, img_x, img_y))
-        {
-            post_host_redraw(1);
-            return TRUE;
-        }
-        return FALSE;
-    }
 
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1411,6 +1608,15 @@ BOOL plugin_manager_forward_main_mouse(UINT filter_mouse_msg, WPARAM mk_flags,
             need_redraw = TRUE;
         }
     }
+
+    if (plugin_bridge_is_active())
+    {
+        if (plugin_bridge_forward_mouse(filter_mouse_msg, mk_flags, img_x, img_y))
+        {
+            need_redraw = TRUE;
+        }
+    }
+
     if (need_redraw)
         post_host_redraw(1);
     return need_redraw;
@@ -1420,11 +1626,6 @@ BOOL plugin_manager_forward_main_misc(UINT filter_msg, WPARAM wp, LPARAM lp)
 {
     int i;
     BOOL need_redraw = FALSE;
-
-    if (plugin_bridge_is_active())
-    {
-        return FALSE;
-    }
 
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1455,7 +1656,7 @@ BOOL plugin_manager_forward_main_misc(UINT filter_msg, WPARAM wp, LPARAM lp)
 void plugin_manager_modify_title(EDITP *ep, int frame, char *title, int max_title)
 {
     int i;
-    if (!title || max_title <= 0 || plugin_bridge_is_active())
+    if (!title || max_title <= 0)
         return;
 
     for (i = 0; i < g_plugin_count; i++)
@@ -1537,7 +1738,7 @@ int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL
     }
     if (plugin_bridge_is_active())
     {
-        return plugin_bridge_render_audio(ep, frame_num, buf, samples, editp_get_audio_ch(ep));
+        samples = plugin_bridge_render_audio(ep, frame_num, buf, samples, editp_get_audio_ch(ep));
     }
     return plugin_manager_apply_audio_filters(ep, frame_num, buf, samples, NULL);
 }
@@ -1545,15 +1746,19 @@ int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL
 BOOL plugin_manager_send_filter_command(int filter_index, int filter_cmd_id)
 {
     PluginEntry *e;
-    if (plugin_bridge_is_active())
-    {
-        BOOL ok = plugin_bridge_send_filter_command(filter_index, filter_cmd_id);
-        if (ok)
-            post_host_redraw(1);
-        return ok;
-    }
-    if (filter_index < 0 || filter_index >= g_plugin_count)
+    if (filter_index < 0)
         return FALSE;
+    if (filter_index >= g_plugin_count)
+    {
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_send_filter_command(filter_index - g_plugin_count, filter_cmd_id);
+            if (ok)
+                post_host_redraw(1);
+            return ok;
+        }
+        return FALSE;
+    }
     e = &g_plugins[filter_index];
     if (!e->stage2_initialized || !e->runtime.func_WndProc)
         return FALSE;
@@ -1570,23 +1775,25 @@ BOOL plugin_manager_import_exo(int filter_index, const char *exo_path, EDITP *ep
     char abs_exo[MAX_PATH];
     PluginEntry *e;
 
-    if (!exo_path || !exo_path[0])
+    if (!exo_path || !exo_path[0] || filter_index < 0)
         return FALSE;
     if (GetFullPathNameA(exo_path, MAX_PATH, abs_exo, NULL) == 0)
     {
         lstrcpynA(abs_exo, exo_path, MAX_PATH);
     }
 
-    if (plugin_bridge_is_active())
+    if (filter_index >= g_plugin_count)
     {
-        BOOL ok = plugin_bridge_import_exo(filter_index, abs_exo, ep);
-        if (ok)
-            post_host_redraw(2);
-        return ok;
+        if (plugin_bridge_is_active())
+        {
+            BOOL ok = plugin_bridge_import_exo(filter_index - g_plugin_count, abs_exo, ep);
+            if (ok)
+                post_host_redraw(2);
+            return ok;
+        }
+        return FALSE;
     }
 
-    if (filter_index < 0 || filter_index >= g_plugin_count)
-        return FALSE;
     e = &g_plugins[filter_index];
     if (!e->stage2_initialized || e->faulted || !e->runtime.func_WndProc)
         return FALSE;
@@ -1658,7 +1865,6 @@ void plugin_manager_notify_file_open(EDITP *ep)
         {
             plugin_bridge_open_video(editp_get_edit_path(ep), ep);
         }
-        return;
     }
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1678,7 +1884,6 @@ void plugin_manager_notify_file_close(EDITP *ep)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_close_video(ep);
-        return;
     }
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1697,7 +1902,6 @@ void plugin_manager_notify_update(EDITP *ep)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_sync_to_bridge(ep);
-        return;
     }
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1723,7 +1927,6 @@ void plugin_manager_notify_save_start(EDITP *ep, int s, int e, int out_flags)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_notify_save_start(target_ep, s, e, out_flags);
-        return;
     }
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1763,9 +1966,6 @@ void plugin_manager_notify_save_end(EDITP *ep, int out_flags)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_notify_save_end(target_ep, out_flags);
-        if (target_ep)
-            editp_set_saving(target_ep, FALSE);
-        return;
     }
     for (i = 0; i < g_plugin_count; i++)
     {
@@ -1831,8 +2031,10 @@ BOOL plugin_manager_render_video_frame(EDITP *ep, int frame_num)
 
     if (plugin_bridge_is_active())
     {
-        // if no native 64-bit filters ran first, let the 32-bit bridge decode + render directly in its own EDITP and return the final YC48 frame via shared memory
-        return plugin_bridge_render_frame(ep, frame_num, FALSE);
+        if (!plugin_bridge_render_frame(ep, frame_num, FALSE))
+            return FALSE;
+        apply_native_video_filters(ep, NULL);
+        return TRUE;
     }
 
     if (!editp_is_editing(ep))
@@ -1878,14 +2080,7 @@ BOOL plugin_manager_apply_filter(int filter_id, void *editp_ptr)
 void plugin_manager_debug_dump(void)
 {
     int i;
-    if (plugin_bridge_is_active())
-    {
-        dbg_plugin("bridged 32-bit filters: %d", plugin_bridge_get_filter_count());
-        plugin_bridge_debug_cmd("plugins");
-        return;
-    }
-
-    dbg_plugin("loaded filters: %d (menu items: %d)", g_plugin_count, g_menu_item_count);
+    dbg_plugin("loaded native filters: %d (native menu items: %d)", g_plugin_count, g_menu_item_count);
     for (i = 0; i < g_plugin_count; i++)
     {
         const PluginEntry *e = &g_plugins[i];
@@ -1902,5 +2097,11 @@ void plugin_manager_debug_dump(void)
                    (fp->flag & FILTER_FLAG_AUDIO_FILTER) ? "AUDIO " : "",
                    (fp->flag & FILTER_FLAG_MAIN_MESSAGE) ? "MAIN_MSG " : "",
                    fp->track_n, fp->check_n, fp->ex_data_size, e->path);
+    }
+
+    if (plugin_bridge_is_active())
+    {
+        dbg_plugin("bridged 32-bit filters: %d", plugin_bridge_get_filter_count());
+        plugin_bridge_debug_cmd("plugins");
     }
 }

@@ -10,8 +10,11 @@
 #define WM_REAVIUTL_PLUGIN_REDRAW (WM_APP + 0x40)
 #define WM_REAVIUTL_BRIDGE_NOTIFY (WM_APP + 0x50)
 
-#define PLUGIN_CMD_WINDOW_BASE 30000
-#define PLUGIN_CMD_MENU_ITEM_BASE 31000
+#define PLUGIN_CMD_TOGGLE_BASE 10001
+#define PLUGIN_CMD_WINDOW_BASE 11001
+#define PLUGIN_CMD_IMPORT_BASE 14001
+#define PLUGIN_CMD_EXPORT_BASE 15001
+#define PLUGIN_CMD_MENU_ITEM_BASE 16000
 
 typedef struct PluginMenuItem
 {
@@ -30,6 +33,8 @@ void plugin_manager_shutdown(void);
 
 int plugin_manager_get_count(void);
 const char *plugin_manager_get_name(int index);
+const char *plugin_manager_get_information(int index);
+const char *plugin_manager_get_path(int index);
 int plugin_manager_get_flags(int index);
 FILTER *plugin_manager_get_filter(int index);
 HWND plugin_manager_get_window(int index);
@@ -41,6 +46,11 @@ BOOL plugin_manager_get_menu_item(int index, PluginMenuItem *out_item);
 BOOL plugin_manager_exec_menu_item_index(int menu_index);
 
 HMENU plugin_manager_build_menu(void);
+
+BOOL plugin_manager_set_active(int index, BOOL active);
+BOOL plugin_manager_toggle_active(int index);
+void plugin_manager_disable_all_filters(void);
+BOOL plugin_manager_exec_import_export(int index, BOOL is_export);
 
 BOOL plugin_manager_show_window(int index, BOOL show);
 BOOL plugin_manager_toggle_window(int index);

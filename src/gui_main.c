@@ -11,6 +11,8 @@
 #include "preview.h"
 #include "i18n.h"
 #include "aviutl_dlg.h"
+#include "keycfg.h"
+#include "winsnap.h"
 #include "editp.h"
 #include "exfunc.h"
 #include "yc48_convert.h"
@@ -2359,12 +2361,25 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_ENTERSIZEMOVE:
+    case WM_EXITSIZEMOVE:
+        if (winsnap_handle_message(hwnd, hwnd, msg, wp, lp))
+            return 0;
+        break;
+
+    case WM_MOVING:
+        if (winsnap_handle_message(hwnd, hwnd, msg, wp, lp))
+            return TRUE;
+        break;
+
     case WM_MOVE:
+        winsnap_handle_message(hwnd, hwnd, msg, wp, lp);
         preview_on_size(hwnd, g_editp);
         plugin_manager_forward_main_misc(WM_FILTER_MAIN_MOVESIZE, 0, 0);
         return 0;
 
     case WM_SIZE:
+        winsnap_handle_message(hwnd, hwnd, msg, wp, lp);
         preview_on_size(hwnd, g_editp);
         plugin_manager_forward_main_misc(WM_FILTER_MAIN_MOVESIZE, 0, 0);
         InvalidateRect(hwnd, NULL, FALSE);
@@ -2629,125 +2644,56 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        BOOL alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+
         if (wp == VK_ESCAPE)
         {
             SendMessageA(hwnd, WM_COMMAND, 1009, 0);
             return 0;
         }
-        if (ctrl && wp == 'O')
+
+        // 0x00412300 lines 446..461: MAIN_MESSAGE filter keydown runs first, then shortcut table
+        if (msg == WM_KEYDOWN && plugin_manager_handle_key(hwnd, (UINT)wp, TRUE, lp))
         {
-            SendMessageA(hwnd, WM_COMMAND, 5097, 0);
             return 0;
         }
-        if (ctrl && wp == 'S')
+        if (keycfg_translate_keydown(hwnd, msg, (UINT)wp))
         {
-            SendMessageA(hwnd, WM_COMMAND, shift ? 1024 : 1003, 0);
-            return 0;
-        }
-        if (ctrl && wp == 'N')
-        {
-            open_media_or_exo(hwnd, "1280x720_30fps_44100Hz.exedit");
-            return 0;
-        }
-        if (ctrl && wp == 'C')
-        {
-            SendMessageA(hwnd, WM_COMMAND, 1020, 0);
-            return 0;
-        }
-        if (ctrl && wp == 'A')
-        {
-            SendMessageA(hwnd, WM_COMMAND, 5112, 0);
-            return 0;
-        }
-        if (ctrl && wp == 'G')
-        {
-            SendMessageA(hwnd, WM_COMMAND, 5131, 0);
-            return 0;
-        }
-        if (wp == VK_F12)
-        {
-            SendMessageA(hwnd, WM_COMMAND, IDC_TOGGLE_CONSOLE, 0);
-            return 0;
-        }
-        if (wp == VK_SPACE)
-        {
-            toggle_playback(hwnd);
-            return 0;
-        }
-        if (wp == VK_ADD)
-        {
-            SendMessageA(hwnd, WM_COMMAND, 9107, 0);
-            return 0;
-        }
-        if (wp == VK_SUBTRACT)
-        {
-            SendMessageA(hwnd, WM_COMMAND, 9108, 0);
             return 0;
         }
 
-        if (plugin_manager_handle_key(hwnd, (UINT)wp, TRUE, lp))
+        if (msg == WM_KEYDOWN)
         {
+            if (ctrl && shift && !alt && wp == 'S')
+            {
+                SendMessageA(hwnd, WM_COMMAND, 1024, 0);
+                return 0;
+            }
+            if (ctrl && !shift && !alt && wp == 'N')
+            {
+                open_media_or_exo(hwnd, "1280x720_30fps_44100Hz.exedit");
+                return 0;
+            }
+            if (!ctrl && !shift && !alt && wp == VK_F12)
+            {
+                SendMessageA(hwnd, WM_COMMAND, IDC_TOGGLE_CONSOLE, 0);
+                return 0;
+            }
+            if (!ctrl && !shift && !alt && wp == VK_SPACE)
+            {
+                toggle_playback(hwnd);
+                return 0;
+            }
             return 0;
         }
-        if (g_editp && editp_is_editing(g_editp))
-        {
-            if (wp == VK_LEFT)
-            {
-                seek_to_frame_ex(hwnd, editp_get_frame(g_editp) - 1, TRUE);
-                return 0;
-            }
-            if (wp == VK_RIGHT)
-            {
-                seek_to_frame_ex(hwnd, editp_get_frame(g_editp) + 1, TRUE);
-                return 0;
-            }
-            if (wp == VK_UP)
-            {
-                seek_to_frame_ex(hwnd, editp_get_frame(g_editp) - 1, TRUE);
-                return 0;
-            }
-            if (wp == VK_DOWN)
-            {
-                seek_to_frame_ex(hwnd, editp_get_frame(g_editp) + 1, TRUE);
-                return 0;
-            }
-            if (wp == VK_HOME)
-            {
-                seek_to_frame_ex(hwnd, 0, TRUE);
-                return 0;
-            }
-            if (wp == VK_END)
-            {
-                seek_to_frame_ex(hwnd, editp_get_frame_n(g_editp) - 1, TRUE);
-                return 0;
-            }
-            if (wp == VK_NEXT)
-            {
-                SendMessageA(hwnd, WM_COMMAND, 5187, 0);
-                return 0;
-            }
-            if (wp == VK_PRIOR)
-            {
-                SendMessageA(hwnd, WM_COMMAND, 5188, 0);
-                return 0;
-            }
-            if (wp == VK_OEM_4)
-            {
-                SendMessageA(hwnd, WM_COMMAND, 9004, 0);
-                return 0;
-            }
-            if (wp == VK_OEM_6)
-            {
-                SendMessageA(hwnd, WM_COMMAND, 9003, 0);
-                return 0;
-            }
-        }
-        return 0;
+        break;
     }
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
         plugin_manager_handle_key(hwnd, (UINT)wp, FALSE, lp);
+        if (msg == WM_SYSKEYUP)
+            break;
         return 0;
 
     case WM_REAVIUTL_PLUGIN_REDRAW:
@@ -2894,6 +2840,9 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 1086: // file -> settings -> Input Plugin Priority
             run_input_priority_dialog(hwnd);
             return 0;
+        case 102: // file -> settings -> Shortcut Keys
+            keycfg_run_dialog(hwnd);
+            return 0;
         case 106: // file -> settings -> Language
             if (i18n_show_lang_dialog(hwnd))
             {
@@ -2907,6 +2856,7 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case 108: // file -> settings -> System Settings
             run_system_settings_dialog(hwnd);
+            winsnap_set_enabled(preview_get_sys_config()->windowsnap != 0);
             return 0;
         case 1006: // other -> File Information
             show_current_file_info(hwnd);
@@ -3175,6 +3125,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     }
 
     preview_load_ini(&win_x, &win_y, &win_w, &win_h, &win_max);
+    winsnap_set_enabled(preview_get_sys_config()->windowsnap != 0);
 
     hwnd = CreateWindowExA(
         0, CLASS_NAME, IDLE_TITLE, AVIUTL_WIN_STYLE,
@@ -3213,6 +3164,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     video_export_scan_auo(plugin_dir, hwnd, g_editp);
 
     apply_menu(hwnd);
+    keycfg_init_and_load(hwnd);
     preview_on_size(hwnd, g_editp);
 
     if (preview_get_flags() & PREVIEW_FLAG_ALWAYSTOP)

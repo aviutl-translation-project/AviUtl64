@@ -57,6 +57,7 @@ typedef struct AviUtlSystemConfig
     int dragdropactive;
     int movieplaymain;
     int trackbarclick;
+    int windowsnap;
 } AviUtlSystemConfig;
 
 BOOL preview_register_classes(HINSTANCE hInst);

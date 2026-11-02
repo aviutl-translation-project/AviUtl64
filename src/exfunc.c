@@ -388,6 +388,7 @@ static BOOL __cdecl impl_filter_window_update(FILTER *fp)
 {
     if (fp && fp->hwnd && IsWindow(fp->hwnd))
     {
+        SendMessageA(fp->hwnd, WM_APP + 0x41, 0, 0);
         InvalidateRect(fp->hwnd, NULL, FALSE);
         return TRUE;
     }

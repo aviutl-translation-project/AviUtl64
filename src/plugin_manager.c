@@ -9,6 +9,8 @@
 #include "aup_project.h"
 #include "editp.h"
 #include "exfunc.h"
+#include "i18n.h"
+#include "winsnap.h"
 #include "debug_console.h"
 
 #define MAX_PLUGINS 128
@@ -16,9 +18,13 @@
 #define MAX_TRACK_CTRLS 64
 #define MAX_CHECK_CTRLS 48
 
-// internal child control IDs inside standard SDK filter windows
+// internal child control IDs inside standard SDK filter windows (0x0042c930 / 0x0042f870)
+#define WM_REAVIUTL_SYNC_FILTER_CONTROLS (WM_APP + 0x41)
+#define IDC_FLT_EDIT_BASE 13100
 #define IDC_FLT_ACTIVE 45000
 #define IDC_FLT_CHECK_BASE 45100
+#define IDC_FLT_STEP_DEC_BASE 45200
+#define IDC_FLT_STEP_INC_BASE 45300
 
 #define FILTER_CONTAINER_CLASS "AviUtlFilterClass"
 #define HOST_DUMMY_OWNER_CLASS "AviUtlHostDummyOwner"
@@ -38,11 +44,14 @@ typedef struct
     BOOL faulted;
     BOOL teardown;
 
-    // standard SDK trackbar/checkbox controls (for non-custom filters)
+    // standard SDK trackbar/checkbox/button controls (for non-custom filters)
     HWND hwnd_active_chk;
     HWND hwnd_track_bar[MAX_TRACK_CTRLS];
     HWND hwnd_track_val[MAX_TRACK_CTRLS];
+    HWND hwnd_track_dec[MAX_TRACK_CTRLS];
+    HWND hwnd_track_inc[MAX_TRACK_CTRLS];
     HWND hwnd_check_btn[MAX_CHECK_CTRLS];
+    BOOL updating_track_ui;
 } PluginEntry;
 
 static PluginEntry g_plugins[MAX_PLUGINS];
@@ -353,6 +362,150 @@ static int cb_host_render_audio_up_to(FILTER *stop_before_fp, EDITP *ep,
     return plugin_manager_apply_audio_filters(ep, frame_num, out_pcm, samples, stop_before_fp);
 }
 
+// 0x00431390 & 0x00431560: synchronize standard host controls from e->runtime
+static void sync_filter_entry_controls(PluginEntry *e)
+{
+    int t, c;
+    if (!e || e->teardown)
+        return;
+
+    e->updating_track_ui = TRUE;
+
+    if (e->hwnd_active_chk && IsWindow(e->hwnd_active_chk))
+    {
+        SendMessageA(e->hwnd_active_chk, BM_SETCHECK,
+                     (e->runtime.flag & FILTER_FLAG_ACTIVE) ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
+    if (e->runtime.track)
+    {
+        for (t = 0; t < e->runtime.track_n && t < MAX_TRACK_CTRLS; t++)
+        {
+            char buf[32];
+            int val = e->runtime.track[t];
+            if (e->hwnd_track_bar[t] && IsWindow(e->hwnd_track_bar[t]))
+            {
+                SendMessageA(e->hwnd_track_bar[t], TBM_SETPOS, TRUE, val);
+            }
+            if (e->hwnd_track_val[t] && IsWindow(e->hwnd_track_val[t]))
+            {
+                wsprintfA(buf, "%d", val);
+                SetWindowTextA(e->hwnd_track_val[t], buf);
+            }
+        }
+    }
+
+    if (e->runtime.check)
+    {
+        for (c = 0; c < e->runtime.check_n && c < MAX_CHECK_CTRLS; c++)
+        {
+            int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+            if (cdef >= 0 && e->hwnd_check_btn[c] && IsWindow(e->hwnd_check_btn[c]))
+            {
+                SendMessageA(e->hwnd_check_btn[c], BM_SETCHECK,
+                             e->runtime.check[c] ? BST_CHECKED : BST_UNCHECKED, 0);
+            }
+        }
+    }
+
+    e->updating_track_ui = FALSE;
+}
+
+static void apply_track_value_change(PluginEntry *e, HWND hwnd, int t, int new_val, BOOL sync_edit)
+{
+    int s_val = e->runtime.track_s ? e->runtime.track_s[t] : 0;
+    int e_val = e->runtime.track_e ? e->runtime.track_e[t] : 256;
+    char buf[32];
+
+    if (new_val < s_val)
+        new_val = s_val;
+    if (new_val > e_val)
+        new_val = e_val;
+    if (e->runtime.track[t] == new_val)
+        return;
+
+    e->runtime.track[t] = new_val;
+    e->updating_track_ui = TRUE;
+    if (e->hwnd_track_bar[t])
+        SendMessageA(e->hwnd_track_bar[t], TBM_SETPOS, TRUE, new_val);
+    if (sync_edit && e->hwnd_track_val[t])
+    {
+        wsprintfA(buf, "%d", new_val);
+        SetWindowTextA(e->hwnd_track_val[t], buf);
+    }
+    e->updating_track_ui = FALSE;
+
+    if (e->runtime.func_update)
+        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_TRACK + t);
+    if (e->runtime.func_WndProc)
+    {
+        safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                          exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
+    }
+    post_host_redraw(1);
+}
+
+// 0x0042f870 lines 188..218: reset filter parameters & ex_data to defaults (CONTEXT2 -> 13001)
+static void reset_filter_entry_defaults(PluginEntry *e, HWND hwnd)
+{
+    int t, c;
+    if (!e)
+        return;
+
+    if (e->runtime.track)
+    {
+        for (t = 0; t < e->runtime.track_n && t < MAX_TRACK_CTRLS; t++)
+        {
+            e->runtime.track[t] = e->runtime.track_default ? e->runtime.track_default[t] : 0;
+        }
+    }
+
+    if (e->runtime.check)
+    {
+        int first_radio_checked = -1;
+        for (c = 0; c < e->runtime.check_n && c < MAX_CHECK_CTRLS; c++)
+        {
+            int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+            if (cdef >= 0)
+            {
+                e->runtime.check[c] = cdef;
+                if ((e->runtime.flag & FILTER_FLAG_RADIO_BUTTON) && cdef > 0 && first_radio_checked < 0)
+                {
+                    first_radio_checked = c;
+                }
+            }
+        }
+        if ((e->runtime.flag & FILTER_FLAG_RADIO_BUTTON) && e->runtime.check_n > 0)
+        {
+            if (first_radio_checked < 0)
+                first_radio_checked = 0;
+            for (c = 0; c < e->runtime.check_n && c < MAX_CHECK_CTRLS; c++)
+            {
+                int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+                if (cdef >= 0)
+                    e->runtime.check[c] = (c == first_radio_checked) ? 1 : 0;
+            }
+        }
+    }
+
+    if ((e->runtime.flag & FILTER_FLAG_EX_DATA) &&
+        e->runtime.ex_data_ptr && e->runtime.ex_data_def && e->runtime.ex_data_size > 0)
+    {
+        memcpy(e->runtime.ex_data_ptr, e->runtime.ex_data_def, (size_t)e->runtime.ex_data_size);
+    }
+
+    sync_filter_entry_controls(e);
+    if (e->runtime.func_update)
+        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
+    if (e->runtime.func_WndProc)
+    {
+        safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                          exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+    post_host_redraw(1);
+}
+
 // 0x0042f870, filter container wndproc
 static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -376,6 +529,12 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         return DefWindowProcW(hwnd, WM_SETTEXT, wp, (LPARAM)wtitle);
     }
 
+    if (msg == WM_REAVIUTL_SYNC_FILTER_CONTROLS && e)
+    {
+        sync_filter_entry_controls(e);
+        return 0;
+    }
+
     if (msg == WM_GETMINMAXINFO)
     {
         LRESULT lr = DefWindowProcA(hwnd, msg, wp, lp);
@@ -390,6 +549,30 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         return lr;
     }
 
+    if (msg == WM_SIZE && e && e->hwnd_active_chk && IsWindow(e->hwnd_active_chk))
+    {
+        RECT crc;
+        GetClientRect(hwnd, &crc);
+        SetWindowPos(e->hwnd_active_chk, NULL, crc.right - 15, 2, 12, 11,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // 0x00405450 lines 72..98: paint track value EDIT boxes on COLOR_BTNFACE
+    if (msg == WM_CTLCOLOREDIT && e && lp != 0)
+    {
+        int t;
+        for (t = 0; t < e->runtime.track_n && t < MAX_TRACK_CTRLS; t++)
+        {
+            if (e->hwnd_track_val[t] == (HWND)lp)
+            {
+                HDC hdc = (HDC)wp;
+                SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
+                return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            }
+        }
+    }
+
     if (msg == WM_CLOSE && e && !e->teardown)
     {
         // aviutl hides filter windows on [X] instead of destroying them
@@ -397,7 +580,7 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         return 0;
     }
 
-    // standard SDK trackbar/checkbox handling when filter uses host controls
+    // standard SDK trackbar/checkbox/edit/context2 handling when filter uses host controls
     if (e && e->stage1_initialized && !e->teardown)
     {
         if (msg == WM_HSCROLL && lp != 0 && e->runtime.track)
@@ -409,21 +592,7 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 if (e->hwnd_track_bar[t] == hBar)
                 {
                     int val = (int)SendMessageA(hBar, TBM_GETPOS, 0, 0);
-                    char buf[32];
-                    e->runtime.track[t] = val;
-                    wsprintfA(buf, "%d", val);
-                    if (e->hwnd_track_val[t])
-                        SetWindowTextA(e->hwnd_track_val[t], buf);
-                    if (e->runtime.func_update)
-                    {
-                        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_TRACK + t);
-                    }
-                    if (e->runtime.func_WndProc)
-                    {
-                        e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
-                                                exfunc_get_editp(), &e->runtime);
-                    }
-                    post_host_redraw(1);
+                    apply_track_value_change(e, hwnd, t, val, TRUE);
                     return 0;
                 }
             }
@@ -431,65 +600,202 @@ static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         else if (msg == WM_COMMAND)
         {
             int id = LOWORD(wp);
+            int code = HIWORD(wp);
+
             if (id == IDC_FLT_ACTIVE && e->hwnd_active_chk)
             {
-                if (SendMessageA(e->hwnd_active_chk, BM_GETCHECK, 0, 0) == BST_CHECKED)
-                    e->runtime.flag |= FILTER_FLAG_ACTIVE;
-                else
-                    e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
-                if (e->src_dll)
-                    e->src_dll->flag = e->runtime.flag;
-                if (e->runtime.func_update)
-                {
-                    e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
-                }
-                if (e->runtime.func_WndProc)
-                {
-                    e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
-                                            exfunc_get_editp(), &e->runtime);
-                }
-                post_host_redraw(1);
+                BOOL want = (SendMessageA(e->hwnd_active_chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                plugin_manager_set_active(e->index, want);
                 return 0;
+            }
+            if (id == 13000)
+            {
+                plugin_manager_toggle_active(e->index);
+                return 0;
+            }
+            if (id == 13001)
+            {
+                reset_filter_entry_defaults(e, hwnd);
+                return 0;
+            }
+            if (id >= IDC_FLT_STEP_DEC_BASE &&
+                id < IDC_FLT_STEP_DEC_BASE + e->runtime.track_n &&
+                id - IDC_FLT_STEP_DEC_BASE < MAX_TRACK_CTRLS && e->runtime.track)
+            {
+                int t = id - IDC_FLT_STEP_DEC_BASE;
+                apply_track_value_change(e, hwnd, t, e->runtime.track[t] - 1, TRUE);
+                return 0;
+            }
+            if (id >= IDC_FLT_STEP_INC_BASE &&
+                id < IDC_FLT_STEP_INC_BASE + e->runtime.track_n &&
+                id - IDC_FLT_STEP_INC_BASE < MAX_TRACK_CTRLS && e->runtime.track)
+            {
+                int t = id - IDC_FLT_STEP_INC_BASE;
+                apply_track_value_change(e, hwnd, t, e->runtime.track[t] + 1, TRUE);
+                return 0;
+            }
+            if (id >= IDC_FLT_EDIT_BASE &&
+                id < IDC_FLT_EDIT_BASE + e->runtime.track_n &&
+                id - IDC_FLT_EDIT_BASE < MAX_TRACK_CTRLS && e->runtime.track)
+            {
+                int t = id - IDC_FLT_EDIT_BASE;
+                if (code == EN_SETFOCUS && e->hwnd_track_val[t])
+                {
+                    PostMessageA(e->hwnd_track_val[t], EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                if (code == EN_UPDATE && !e->updating_track_ui &&
+                    e->hwnd_track_val[t] && GetFocus() == e->hwnd_track_val[t])
+                {
+                    char txt[32];
+                    int parsed;
+                    txt[0] = '\0';
+                    GetWindowTextA(e->hwnd_track_val[t], txt, sizeof(txt));
+                    if (txt[0] == '\0')
+                        parsed = e->runtime.track_default ? e->runtime.track_default[t] : 0;
+                    else
+                        parsed = atoi(txt);
+                    apply_track_value_change(e, hwnd, t, parsed, FALSE);
+                    return 0;
+                }
+                if (code == EN_KILLFOCUS && !e->updating_track_ui && e->hwnd_track_val[t])
+                {
+                    char txt[32];
+                    e->updating_track_ui = TRUE;
+                    wsprintfA(txt, "%d", e->runtime.track[t]);
+                    SetWindowTextA(e->hwnd_track_val[t], txt);
+                    e->updating_track_ui = FALSE;
+                    return 0;
+                }
             }
             if (id >= IDC_FLT_CHECK_BASE &&
                 id < IDC_FLT_CHECK_BASE + e->runtime.check_n &&
                 id - IDC_FLT_CHECK_BASE < MAX_CHECK_CTRLS)
             {
                 int c = id - IDC_FLT_CHECK_BASE;
-                if (e->runtime.check_default && e->runtime.check_default[c] >= 0 &&
-                    e->runtime.check && e->hwnd_check_btn[c])
+                int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+                if (cdef >= 0 && e->runtime.check && e->hwnd_check_btn[c])
                 {
-                    e->runtime.check[c] =
-                        (SendMessageA(e->hwnd_check_btn[c], BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                    if (e->runtime.flag & FILTER_FLAG_RADIO_BUTTON)
+                    {
+                        int k;
+                        for (k = 0; k < e->runtime.check_n && k < MAX_CHECK_CTRLS; k++)
+                        {
+                            int kdef = e->runtime.check_default ? e->runtime.check_default[k] : 0;
+                            if (kdef >= 0)
+                            {
+                                e->runtime.check[k] = (k == c) ? 1 : 0;
+                                if (e->hwnd_check_btn[k])
+                                {
+                                    SendMessageA(e->hwnd_check_btn[k], BM_SETCHECK,
+                                                 (k == c) ? BST_CHECKED : BST_UNCHECKED, 0);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        e->runtime.check[c] =
+                            (SendMessageA(e->hwnd_check_btn[c], BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                    }
                     if (e->runtime.func_update)
                     {
                         e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_CHECK + c);
                     }
                     if (e->runtime.func_WndProc)
                     {
-                        e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
-                                                exfunc_get_editp(), &e->runtime);
+                        safe_call_wndproc(e, hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                                          exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
                     }
                     post_host_redraw(1);
                     return 0;
                 }
-                // pushbutton check item (check_default < 0): fall through so plugin's func_WndProc also sees WM_COMMAND if desired
             }
         }
     }
 
     if (e && e->stage1_initialized && !e->teardown && e->runtime.func_WndProc)
     {
-        BOOL need_redraw = e->runtime.func_WndProc(
-            hwnd, msg, wp, lp, exfunc_get_editp(), &e->runtime);
+        BOOL need_redraw = safe_call_wndproc(
+            e, hwnd, msg, wp, lp, exfunc_get_editp(), "AviUtlFilterWndProc");
         if (need_redraw)
         {
             post_host_redraw(1);
+        }
+        if (msg == WM_CONTEXTMENU && need_redraw)
+        {
+            return 0;
         }
         // custom WM_FILTER_* messages (0x0464) do not go to DefWindowProc
         if (msg >= WM_FILTER_UPDATE && msg <= 0x0490)
         {
             return (LRESULT)need_redraw;
+        }
+    }
+
+    // 0x0042f870 lines 68..110: client-area right-click CONTEXT2 menu (ON/OFF, Reset defaults)
+    if (msg == WM_CONTEXTMENU && e && !e->teardown)
+    {
+        UINT flg = (UINT)e->runtime.flag;
+        if (!(flg & FILTER_FLAG_DISP_FILTER) &&
+            (!(flg & FILTER_FLAG_ALWAYS_ACTIVE) || e->runtime.track_n > 0 ||
+             e->runtime.check_n > 0 || (flg & FILTER_FLAG_EX_DATA)))
+        {
+            int sx = (short)LOWORD(lp);
+            int sy = (short)HIWORD(lp);
+            POINT pt;
+            RECT crc;
+            GetClientRect(hwnd, &crc);
+            if (sx == -1 && sy == -1)
+            {
+                pt.x = 8;
+                pt.y = 8;
+                ClientToScreen(hwnd, &pt);
+                sx = pt.x;
+                sy = pt.y;
+                pt.x = 8;
+                pt.y = 8;
+            }
+            else
+            {
+                pt.x = sx;
+                pt.y = sy;
+                ScreenToClient(hwnd, &pt);
+            }
+            if (PtInRect(&crc, pt))
+            {
+                HMENU hMenu = i18n_load_menu("CONTEXT2");
+                if (hMenu)
+                {
+                    HMENU hSub = GetSubMenu(hMenu, 0);
+                    if (hSub)
+                    {
+                        EDITP *ep = exfunc_get_editp();
+                        BOOL editing = (ep && editp_is_editing(ep));
+                        if (!editing || (flg & FILTER_FLAG_ALWAYS_ACTIVE))
+                        {
+                            EnableMenuItem(hSub, 13000, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+                        }
+                        if (!editing)
+                        {
+                            EnableMenuItem(hSub, 13001, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+                        }
+                        TrackPopupMenu(hSub, TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+                                       sx, sy, 0, hwnd, NULL);
+                    }
+                    DestroyMenu(hMenu);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // magnetic window snapping (0x00405450 lines 1289..1318)
+    if (msg == WM_ENTERSIZEMOVE || msg == WM_EXITSIZEMOVE || msg == WM_MOVING)
+    {
+        if (winsnap_handle_message(hwnd, g_main_hwnd, msg, wp, lp))
+        {
+            return (msg == WM_MOVING) ? TRUE : 0;
         }
     }
 
@@ -551,6 +857,8 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
     HMENU sysm;
     HINSTANCE hInst = GetModuleHandleA(NULL);
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HICON hIconLeft = (HICON)LoadImageA(hInst, "ICON_LEFT", IMAGE_ICON, 16, 16, 0);
+    HICON hIconRight = (HICON)LoadImageA(hInst, "ICON_RIGHT", IMAGE_ICON, 16, 16, 0);
 
     if (!f)
         return NULL;
@@ -570,7 +878,7 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
         style |= WS_VSCROLL;
 
     w = 314;
-    h = ((f->flag & FILTER_FLAG_ALWAYS_ACTIVE) ? 0 : 20) + 14 +
+    h = ((f->flag & FILTER_FLAG_ALWAYS_ACTIVE) ? 0 : 4) + 14 +
         f->check_n * 20 + f->track_n * 24;
 
     raw_x = (f->flag & FILTER_FLAG_WINDOW_SIZE) ? f->x : FILTER_WINDOW_SIZE_CLIENT;
@@ -585,7 +893,7 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
     }
     if (w < 160)
         w = 560; // default initial width before plugin's WM_FILTER_INIT SetWindowPos
-    if (h < 48)
+    if (h < 24 && f->track_n == 0 && f->check_n == 0)
         h = 200;
 
     SetRect(&rc, 0, 0, w, h);
@@ -619,69 +927,126 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
         DeleteMenu(sysm, SC_MINIMIZE, MF_BYCOMMAND);
     }
 
-    // populate standard SDK controls if the filter declares trackbars or checkboxes
-    y_pos = 6;
+    // 0x0042c930 lines 515..524: top-right active checkbox (12x11 at right-15, 2)
+    y_pos = ((f->flag & FILTER_FLAG_ALWAYS_ACTIVE) ? 0 : 4) + 8;
     if ((f->track_n > 0 || f->check_n > 0) && !(f->flag & FILTER_FLAG_ALWAYS_ACTIVE))
     {
+        RECT crc;
+        GetClientRect(hwnd, &crc);
         e->hwnd_active_chk = CreateWindowExA(
-            0, "BUTTON", "Active", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            8, y_pos, 100, 18, hwnd, (HMENU)(UINT_PTR)IDC_FLT_ACTIVE, hInst, NULL);
-        if (e->hwnd_active_chk)
-            SendMessageA(e->hwnd_active_chk, WM_SETFONT, (WPARAM)hFont, 0);
-        y_pos += 20;
+            0, "BUTTON", "", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            crc.right - 15, 2, 12, 11, hwnd,
+            (HMENU)(UINT_PTR)IDC_FLT_ACTIVE, hInst, NULL);
+        if (e->hwnd_active_chk && (f->flag & FILTER_FLAG_ACTIVE))
+        {
+            SendMessageA(e->hwnd_active_chk, BM_SETCHECK, BST_CHECKED, 0);
+        }
     }
 
+    // 0x0042c930 lines 526..589: trackbars + step <- / -> buttons + editable numeric EDIT
+    e->updating_track_ui = TRUE;
     for (t = 0; t < f->track_n && t < MAX_TRACK_CTRLS; t++)
     {
         const char *tname = (f->track_name && f->track_name[t]) ? f->track_name[t] : "";
+        wchar_t wtname[128];
         int s_val = f->track_s ? f->track_s[t] : 0;
         int e_val = f->track_e ? f->track_e[t] : 256;
         int d_val = f->track_default ? f->track_default[t] : 0;
         char vbuf[32];
         HWND hLbl;
 
-        hLbl = CreateWindowExA(0, "STATIC", tname, WS_CHILD | WS_VISIBLE,
-                               6, y_pos + 3, 68, 16, hwnd, NULL, hInst, NULL);
+        sjis_to_wide(tname, wtname, 128);
+        hLbl = CreateWindowExW(0, L"STATIC", wtname, WS_CHILD | WS_VISIBLE,
+                               6, y_pos + 2, 50, 16, hwnd, NULL, hInst, NULL);
         if (hLbl)
-            SendMessageA(hLbl, WM_SETFONT, (WPARAM)hFont, 0);
+            SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, 0);
 
         e->hwnd_track_bar[t] = CreateWindowExA(
-            0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_NOTICKS,
-            76, y_pos, 184, 22, hwnd, NULL, hInst, NULL);
+            0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+            56, y_pos - 2, 190, 24, hwnd, NULL, hInst, NULL);
         if (e->hwnd_track_bar[t])
         {
-            SendMessageA(e->hwnd_track_bar[t], TBM_SETRANGEMIN, FALSE, s_val);
+            int page_sz = (e_val - s_val) / 2;
+            if (page_sz < 1)
+                page_sz = 1;
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETRANGEMIN, TRUE, s_val);
             SendMessageA(e->hwnd_track_bar[t], TBM_SETRANGEMAX, TRUE, e_val);
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETPAGESIZE, 0, page_sz);
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETTICFREQ, (WPARAM)page_sz, 0);
             SendMessageA(e->hwnd_track_bar[t], TBM_SETPOS, TRUE, d_val);
+        }
+
+        e->hwnd_track_dec[t] = CreateWindowExA(
+            0, "BUTTON", "<",
+            WS_CHILD | WS_VISIBLE | (hIconLeft ? BS_ICON : BS_PUSHBUTTON),
+            246, y_pos + 2, 16, 16, hwnd,
+            (HMENU)(UINT_PTR)(IDC_FLT_STEP_DEC_BASE + t), hInst, NULL);
+        if (e->hwnd_track_dec[t])
+        {
+            if (hIconLeft)
+                SendMessageA(e->hwnd_track_dec[t], BM_SETIMAGE, IMAGE_ICON, (LPARAM)hIconLeft);
+            else
+                SendMessageA(e->hwnd_track_dec[t], WM_SETFONT, (WPARAM)hFont, 0);
+        }
+
+        e->hwnd_track_inc[t] = CreateWindowExA(
+            0, "BUTTON", ">",
+            WS_CHILD | WS_VISIBLE | (hIconRight ? BS_ICON : BS_PUSHBUTTON),
+            262, y_pos + 2, 16, 16, hwnd,
+            (HMENU)(UINT_PTR)(IDC_FLT_STEP_INC_BASE + t), hInst, NULL);
+        if (e->hwnd_track_inc[t])
+        {
+            if (hIconRight)
+                SendMessageA(e->hwnd_track_inc[t], BM_SETIMAGE, IMAGE_ICON, (LPARAM)hIconRight);
+            else
+                SendMessageA(e->hwnd_track_inc[t], WM_SETFONT, (WPARAM)hFont, 0);
         }
 
         wsprintfA(vbuf, "%d", d_val);
         e->hwnd_track_val[t] = CreateWindowExA(
-            0, "STATIC", vbuf, WS_CHILD | WS_VISIBLE | SS_RIGHT,
-            262, y_pos + 3, 42, 16, hwnd, NULL, hInst, NULL);
+            0, "EDIT", vbuf, WS_CHILD | WS_VISIBLE,
+            282, y_pos + 2, 30, 16, hwnd,
+            (HMENU)(UINT_PTR)(IDC_FLT_EDIT_BASE + t), hInst, NULL);
         if (e->hwnd_track_val[t])
             SendMessageA(e->hwnd_track_val[t], WM_SETFONT, (WPARAM)hFont, 0);
 
         y_pos += 24;
     }
+    e->updating_track_ui = FALSE;
 
+    // 0x0042c930 lines 591..614: checkboxes, radio buttons, and MID_FILTER_BUTTON (12004 + c) pushbuttons
+    y_pos += 2;
     for (c = 0; c < f->check_n && c < MAX_CHECK_CTRLS; c++)
     {
         const char *cname = (f->check_name && f->check_name[c]) ? f->check_name[c] : "";
+        wchar_t wcname[256];
         int cdef = f->check_default ? f->check_default[c] : 0;
-        DWORD bstyle = WS_CHILD | WS_VISIBLE |
-                       ((cdef < 0) ? BS_PUSHBUTTON : BS_AUTOCHECKBOX);
-        e->hwnd_check_btn[c] = CreateWindowExA(
-            0, "BUTTON", cname, bstyle,
-            8, y_pos, 290, 18, hwnd,
-            (HMENU)(UINT_PTR)(IDC_FLT_CHECK_BASE + c), hInst, NULL);
+
+        sjis_to_wide(cname, wcname, 256);
+        if (cdef < 0)
+        {
+            e->hwnd_check_btn[c] = CreateWindowExW(
+                0, L"BUTTON", wcname,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_CENTER | BS_VCENTER,
+                10, y_pos, 294, 18, hwnd,
+                (HMENU)(UINT_PTR)(MID_FILTER_BUTTON + c), hInst, NULL);
+        }
+        else
+        {
+            DWORD bstyle = WS_CHILD | WS_VISIBLE |
+                           ((f->flag & FILTER_FLAG_RADIO_BUTTON) ? BS_RADIOBUTTON : BS_AUTOCHECKBOX);
+            e->hwnd_check_btn[c] = CreateWindowExW(
+                0, L"BUTTON", wcname, bstyle,
+                8, y_pos, 290, 16, hwnd,
+                (HMENU)(UINT_PTR)(IDC_FLT_CHECK_BASE + c), hInst, NULL);
+            if (e->hwnd_check_btn[c] && cdef > 0)
+            {
+                SendMessageW(e->hwnd_check_btn[c], BM_SETCHECK, BST_CHECKED, 0);
+            }
+        }
         if (e->hwnd_check_btn[c])
         {
-            SendMessageA(e->hwnd_check_btn[c], WM_SETFONT, (WPARAM)hFont, 0);
-            if (cdef > 0)
-            {
-                SendMessageA(e->hwnd_check_btn[c], BM_SETCHECK, BST_CHECKED, 0);
-            }
+            SendMessageW(e->hwnd_check_btn[c], WM_SETFONT, (WPARAM)hFont, 0);
         }
         y_pos += 20;
     }
@@ -1528,34 +1893,7 @@ BOOL plugin_manager_handle_key(HWND hwnd, UINT vk, BOOL is_down, LPARAM key_lpar
     BOOL handled = FALSE;
     (void)hwnd;
 
-    // check registered native add_menu_item default shortcuts on key down
-    if (is_down)
-    {
-        BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        BOOL alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-
-        for (i = 0; i < g_menu_item_count; i++)
-        {
-            const PluginMenuItem *it = &g_menu_items[i];
-            BOOL req_shift, req_ctrl, req_alt, req_vk;
-            if (it->def_key == 0)
-                continue;
-            req_shift = (it->flag & ADD_MENU_ITEM_FLAG_KEY_SHIFT) != 0;
-            req_ctrl = (it->flag & ADD_MENU_ITEM_FLAG_KEY_CTRL) != 0;
-            req_alt = (it->flag & ADD_MENU_ITEM_FLAG_KEY_ALT) != 0;
-            req_vk = (it->flag & ADD_MENU_ITEM_FLAG_KEY_VIEW) != 0;
-            if (!req_vk)
-                continue;
-            if ((UINT)it->def_key == vk &&
-                shift == req_shift && ctrl == req_ctrl && alt == req_alt)
-            {
-                return plugin_manager_exec_menu_item_index(i);
-            }
-        }
-    }
-
-    // forward WM_FILTER_MAIN_KEY_DOWN / UP to native MAIN_MESSAGE filters
+    // forward WM_FILTER_MAIN_KEY_DOWN / UP to native MAIN_MESSAGE filters (0x00430490)
     for (i = 0; i < g_plugin_count; i++)
     {
         PluginEntry *e = &g_plugins[i];

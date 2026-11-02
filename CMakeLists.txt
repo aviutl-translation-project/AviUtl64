@@ -27,15 +27,17 @@ set(REAVIUTL_CORE_SOURCES
 	src/editp.c
 	src/yc48_convert.c
 	src/vfw_input.c
+	src/winsnap.c
+	src/i18n.c
+	src/aviutl_dlg.c
+	src/aviutl_resources.rc
 )
 
 # main executable
 add_executable(reaviutl
 	src/gui_main.c
 	src/preview.c
-	src/i18n.c
-	src/aviutl_dlg.c
-	src/aviutl_resources.rc
+	src/keycfg.c
 	${REAVIUTL_CORE_SOURCES}
 )
 
@@ -105,6 +107,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 			comctl32
 			shell32
 			ole32
+			version
 			vfw32
 			msacm32
 			winmm

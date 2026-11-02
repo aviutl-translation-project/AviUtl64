@@ -10,6 +10,7 @@
 #include "vfw_input.h"
 #include "exfunc.h"
 #include "editp.h"
+#include "i18n.h"
 #include "debug_console.h"
 
 #if REAVIUTL_X64
@@ -744,6 +745,8 @@ int main(int argc, char **argv)
     g_bridge_hwnd = CreateWindowExA(
         0, "AviUtlBridgeOwnerClass", "AviUtl", WS_OVERLAPPEDWINDOW,
         0, 0, 320, 240, NULL, NULL, GetModuleHandleA(NULL), NULL);
+
+    i18n_init(GetModuleHandleA(NULL));
 
     g_editp = editp_create_idle(g_bridge_hwnd);
     exfunc_set_editp(g_editp);

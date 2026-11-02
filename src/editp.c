@@ -7,6 +7,7 @@
 #include <math.h>
 #include "editp.h"
 #include "exfunc.h"
+#include "input_plugin.h"
 #include "vfw_input.h"
 #include "yc48_convert.h"
 
@@ -803,13 +804,17 @@ BOOL editp_open_video_ex(EDITP *ep, const char *filepath, const EditpLoadOptions
 
     if ((fi.flag & FILE_INFO_FLAG_VIDEO) == 0 && (fi.flag & FILE_INFO_FLAG_AUDIO) != 0)
     {
-        // audio-only input (.mp3 / .wav): synthesize a 640x480 30fps black canvas sized to the audio track length so aviutl timeline scrubbing & playback work
-        proj_w = 640;
-        proj_h = 480;
-        fps_r = 30;
-        fps_s = 1;
+        int wav_w = 0, wav_h = 0;
+        input_plugin_get_wav_video_size(&wav_w, &wav_h);
+        // audio-only input (.mp3 / .wav): synthesize a black canvas sized to the audio track length so aviutl timeline scrubbing & playback work
+        proj_w = (wav_w > 0 && wav_h > 0) ? wav_w : 640;
+        proj_h = (wav_w > 0 && wav_h > 0) ? wav_h : 480;
+        fps_r = (opts && opts->fps_rate > 0 && opts->fps_scale > 0) ? opts->fps_rate : 30;
+        fps_s = (opts && opts->fps_rate > 0 && opts->fps_scale > 0) ? opts->fps_scale : 1;
         proj_fn = (int)(((long long)fi.audio_n * fps_r + (long long)aud_r * fps_s - 1) /
                         ((long long)aud_r * fps_s));
+        if (proj_fn < 1)
+            proj_fn = 1;
         is_60 = FALSE;
     }
     else if ((fi.flag & FILE_INFO_FLAG_VIDEO) != 0 && strstr(filepath, ".exedit") == NULL)

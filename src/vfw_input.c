@@ -98,6 +98,7 @@ struct VFWInput
     int mp3_frame_count;
     int mp3_spf; // 1152 (MPEG-1) or 576 (MPEG-2/2.5)
     int mp3_next_frame;
+    int mp3_lead_skip;
 
     LONG vfw_cur_pos;
     LONG vfw_end_pos;
@@ -118,6 +119,7 @@ struct VFWInput
     int acm_out_bits;
     BOOL acm_need_start;
     BOOL acm_eof_flushed;
+    int acm_valid_from;
 
     // rolling decoded 16-bit PCM cache (interleaved src_audio_ch channels @ src_audio_rate)
     short *pcm_cache;
@@ -154,6 +156,9 @@ struct VFWInput
     int aui_aud_raw_ch;
     BOOL aui_aud_is_float;
     int aui_aud_cur_pos;
+    BOOL aui_aud_eof;
+    unsigned char *aui_aud_buf;
+    size_t aui_aud_buf_cap;
     int bridge_aui_slot;
 };
 
@@ -396,39 +401,47 @@ static BOOL acm_init_decoder(VFWInput *input, WAVEFORMATEX *pwfx_src)
     return TRUE;
 }
 
-static BOOL pcm_cache_append(VFWInput *input, const unsigned char *raw_pcm,
-                             int frames_produced, int keep_from_sample)
+#define PCM_CACHE_DEFAULT_CAP 65536
+#define PCM_CACHE_HISTORY_KEEP 24576
+
+static BOOL pcm_cache_append_raw(VFWInput *input, const unsigned char *raw_pcm,
+                                 int frames_produced, int raw_ch, int block_align,
+                                 int bits, BOOL is_float,
+                                 int discard_before_sample, int retain_ref_sample)
 {
     int ch = input->src_audio_ch > 0 ? input->src_audio_ch : 2;
-    int block_align = input->acm_out_ch * (input->acm_out_bits / 8);
 
     if (frames_produced <= 0 || block_align <= 0)
     {
         return TRUE;
     }
 
-    // discard any preroll frames that precede keep_from_sample
-    if (input->pcm_decode_pos + frames_produced <= keep_from_sample)
+    // discard codec warmup preroll frames that precede discard_before_sample
+    if (input->pcm_decode_pos + frames_produced <= discard_before_sample)
     {
         input->pcm_decode_pos += frames_produced;
         input->pcm_cache_start = input->pcm_decode_pos;
         input->pcm_cache_len = 0;
         return TRUE;
     }
-    if (input->pcm_decode_pos < keep_from_sample)
+    if (input->pcm_decode_pos < discard_before_sample)
     {
-        int skip = keep_from_sample - input->pcm_decode_pos;
+        int skip = discard_before_sample - input->pcm_decode_pos;
         raw_pcm += (size_t)skip * (size_t)block_align;
         frames_produced -= skip;
-        input->pcm_decode_pos = keep_from_sample;
-        input->pcm_cache_start = keep_from_sample;
+        input->pcm_decode_pos = discard_before_sample;
+        input->pcm_cache_start = discard_before_sample;
         input->pcm_cache_len = 0;
     }
 
-    // slide or grow cache if needed
+    // slide or grow cache while keeping PCM_CACHE_HISTORY_KEEP lookback frames
+    // so resampler +2 lookahead and overlapping exedit/waveform reads never seek backward
     if (input->pcm_cache_len + frames_produced > input->pcm_cache_cap)
     {
-        int can_drop = keep_from_sample - input->pcm_cache_start;
+        int retain_from = (retain_ref_sample > PCM_CACHE_HISTORY_KEEP)
+                              ? (retain_ref_sample - PCM_CACHE_HISTORY_KEEP)
+                              : 0;
+        int can_drop = retain_from - input->pcm_cache_start;
         if (can_drop > 0)
         {
             if (can_drop > input->pcm_cache_len)
@@ -444,7 +457,7 @@ static BOOL pcm_cache_append(VFWInput *input, const unsigned char *raw_pcm,
         }
         if (input->pcm_cache_len + frames_produced > input->pcm_cache_cap)
         {
-            int new_cap = input->pcm_cache_cap * 2;
+            int new_cap = input->pcm_cache_cap > 0 ? (input->pcm_cache_cap * 2) : PCM_CACHE_DEFAULT_CAP;
             short *nb;
             while (new_cap < input->pcm_cache_len + frames_produced + 4096)
             {
@@ -460,12 +473,25 @@ static BOOL pcm_cache_append(VFWInput *input, const unsigned char *raw_pcm,
 
     convert_raw_frames_to_pcm16(
         raw_pcm, frames_produced,
-        input->acm_out_ch, block_align, input->acm_out_bits, FALSE,
+        raw_ch, block_align, bits, is_float,
         input->pcm_cache + (size_t)input->pcm_cache_len * (size_t)ch, ch);
 
     input->pcm_cache_len += frames_produced;
     input->pcm_decode_pos += frames_produced;
     return TRUE;
+}
+
+static BOOL pcm_cache_append(VFWInput *input, const unsigned char *raw_pcm,
+                             int frames_produced, int keep_from_sample)
+{
+    int block_align = input->acm_out_ch * (input->acm_out_bits / 8);
+    int discard_before = (input->acm_valid_from < keep_from_sample)
+                             ? input->acm_valid_from
+                             : keep_from_sample;
+    return pcm_cache_append_raw(input, raw_pcm, frames_produced,
+                                input->acm_out_ch, block_align,
+                                input->acm_out_bits, FALSE,
+                                discard_before, keep_from_sample);
 }
 
 static BOOL acm_convert_step(VFWInput *input, BOOL is_eof, int keep_from_sample, int *out_produced)
@@ -594,20 +620,66 @@ static BOOL parse_mp3_header(const unsigned char b[4],
     return TRUE;
 }
 
-static BOOL is_vbr_info_frame(const unsigned char *frame, int fsize, int ver, int ch)
+static BOOL parse_vbr_info_frame(const unsigned char *frame, int fsize, int ver, int ch,
+                                 int *out_enc_delay, int *out_enc_padding, BOOL *out_has_delay)
 {
     int side_info = (ver == 3) ? ((ch == 1) ? 17 : 32) : ((ch == 1) ? 9 : 17);
     int xing_off = 4 + side_info;
-    if (xing_off + 8 <= fsize)
+
+    if (out_enc_delay)
+        *out_enc_delay = 0;
+    if (out_enc_padding)
+        *out_enc_padding = 0;
+    if (out_has_delay)
+        *out_has_delay = FALSE;
+
+    if (xing_off + 8 <= fsize &&
+        (memcmp(frame + xing_off, "Xing", 4) == 0 ||
+         memcmp(frame + xing_off, "Info", 4) == 0))
     {
-        if (memcmp(frame + xing_off, "Xing", 4) == 0 ||
-            memcmp(frame + xing_off, "Info", 4) == 0)
+        uint32_t flags = ((uint32_t)frame[xing_off + 4] << 24) |
+                         ((uint32_t)frame[xing_off + 5] << 16) |
+                         ((uint32_t)frame[xing_off + 6] << 8) |
+                         (uint32_t)frame[xing_off + 7];
+        int p = xing_off + 8;
+        if (flags & 0x01u)
+            p += 4;
+        if (flags & 0x02u)
+            p += 4;
+        if (flags & 0x04u)
+            p += 100;
+        if (flags & 0x08u)
+            p += 4;
+        if (p + 24 <= fsize &&
+            (memcmp(frame + p, "LAME", 4) == 0 ||
+             memcmp(frame + p, "Lavf", 4) == 0 ||
+             memcmp(frame + p, "Lavc", 4) == 0 ||
+             memcmp(frame + p, "GOGO", 4) == 0))
         {
-            return TRUE;
+            int d = ((int)frame[p + 21] << 4) | ((int)frame[p + 22] >> 4);
+            int pad = (((int)frame[p + 22] & 0x0F) << 8) | (int)frame[p + 23];
+            if (d >= 0 && d <= 2880 && pad >= 0 && pad <= 8192)
+            {
+                if (out_enc_delay)
+                    *out_enc_delay = d;
+                if (out_enc_padding)
+                    *out_enc_padding = pad;
+                if (out_has_delay)
+                    *out_has_delay = TRUE;
+            }
         }
+        return TRUE;
     }
-    if (36 + 4 <= fsize && memcmp(frame + 36, "VBRI", 4) == 0)
+    if (36 + 26 <= fsize && memcmp(frame + 36, "VBRI", 4) == 0)
     {
+        int d = ((int)frame[42] << 8) | (int)frame[43];
+        if (d > 0 && d <= 2880)
+        {
+            if (out_enc_delay)
+                *out_enc_delay = d;
+            if (out_has_delay)
+                *out_has_delay = TRUE;
+        }
         return TRUE;
     }
     return FALSE;
@@ -623,7 +695,14 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
     int count = 0, cap = 0;
     int stream_ver = -1, stream_sr = 0, stream_ch = 0, stream_spf = 0;
     uint64_t total_frame_bytes = 0;
+    uint16_t max_frame_size = 0;
+    int enc_delay = 0, enc_padding = 0;
+    BOOL has_vbr_delay = FALSE;
     BOOL checked_first_vbr = FALSE;
+    BOOL in_sync = FALSE;
+    int64_t raw_samples, usable_samples;
+    int lead_skip = 0;
+    WORD avg_block_size;
     MPEGLAYER3WAVEFORMAT mp3wfx;
 
     if (end_off <= start_off + 24)
@@ -703,8 +782,9 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
             if (rel + 4 > win_valid)
                 break;
 
-            // stop at APEv2 footer/tag if encountered
-            if (rel + 8 <= win_valid && memcmp(win + rel, "APETAGEX", 8) == 0)
+            // stop at APEv2 or Lyrics3 tag if encountered
+            if ((rel + 8 <= win_valid && memcmp(win + rel, "APETAGEX", 8) == 0) ||
+                (rel + 11 <= win_valid && memcmp(win + rel, "LYRICSBEGIN", 11) == 0))
             {
                 break;
             }
@@ -713,9 +793,8 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
                 pos + (uint64_t)fsize <= end_off &&
                 (stream_ver < 0 || (ver == stream_ver && sr == stream_sr)))
             {
-
-                // verify next header at pos + fsize before locking onto stream
-                BOOL sync_ok = (stream_ver >= 0);
+                // verify next header at pos + fsize before locking (or re-locking after lost sync)
+                BOOL sync_ok = in_sync;
                 if (!sync_ok)
                 {
                     uint64_t next_pos = pos + (uint64_t)fsize;
@@ -736,6 +815,7 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
 
                 if (sync_ok)
                 {
+                    in_sync = TRUE;
                     if (stream_ver < 0)
                     {
                         stream_ver = ver;
@@ -744,12 +824,13 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
                         stream_spf = spf;
                     }
 
-                    // skip leading Xing / Info / VBRI metadata-only frame
+                    // skip leading Xing / Info / VBRI metadata-only frame and capture LAME delay/padding
                     if (!checked_first_vbr)
                     {
                         checked_first_vbr = TRUE;
                         if (rel + (size_t)fsize <= win_valid &&
-                            is_vbr_info_frame(win + rel, fsize, ver, ch))
+                            parse_vbr_info_frame(win + rel, fsize, ver, ch,
+                                                 &enc_delay, &enc_padding, &has_vbr_delay))
                         {
                             pos += (uint64_t)fsize;
                             continue;
@@ -775,6 +856,8 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
                         frames[count].offset = (uint32_t)pos;
                         frames[count].size = (uint16_t)fsize;
                         frames[count].pad = 0;
+                        if ((uint16_t)fsize > max_frame_size)
+                            max_frame_size = (uint16_t)fsize;
                         count++;
                         total_frame_bytes += (uint64_t)fsize;
                     }
@@ -784,7 +867,14 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
             }
 
             // sync lost or not yet found
+            in_sync = FALSE;
             if (stream_ver < 0 && pos >= search_limit)
+            {
+                break;
+            }
+            // if trailing metadata/padding is hit near EOF after valid frames, stop scanning past 64 KB
+            if (stream_ver >= 0 && count > 0 &&
+                pos > (uint64_t)frames[count - 1].offset + (uint64_t)frames[count - 1].size + 65536u)
             {
                 break;
             }
@@ -800,24 +890,56 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
         return FALSE;
     }
 
+    // MPEG Layer III synthesis filterbank adds 529 samples of decoder delay on top of encoder delay
+    raw_samples = (int64_t)count * (int64_t)stream_spf;
+    usable_samples = raw_samples;
+    if (has_vbr_delay)
+    {
+        int cand_skip = enc_delay + 529;
+        int64_t trimmed = raw_samples - (int64_t)enc_delay - (int64_t)enc_padding;
+        if (trimmed > 0 && raw_samples > (int64_t)cand_skip)
+        {
+            lead_skip = cand_skip;
+            usable_samples = trimmed;
+            if ((int64_t)lead_skip + usable_samples > raw_samples)
+            {
+                usable_samples = raw_samples - (int64_t)lead_skip;
+            }
+        }
+    }
+    else if (raw_samples > (int64_t)stream_spf * 2)
+    {
+        lead_skip = 529;
+        usable_samples = raw_samples - 529;
+    }
+    if (usable_samples > 0x7FFFFFFFLL)
+        usable_samples = 0x7FFFFFFFLL;
+    if (usable_samples < 1)
+        usable_samples = 1;
+
     input->audio_kind = AUDIO_SRC_MP3_ACM;
     input->mp3_frames = frames;
     input->mp3_frame_count = count;
     input->mp3_spf = stream_spf;
     input->mp3_next_frame = 0;
+    input->mp3_lead_skip = lead_skip;
     input->src_audio_rate = stream_sr;
     input->src_audio_ch = stream_ch;
     input->src_audio_bits = 16;
-    input->src_audio_samples = count * stream_spf;
+    input->src_audio_samples = (int)usable_samples;
     input->req_audio_rate = stream_sr;
     input->req_audio_ch = stream_ch;
+
+    avg_block_size = (WORD)((total_frame_bytes + (uint64_t)count - 1u) / (uint64_t)count);
+    if (avg_block_size < 24)
+        avg_block_size = (max_frame_size >= 24) ? max_frame_size : frames[0].size;
 
     memset(&mp3wfx, 0, sizeof(mp3wfx));
     mp3wfx.wfx.wFormatTag = WAVE_FORMAT_MPEGLAYER3;
     mp3wfx.wfx.nChannels = (WORD)stream_ch;
     mp3wfx.wfx.nSamplesPerSec = (DWORD)stream_sr;
     mp3wfx.wfx.nAvgBytesPerSec = (DWORD)((total_frame_bytes * (uint64_t)stream_sr) /
-                                         (uint64_t)input->src_audio_samples);
+                                         (uint64_t)raw_samples);
     if (mp3wfx.wfx.nAvgBytesPerSec == 0)
     {
         mp3wfx.wfx.nAvgBytesPerSec = 16000;
@@ -827,7 +949,7 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
     mp3wfx.wfx.cbSize = MPEGLAYER3_WFX_EXTRA_BYTES;
     mp3wfx.wID = MPEGLAYER3_ID_MPEG;
     mp3wfx.fdwFlags = MPEGLAYER3_FLAG_PADDING_OFF;
-    mp3wfx.nBlockSize = frames[0].size;
+    mp3wfx.nBlockSize = avg_block_size;
     mp3wfx.nFramesPerBlock = 1;
     mp3wfx.nCodecDelay = 0;
 
@@ -1528,6 +1650,21 @@ static BOOL try_open_avi_vfw(VFWInput *input, const char *filepath, BOOL want_vi
     return FALSE;
 }
 
+static BOOL is_pure_audio_ext(const char *filepath)
+{
+    const char *ext = path_ext(filepath);
+    return (_stricmp(ext, ".mp3") == 0 ||
+            _stricmp(ext, ".mp2") == 0 ||
+            _stricmp(ext, ".mpa") == 0 ||
+            _stricmp(ext, ".wav") == 0 ||
+            _stricmp(ext, ".flac") == 0 ||
+            _stricmp(ext, ".ogg") == 0 ||
+            _stricmp(ext, ".aac") == 0 ||
+            _stricmp(ext, ".m4a") == 0 ||
+            _stricmp(ext, ".opus") == 0 ||
+            _stricmp(ext, ".wma") == 0);
+}
+
 static BOOL try_open_native_aui(VFWInput *input, int aui_idx, const char *filepath,
                                 BOOL want_video, BOOL want_audio)
 {
@@ -1541,6 +1678,13 @@ static BOOL try_open_native_aui(VFWInput *input, int aui_idx, const char *filepa
     if (!inst)
     {
         return FALSE;
+    }
+
+    // ignore 1-frame embedded ID3v2/Vorbis/MP4 cover-art pictures on pure audio files
+    if (want_video && want_audio && is_pure_audio_ext(filepath) &&
+        (iip.flag & INPUT_INFO_FLAG_AUDIO) && iip.audio_n > 0 && iip.n <= 1)
+    {
+        want_video = FALSE;
     }
 
     if (want_video && (iip.flag & INPUT_INFO_FLAG_VIDEO) && iip.format)
@@ -1668,12 +1812,19 @@ static BOOL try_open_native_aui(VFWInput *input, int aui_idx, const char *filepa
                 blk = (int)pwfx->nChannels * (bits / 8);
             if (blk > 0)
             {
+                input->pcm_cache_cap = PCM_CACHE_DEFAULT_CAP;
+                input->pcm_cache = (short *)calloc((size_t)input->pcm_cache_cap * 2u, sizeof(short));
+                input->pcm_cache_start = 0;
+                input->pcm_cache_len = 0;
+                input->pcm_decode_pos = 0;
                 input->audio_kind = AUDIO_SRC_AUI_PCM;
                 input->src_audio_bits = (int)bits;
                 input->src_audio_samples = iip.audio_n;
                 input->aui_aud_raw_ch = (int)pwfx->nChannels;
                 input->aui_aud_is_float = (tag == WAVE_FORMAT_IEEE_FLOAT);
                 input->aui_aud_block_align = blk;
+                input->aui_aud_cur_pos = 0;
+                input->aui_aud_eof = FALSE;
                 audio_ok = TRUE;
             }
         }
@@ -1746,6 +1897,12 @@ static BOOL try_open_bridged_aui(VFWInput *input, int bridge_aui_idx, const char
     if (slot < 0)
     {
         return FALSE;
+    }
+
+    if (want_video && want_audio && is_pure_audio_ext(filepath) &&
+        binfo.has_audio && binfo.audio_n > 0 && binfo.frame_n <= 1)
+    {
+        want_video = FALSE;
     }
 
     if (want_video && binfo.has_video && binfo.w > 0 && binfo.h > 0)
@@ -2058,6 +2215,7 @@ void vfw_input_close(VFWInput *input)
     free(input->aui_hic_out_buf);
     free(input->aui_vid_bih);
     free(input->aui_vid_buf);
+    free(input->aui_aud_buf);
     free(input->aui_yc_tmp);
     free(input->mp3_frames);
     free(input->acm_src_buf);
@@ -2466,25 +2624,145 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
 
     if (input->audio_kind == AUDIO_SRC_AUI_PCM && input->aui_inst)
     {
-        size_t raw_bytes = (size_t)src_count * (size_t)input->aui_aud_block_align;
-        unsigned char *raw = (unsigned char *)malloc(raw_bytes);
-        int got;
-        if (!raw)
+        int target_end = (src_count > 0x7FFFFFFF - src_start) ? 0x7FFFFFFF : (src_start + src_count);
+        int blk = input->aui_aud_block_align;
+
+        if (blk <= 0)
             return 0;
-        got = input_plugin_read_audio_native(input->aui_inst, src_start, src_count, raw);
-        if (got <= 0)
+
+        // fast cache hit: prevents backward 1-2 sample seeks during resampling & overlapping reads
+        if (input->pcm_cache &&
+            src_start >= input->pcm_cache_start &&
+            target_end <= input->pcm_cache_start + input->pcm_cache_len)
         {
-            free(raw);
-            return 0;
+            int off = src_start - input->pcm_cache_start;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)src_count * (size_t)src_ch * sizeof(short));
+            return src_count;
         }
-        if (got > src_count)
-            got = src_count;
-        convert_raw_frames_to_pcm16(raw, got,
-                                    input->aui_aud_raw_ch, input->aui_aud_block_align,
-                                    input->src_audio_bits, input->aui_aud_is_float,
-                                    dst, src_ch);
-        free(raw);
-        return got;
+
+        if (!input->pcm_cache || input->pcm_cache_cap <= 0)
+        {
+            size_t raw_bytes = (size_t)src_count * (size_t)blk;
+            unsigned char *raw = (unsigned char *)malloc(raw_bytes);
+            int got;
+            if (!raw)
+                return 0;
+            got = input_plugin_read_audio_native(input->aui_inst, src_start, src_count, raw);
+            if (got > 0)
+            {
+                if (got > src_count)
+                    got = src_count;
+                convert_raw_frames_to_pcm16(raw, got,
+                                            input->aui_aud_raw_ch, blk,
+                                            input->src_audio_bits, input->aui_aud_is_float,
+                                            dst, src_ch);
+            }
+            free(raw);
+            return (got > 0) ? got : 0;
+        }
+
+        // seek .aui cursor only on backward miss past retained history or >1s forward jump;
+        // small forward gaps (e.g. 1.5x/2x speed or dropped frames) advance sequentially
+        {
+            int forward_limit = (input->src_audio_rate > 16384) ? input->src_audio_rate : 16384;
+            BOOL need_seek = FALSE;
+            if (input->pcm_cache_len == 0)
+            {
+                if (src_start < input->aui_aud_cur_pos ||
+                    src_start > input->aui_aud_cur_pos + forward_limit)
+                {
+                    need_seek = TRUE;
+                }
+            }
+            else if (src_start < input->pcm_cache_start ||
+                     src_start > input->aui_aud_cur_pos + forward_limit)
+            {
+                need_seek = TRUE;
+            }
+
+            if (need_seek)
+            {
+                int seek_pos = (src_start > 8192) ? (src_start - 4096) : 0;
+                input->aui_aud_cur_pos = seek_pos;
+                input->aui_aud_eof = FALSE;
+                input->pcm_decode_pos = seek_pos;
+                input->pcm_cache_start = seek_pos;
+                input->pcm_cache_len = 0;
+            }
+        }
+
+        while (!input->aui_aud_eof &&
+               input->pcm_cache_start + input->pcm_cache_len < target_end &&
+               input->aui_aud_cur_pos < input->src_audio_samples)
+        {
+            int need_now = target_end - input->aui_aud_cur_pos;
+            int chunk_smp = 4096;
+            int rem_smp = input->src_audio_samples - input->aui_aud_cur_pos;
+            size_t need_bytes;
+            int got;
+
+            if (need_now > chunk_smp)
+            {
+                chunk_smp = (need_now < 16384) ? need_now : 16384;
+            }
+            if (chunk_smp > rem_smp)
+            {
+                chunk_smp = rem_smp;
+            }
+            if (chunk_smp <= 0)
+            {
+                break;
+            }
+
+            need_bytes = (size_t)chunk_smp * (size_t)blk;
+            if (!input->aui_aud_buf || input->aui_aud_buf_cap < need_bytes)
+            {
+                size_t ncap = (need_bytes < 65536u) ? 65536u : need_bytes;
+                unsigned char *nb = (unsigned char *)realloc(input->aui_aud_buf, ncap);
+                if (!nb)
+                    break;
+                input->aui_aud_buf = nb;
+                input->aui_aud_buf_cap = ncap;
+            }
+
+            got = input_plugin_read_audio_native(input->aui_inst,
+                                                 input->aui_aud_cur_pos,
+                                                 chunk_smp,
+                                                 input->aui_aud_buf);
+            if (got <= 0)
+            {
+                input->aui_aud_eof = TRUE;
+                break;
+            }
+            if (got > chunk_smp)
+            {
+                got = chunk_smp;
+            }
+            input->aui_aud_cur_pos += got;
+
+            if (!pcm_cache_append_raw(input, input->aui_aud_buf, got,
+                                      input->aui_aud_raw_ch, blk,
+                                      input->src_audio_bits, input->aui_aud_is_float,
+                                      0, src_start))
+            {
+                break;
+            }
+        }
+
+        if (src_start >= input->pcm_cache_start &&
+            src_start < input->pcm_cache_start + input->pcm_cache_len)
+        {
+            int off = src_start - input->pcm_cache_start;
+            int avail = input->pcm_cache_len - off;
+            if (avail > src_count)
+                avail = src_count;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)avail * (size_t)src_ch * sizeof(short));
+        }
+        return src_count;
     }
 
     if (input->audio_kind == AUDIO_SRC_AUI_ACM && input->aui_inst)
@@ -2493,15 +2771,27 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
         int stall_guard = 0;
         int ba = input->aui_aud_block_align > 0 ? input->aui_aud_block_align : 1;
 
+        if (input->pcm_cache &&
+            src_start >= input->pcm_cache_start &&
+            target_end <= input->pcm_cache_start + input->pcm_cache_len)
+        {
+            int off = src_start - input->pcm_cache_start;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)src_count * (size_t)src_ch * sizeof(short));
+            return src_count;
+        }
+
         if (input->pcm_cache_len == 0 ||
             src_start < input->pcm_cache_start ||
             src_start > input->pcm_decode_pos + input->src_audio_rate * 2)
         {
-            int preroll_smp = (src_start > 4096) ? (src_start - 4096) : 0;
+            int preroll_smp = (src_start > 8192) ? (src_start - 8192) : 0;
             input->aui_aud_cur_pos = preroll_smp;
             input->acm_src_len = 0;
             input->acm_need_start = TRUE;
             input->acm_eof_flushed = FALSE;
+            input->acm_valid_from = (preroll_smp > 0) ? (src_start - 2048) : 0;
             input->pcm_decode_pos = preroll_smp;
             input->pcm_cache_start = preroll_smp;
             input->pcm_cache_len = 0;
@@ -2628,26 +2918,45 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
 
     if (input->audio_kind == AUDIO_SRC_MP3_ACM)
     {
-        int target_end = src_start + src_count;
+        int raw_start = (src_start > 0x7FFFFFFF - input->mp3_lead_skip)
+                            ? 0x7FFFFFFF
+                            : (src_start + input->mp3_lead_skip);
+        int target_end = (src_count > 0x7FFFFFFF - raw_start)
+                             ? 0x7FFFFFFF
+                             : (raw_start + src_count);
         int stall_guard = 0;
 
-        // seek + 4-frame bit-reservoir preroll if target is outside sequential window
-        if (input->pcm_cache_len == 0 ||
-            src_start < input->pcm_cache_start ||
-            src_start > input->pcm_decode_pos + input->mp3_spf * 16)
+        if (input->pcm_cache &&
+            raw_start >= input->pcm_cache_start &&
+            target_end <= input->pcm_cache_start + input->pcm_cache_len)
         {
-            int target_f = src_start / input->mp3_spf;
-            int preroll_f = target_f - 4;
+            int off = raw_start - input->pcm_cache_start;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)src_count * (size_t)src_ch * sizeof(short));
+            return src_count;
+        }
+
+        // seek + 10-frame VBR-safe bit-reservoir preroll if target is outside sequential window
+        if (input->pcm_cache_len == 0 ||
+            raw_start < input->pcm_cache_start ||
+            raw_start > input->pcm_decode_pos + input->mp3_spf * 36)
+        {
+            int target_f = raw_start / input->mp3_spf;
+            int preroll_f = target_f - 10;
+            int valid_f;
             if (preroll_f < 0)
                 preroll_f = 0;
             if (preroll_f >= input->mp3_frame_count)
             {
                 preroll_f = input->mp3_frame_count - 1;
             }
+            valid_f = (preroll_f > 0 && target_f - 2 > preroll_f) ? (target_f - 2) : preroll_f;
             input->mp3_next_frame = preroll_f;
             input->acm_src_len = 0;
             input->acm_need_start = TRUE;
             input->acm_eof_flushed = FALSE;
+            input->acm_valid_from = valid_f * input->mp3_spf;
             input->pcm_decode_pos = preroll_f * input->mp3_spf;
             input->pcm_cache_start = input->pcm_decode_pos;
             input->pcm_cache_len = 0;
@@ -2682,7 +2991,7 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
 
             if (input->acm_src_len > 0)
             {
-                if (!acm_convert_step(input, FALSE, src_start, &produced))
+                if (!acm_convert_step(input, FALSE, raw_start, &produced))
                     break;
                 if (produced == 0)
                 {
@@ -2697,7 +3006,7 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
             else if (input->mp3_next_frame >= input->mp3_frame_count && !input->acm_eof_flushed)
             {
                 input->acm_eof_flushed = TRUE;
-                acm_convert_step(input, TRUE, src_start, &produced);
+                acm_convert_step(input, TRUE, raw_start, &produced);
                 break;
             }
             else
@@ -2706,10 +3015,10 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
             }
         }
 
-        if (src_start >= input->pcm_cache_start &&
-            src_start < input->pcm_cache_start + input->pcm_cache_len)
+        if (raw_start >= input->pcm_cache_start &&
+            raw_start < input->pcm_cache_start + input->pcm_cache_len)
         {
-            int off = src_start - input->pcm_cache_start;
+            int off = raw_start - input->pcm_cache_start;
             int avail = input->pcm_cache_len - off;
             if (avail > src_count)
                 avail = src_count;
@@ -2723,8 +3032,19 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
 
     if (input->audio_kind == AUDIO_SRC_WAV_ACM)
     {
-        int target_end = src_start + src_count;
+        int target_end = (src_count > 0x7FFFFFFF - src_start) ? 0x7FFFFFFF : (src_start + src_count);
         int stall_guard = 0;
+
+        if (input->pcm_cache &&
+            src_start >= input->pcm_cache_start &&
+            target_end <= input->pcm_cache_start + input->pcm_cache_len)
+        {
+            int off = src_start - input->pcm_cache_start;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)src_count * (size_t)src_ch * sizeof(short));
+            return src_count;
+        }
 
         if (input->pcm_cache_len == 0 ||
             src_start < input->pcm_cache_start ||
@@ -2745,6 +3065,7 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
             input->acm_eof_flushed = FALSE;
             input->pcm_decode_pos = (int)((input->wav_cur_byte * (uint64_t)input->src_audio_rate) /
                                           (uint64_t)input->wav_avg_bps);
+            input->acm_valid_from = (input->wav_cur_byte > 0) ? src_start : 0;
             input->pcm_cache_start = input->pcm_decode_pos;
             input->pcm_cache_len = 0;
         }
@@ -2809,14 +3130,25 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
 
     if (input->audio_kind == AUDIO_SRC_VFW_ACM && input->pavi_audio)
     {
-        int target_end = src_start + src_count;
+        int target_end = (src_count > 0x7FFFFFFF - src_start) ? 0x7FFFFFFF : (src_start + src_count);
         int stall_guard = 0;
+
+        if (input->pcm_cache &&
+            src_start >= input->pcm_cache_start &&
+            target_end <= input->pcm_cache_start + input->pcm_cache_len)
+        {
+            int off = src_start - input->pcm_cache_start;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)src_count * (size_t)src_ch * sizeof(short));
+            return src_count;
+        }
 
         if (input->pcm_cache_len == 0 ||
             src_start < input->pcm_cache_start ||
             src_start > input->pcm_decode_pos + input->src_audio_rate * 2)
         {
-            int preroll_smp = (src_start > 4096) ? (src_start - 4096) : 0;
+            int preroll_smp = (src_start > 8192) ? (src_start - 8192) : 0;
             LONG ms = (LONG)(((int64_t)preroll_smp * 1000) / input->src_audio_rate);
             LONG pos = AVIStreamTimeToSample(input->pavi_audio, ms);
             LONG kf = AVIStreamFindSample(input->pavi_audio, pos, FIND_ANY | FIND_PREV);
@@ -2830,6 +3162,7 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
             input->acm_eof_flushed = FALSE;
             ms = AVIStreamSampleToTime(input->pavi_audio, pos);
             input->pcm_decode_pos = (ms > 0) ? (int)(((int64_t)ms * input->src_audio_rate) / 1000) : 0;
+            input->acm_valid_from = (preroll_smp > 0) ? (src_start - 2048) : 0;
             input->pcm_cache_start = input->pcm_decode_pos;
             input->pcm_cache_len = 0;
         }
@@ -2933,9 +3266,16 @@ int vfw_input_read_audio(VFWInput *input, int sample_num, void *buf, int samples
         return 0;
     }
     out_valid = samples;
-    if (out_valid > total_out - sample_num)
     {
-        out_valid = total_out - sample_num;
+        int64_t avail_after = (int64_t)total_out - (int64_t)sample_num;
+        if ((int64_t)out_valid > avail_after)
+        {
+            out_valid = (avail_after > 0) ? (int)avail_after : 0;
+        }
+    }
+    if (out_valid <= 0)
+    {
+        return 0;
     }
 
     if (input->audio_kind == AUDIO_SRC_AUI_BRIDGED)

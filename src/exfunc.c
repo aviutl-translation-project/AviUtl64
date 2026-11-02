@@ -1746,13 +1746,28 @@ static BOOL __cdecl impl_avi_file_read_video(AVI_FILE_HANDLE afh, PIXEL_YC *ycp,
 static int __cdecl impl_avi_file_read_audio(AVI_FILE_HANDLE afh, void *buf, int n)
 {
     FILE_INFO fi;
-    int spf;
-    if (!afh || !vfw_input_get_file_info((VFWInput *)afh, &fi))
+    int vrate, vscale, count;
+    long long s0, s1;
+    if (!afh || n < 0 || !vfw_input_get_file_info((VFWInput *)afh, &fi))
         return 0;
-    if (fi.audio_rate <= 0 || fi.video_rate <= 0)
+    if (fi.audio_rate <= 0)
         return 0;
-    spf = (int)(((long long)fi.audio_rate * fi.video_scale) / fi.video_rate);
-    return vfw_input_read_audio((VFWInput *)afh, n * spf, buf, spf);
+    vrate = fi.video_rate;
+    vscale = fi.video_scale;
+    if (vrate <= 0 || vscale <= 0)
+    {
+        editp_get_fps(resolve_ep(NULL), &vrate, &vscale);
+        if (vrate <= 0)
+            vrate = 30;
+        if (vscale <= 0)
+            vscale = 1;
+    }
+    s0 = ((long long)n * fi.audio_rate * vscale) / vrate;
+    s1 = ((long long)(n + 1) * fi.audio_rate * vscale) / vrate;
+    count = (int)(s1 - s0);
+    if (count <= 0)
+        return 0;
+    return vfw_input_read_audio((VFWInput *)afh, (int)s0, buf, count);
 }
 
 // +0x0f8

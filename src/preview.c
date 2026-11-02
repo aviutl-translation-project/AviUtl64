@@ -359,6 +359,7 @@ void preview_load_ini(int *out_x, int *out_y, int *out_w, int *out_h, BOOL *out_
     g_sys_cfg.dragdropdialog = GetPrivateProfileIntA("system", "dragdropdialog", 0, ini);
     g_sys_cfg.openprojectaup = GetPrivateProfileIntA("system", "openprojectaup", 1, ini);
     g_sys_cfg.closedialog = GetPrivateProfileIntA("system", "closedialog", 0, ini);
+    g_sys_cfg.editresume = GetPrivateProfileIntA("system", "editresume", 0, ini);
 
     // [window] section (0x00460960)
     x = GetPrivateProfileIntA("window", "x", CW_USEDEFAULT, ini);
@@ -519,6 +520,7 @@ void preview_reload_sys_config(HWND main_hwnd)
     g_sys_cfg.dragdropdialog = GetPrivateProfileIntA("system", "dragdropdialog", 0, ini);
     g_sys_cfg.openprojectaup = GetPrivateProfileIntA("system", "openprojectaup", 1, ini);
     g_sys_cfg.closedialog = GetPrivateProfileIntA("system", "closedialog", 0, ini);
+    g_sys_cfg.editresume = GetPrivateProfileIntA("system", "editresume", 0, ini);
 
     page_sz = abs(g_sys_cfg.moveA);
     if (page_sz < 1)

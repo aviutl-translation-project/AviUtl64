@@ -19,6 +19,7 @@
 #include "debug_console.h"
 
 #define IDC_BATCH_DRAG_COMMIT 0x7FCE
+#define WM_BATCH_AUTO_START (WM_APP + 50)
 
 typedef struct BatchJob
 {
@@ -685,6 +686,8 @@ typedef struct BatchDlgCtx
     int count;
     BOOL running;
     BOOL abort_requested;
+    BOOL auto_start;
+    BOOL auto_close;
     UINT drag_msg;
     HWND drag_icon_hwnd;
     int drag_src_idx;
@@ -1210,6 +1213,23 @@ static INT_PTR CALLBACK BatchDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
         ctx->count = load_batch_queue_ini(ctx->jobs, BATCH_MAX_ITEMS);
         refresh_batch_listbox(hdlg, ctx, 0);
         update_batch_buttons(hdlg, ctx);
+        if (ctx->auto_start)
+        {
+            PostMessageW(hdlg, WM_BATCH_AUTO_START, 0, 0);
+        }
+        return TRUE;
+    }
+
+    if (msg == WM_BATCH_AUTO_START && ctx && !ctx->running)
+    {
+        if (ctx->count > 0)
+        {
+            run_batch_queue_now(hdlg, ctx);
+        }
+        if (ctx->auto_close && !ctx->abort_requested && IsWindow(hdlg))
+        {
+            EndDialog(hdlg, IDOK);
+        }
         return TRUE;
     }
 
@@ -1434,7 +1454,8 @@ static INT_PTR CALLBACK BatchDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
-void avi_tools_run_batch_dialog(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_refresh)
+void avi_tools_run_batch_dialog_ex(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_refresh,
+                                   BOOL auto_start, BOOL auto_close)
 {
     const DLGTEMPLATE *tmpl = i18n_load_dialog_template("BATCH");
     BatchDlgCtx *ctx;
@@ -1449,12 +1470,19 @@ void avi_tools_run_batch_dialog(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_re
     ctx->owner = owner;
     ctx->ep = ep;
     ctx->on_refresh = on_refresh;
+    ctx->auto_start = auto_start;
+    ctx->auto_close = auto_close;
     ctx->drag_src_idx = -1;
     ctx->drag_dst_idx = -1;
     ctx->drag_msg = RegisterWindowMessageA(DRAGLISTMSGSTRING);
 
     DialogBoxIndirectParamW(GetModuleHandleA(NULL), tmpl, owner, BatchDlgProc, (LPARAM)ctx);
     free(ctx);
+}
+
+void avi_tools_run_batch_dialog(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_refresh)
+{
+    avi_tools_run_batch_dialog_ex(owner, ep, on_refresh, FALSE, FALSE);
 }
 
 // lossless vfw stream helpers for AVICHAIN (1057) and AVIMIX (1058)

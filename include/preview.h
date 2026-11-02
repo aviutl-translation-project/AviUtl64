@@ -62,6 +62,7 @@ typedef struct AviUtlSystemConfig
     int dragdropdialog;
     int openprojectaup;
     int closedialog;
+    int editresume;
 } AviUtlSystemConfig;
 
 BOOL preview_register_classes(HINSTANCE hInst);

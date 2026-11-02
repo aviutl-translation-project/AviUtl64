@@ -20,6 +20,8 @@ BOOL avi_tools_batch_register_ex(HWND owner, EDITP *ep,
                                  int out_flags, const AviSaveOptions *opts);
 
 void avi_tools_run_batch_dialog(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_refresh);
+void avi_tools_run_batch_dialog_ex(HWND owner, EDITP *ep, AviToolsUiRefreshFn on_refresh,
+                                   BOOL auto_start, BOOL auto_close);
 
 BOOL avi_tools_run_avichain_dialog(HWND owner);
 BOOL avi_tools_run_avimix_dialog(HWND owner);

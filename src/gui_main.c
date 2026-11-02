@@ -57,6 +57,7 @@ static BOOL g_playing = FALSE;
 static BOOL g_dragging_canvas = FALSE;
 static BOOL g_peeking_unfiltered = FALSE;
 static BOOL g_smoke_exit = FALSE;
+static BOOL g_cli_no_confirm = FALSE;
 static int g_last_auto_w = 0;
 static int g_last_auto_h = 0;
 
@@ -118,6 +119,65 @@ static void get_aviutl_ini_path(char *out_path, size_t out_sz)
     {
         lstrcpynA(out_path, ".\\aviutl.ini", (int)out_sz);
     }
+}
+
+static void get_resume_aup_path(char *out_path, size_t out_sz)
+{
+    char mod_path[MAX_PATH];
+    char *slash;
+    if (GetModuleFileNameA(NULL, mod_path, MAX_PATH) > 0)
+    {
+        slash = strrchr(mod_path, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod_path[0] = '\0';
+        _snprintf(out_path, out_sz, "%saviutl.aup", mod_path);
+        out_path[out_sz - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.aup", (int)out_sz);
+    }
+}
+
+static const char *gui_path_ext_dbcs(const char *path)
+{
+    const char *dot = NULL;
+    const unsigned char *p = (const unsigned char *)path;
+    if (!path)
+        return "";
+    while (*p)
+    {
+        if (IsDBCSLeadByteEx(932, *p) && p[1])
+        {
+            p += 2;
+            continue;
+        }
+        if (*p == '\\' || *p == '/')
+            dot = NULL;
+        else if (*p == '.')
+            dot = (const char *)p;
+        p++;
+    }
+    return dot ? dot : "";
+}
+
+static BOOL is_pure_audio_ext(const char *ext)
+{
+    if (!ext || !ext[0])
+        return FALSE;
+    return lstrcmpiA(ext, ".wav") == 0 ||
+           lstrcmpiA(ext, ".mp3") == 0 ||
+           lstrcmpiA(ext, ".mp2") == 0 ||
+           lstrcmpiA(ext, ".mpa") == 0 ||
+           lstrcmpiA(ext, ".aac") == 0 ||
+           lstrcmpiA(ext, ".m4a") == 0 ||
+           lstrcmpiA(ext, ".flac") == 0 ||
+           lstrcmpiA(ext, ".ogg") == 0 ||
+           lstrcmpiA(ext, ".opus") == 0 ||
+           lstrcmpiA(ext, ".wma") == 0 ||
+           lstrcmpiA(ext, ".ac3") == 0;
 }
 
 static void ini_write_int(const char *section, const char *key, int val, const char *ini_path)
@@ -981,6 +1041,28 @@ static void shutdown_main_window(HWND hwnd)
     debug_console_shutdown();
     // persist [window] geometry & view flags while main window is still live (0x004614a0)
     preview_save_ini(hwnd);
+    // 0x004041d0: [system] editresume=1 auto-saves <exe_dir>\aviutl.aup on exit when tempconfig==0
+    if (!g_smoke_exit && preview_get_sys_config()->editresume != 0 && g_editp)
+    {
+        char ini[MAX_PATH];
+        get_aviutl_ini_path(ini, sizeof(ini));
+        if (GetPrivateProfileIntA("system", "tempconfig", 0, ini) == 0)
+        {
+            char resume_aup[MAX_PATH];
+            get_resume_aup_path(resume_aup, sizeof(resume_aup));
+            if (editp_is_editing(g_editp))
+            {
+                char prev_proj[MAX_PATH];
+                lstrcpynA(prev_proj, editp_get_project_path(g_editp), sizeof(prev_proj));
+                plugin_manager_save_aup(resume_aup, g_editp);
+                editp_set_project_path(g_editp, prev_proj);
+            }
+            else
+            {
+                DeleteFileA(resume_aup);
+            }
+        }
+    }
     if (g_editp && editp_is_editing(g_editp))
     {
         plugin_manager_notify_file_close(g_editp);
@@ -1300,7 +1382,8 @@ static void toggle_playback(HWND hwnd)
 static BOOL confirm_discard_current_edit(HWND hwnd)
 {
     const AviUtlSystemConfig *scfg;
-    if (g_smoke_exit || !g_editp || !editp_is_editing(g_editp) || editp_is_saving(g_editp))
+    if (g_smoke_exit || g_cli_no_confirm || !g_editp ||
+        !editp_is_editing(g_editp) || editp_is_saving(g_editp))
         return TRUE;
     scfg = preview_get_sys_config();
     if (!scfg || scfg->closedialog == 0)
@@ -1665,7 +1748,38 @@ static void reaviutl_file_open_with_initial(HWND owner, const char *initial_path
     }
 }
 
-static void reaviutl_file_append(HWND owner)
+static BOOL append_video_direct(HWND owner, const char *path)
+{
+    EditpLoadOptions opts;
+    char ini[MAX_PATH];
+
+    if (!g_editp || !path || !path[0])
+        return FALSE;
+    if (!editp_is_editing(g_editp))
+        return open_media_or_exo_ex(owner, path, FALSE);
+
+    stop_playback(owner);
+    ZeroMemory(&opts, sizeof(opts));
+    get_aviutl_ini_path(ini, sizeof(ini));
+    if (GetPrivateProfileIntA("system", "loadfpsadjust", 0, ini) != 0)
+    {
+        opts.fps_adjust = TRUE;
+    }
+
+    if (!editp_append_video_ex(g_editp, path, &opts))
+    {
+        aviutl_msgbox_w(owner, i18n_get_wstr(1038), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return FALSE;
+    }
+    exfunc_invalidate_all_caches();
+    if (plugin_manager_is_bridged())
+        plugin_bridge_invalidate_caches();
+    plugin_manager_notify_update(g_editp);
+    refresh_current_frame(owner);
+    return TRUE;
+}
+
+static void reaviutl_file_append_with_initial(HWND owner, const char *initial_path)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH] = {0};
@@ -1676,8 +1790,13 @@ static void reaviutl_file_append(HWND owner)
 
     if (!g_editp || !editp_is_editing(g_editp))
     {
-        reaviutl_file_open_with_initial(owner, NULL);
+        reaviutl_file_open_with_initial(owner, initial_path);
         return;
+    }
+
+    if (initial_path && initial_path[0])
+    {
+        lstrcpynA(file, initial_path, sizeof(file));
     }
 
     stop_playback(owner);
@@ -1717,6 +1836,11 @@ static void reaviutl_file_append(HWND owner)
         plugin_bridge_invalidate_caches();
     plugin_manager_notify_update(g_editp);
     refresh_current_frame(owner);
+}
+
+static void reaviutl_file_append(HWND owner)
+{
+    reaviutl_file_append_with_initial(owner, NULL);
 }
 
 void reaviutl_file_open(HWND owner)
@@ -3083,6 +3207,318 @@ static void cb_batch_ui_refresh(HWND hwnd)
     refresh_current_frame(hwnd);
 }
 
+// 0x0040fa20: AviUtl 1.10 command-line & .aus script parser
+static const char *parse_cli_token(const char *s, char *out, size_t cap)
+{
+    size_t k = 0;
+    char delim = ' ';
+
+    if (out && cap > 0)
+        out[0] = '\0';
+    if (!s)
+        return "";
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+    if (!*s)
+        return s;
+
+    if (*s == '"')
+    {
+        delim = '"';
+        s++;
+    }
+
+    while (*s && *s != delim && !(delim == ' ' && *s == '\t'))
+    {
+        if (out && k + 1 < cap)
+            out[k++] = *s;
+        s++;
+    }
+    if (out && cap > 0)
+        out[k] = '\0';
+    if (*s == '"')
+        s++;
+    return s;
+}
+
+static void execute_cli_line(HWND hwnd, const char *line, int depth, BOOL *io_quit)
+{
+    char in_path[MAX_PATH] = {0};
+    char audio_path[MAX_PATH] = {0};
+    char profile_name[MAX_PATH] = {0};
+    char out_path[MAX_PATH] = {0};
+    char out_mode = 'a';
+    BOOL is_batch = FALSE;
+    BOOL batch_start = FALSE;
+    BOOL local_quit = FALSE;
+    int range_start = -1;
+    int range_end = -1;
+    const char *p = line;
+
+    if (!p || depth > 8)
+        return;
+
+    while (*p)
+    {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+
+        if (*p == '-' || *p == '/')
+        {
+            char opt = p[1];
+            p += 2;
+            switch (opt)
+            {
+            case 'a':
+            case 'A':
+                p = parse_cli_token(p, audio_path, sizeof(audio_path));
+                break;
+
+            case 'p':
+            case 'P':
+                p = parse_cli_token(p, profile_name, sizeof(profile_name));
+                break;
+
+            case 'q':
+            case 'Q':
+                local_quit = TRUE;
+                if (io_quit)
+                    *io_quit = TRUE;
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                break;
+
+            case 'r':
+            case 'R':
+            {
+                int v = 0;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                range_start = 0;
+                while (*p >= '0' && *p <= '9')
+                {
+                    v = v * 10 + (*p - '0');
+                    p++;
+                }
+                range_start = v;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (*p == ',')
+                {
+                    int v2 = 0;
+                    p++;
+                    while (*p == ' ' || *p == '\t')
+                        p++;
+                    range_end = 0;
+                    while (*p >= '0' && *p <= '9')
+                    {
+                        v2 = v2 * 10 + (*p - '0');
+                        p++;
+                    }
+                    range_end = v2;
+                }
+                break;
+            }
+
+            case 'b':
+            case 'B':
+                if ((*p == 's' || *p == 'S') &&
+                    (p[1] == '\0' || p[1] == ' ' || p[1] == '\t'))
+                {
+                    batch_start = TRUE;
+                    p++;
+                    break;
+                }
+                is_batch = TRUE;
+                out_mode = 'a';
+                if ((*p == 'a' || *p == 'A' || *p == 'w' || *p == 'W' || *p == 'p' || *p == 'P') &&
+                    (p[1] == '\0' || p[1] == ' ' || p[1] == '\t' || p[1] == '"'))
+                {
+                    out_mode = (char)((*p >= 'A' && *p <= 'Z') ? (*p - 'A' + 'a') : *p);
+                    p++;
+                }
+                p = parse_cli_token(p, out_path, sizeof(out_path));
+                break;
+
+            case 'o':
+            case 'O':
+                is_batch = FALSE;
+                out_mode = 'a';
+                if ((*p == 'a' || *p == 'A' || *p == 'w' || *p == 'W' || *p == 'p' || *p == 'P') &&
+                    (p[1] == '\0' || p[1] == ' ' || p[1] == '\t' || p[1] == '"'))
+                {
+                    out_mode = (char)((*p >= 'A' && *p <= 'Z') ? (*p - 'A' + 'a') : *p);
+                    p++;
+                }
+                p = parse_cli_token(p, out_path, sizeof(out_path));
+                break;
+
+            default:
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                break;
+            }
+        }
+        else
+        {
+            p = parse_cli_token(p, in_path, sizeof(in_path));
+        }
+    }
+
+    if (local_quit || (io_quit && *io_quit))
+    {
+        g_cli_no_confirm = TRUE;
+    }
+
+    if (profile_name[0])
+    {
+        int pidx = profile_cfg_find_by_name(profile_name);
+        if (pidx >= 0)
+        {
+            profile_cfg_select(pidx, TRUE);
+            exfunc_invalidate_all_caches();
+            if (plugin_manager_is_bridged())
+                plugin_bridge_invalidate_caches();
+            apply_menu(hwnd);
+        }
+    }
+
+    if (in_path[0])
+    {
+        const char *ext = gui_path_ext_dbcs(in_path);
+        if (lstrcmpiA(ext, ".aus") == 0)
+        {
+            FILE *fp = fopen(in_path, "rb");
+            if (fp)
+            {
+                char sline[2048];
+                while (fgets(sline, sizeof(sline), fp))
+                {
+                    char *end = sline + strlen(sline);
+                    char *lead = sline;
+                    while (end > sline && (end[-1] == '\r' || end[-1] == '\n'))
+                        *--end = '\0';
+                    if ((unsigned char)lead[0] == 0xEF &&
+                        (unsigned char)lead[1] == 0xBB &&
+                        (unsigned char)lead[2] == 0xBF)
+                    {
+                        lead += 3;
+                    }
+                    while (*lead == ' ' || *lead == '\t')
+                        lead++;
+                    if (!*lead || *lead == '#' || *lead == ';')
+                        continue;
+                    execute_cli_line(hwnd, lead, depth + 1, io_quit);
+                }
+                fclose(fp);
+            }
+        }
+        else if (lstrcmpiA(ext, ".aup") == 0)
+        {
+            open_media_or_exo_ex(hwnd, in_path, TRUE);
+        }
+        else
+        {
+            open_media_or_exo_ex(hwnd, in_path, FALSE);
+        }
+    }
+
+    if (audio_path[0] && g_editp)
+    {
+        load_audio_into_current_edit(hwnd, audio_path);
+    }
+
+    if (range_start >= 0 && g_editp && editp_is_editing(g_editp))
+    {
+        int sf = preview_get_sys_config() ? preview_get_sys_config()->startframe : 1;
+        int fn = editp_get_frame_n(g_editp);
+        int cur_s = 0, cur_e = (fn > 0) ? (fn - 1) : 0;
+        int ns, ne;
+
+        editp_get_select_frame(g_editp, &cur_s, &cur_e);
+        ns = range_start - sf;
+        ne = (range_end >= 0) ? (range_end - sf) : cur_e;
+        if (ns < 0)
+            ns = 0;
+        if (fn > 0 && ns >= fn)
+            ns = fn - 1;
+        if (ne < 0)
+            ne = 0;
+        if (fn > 0 && ne >= fn)
+            ne = fn - 1;
+        if (ne < ns)
+            ne = ns;
+        editp_set_select_frame(g_editp, ns, ne);
+        plugin_manager_notify_update(g_editp);
+        refresh_current_frame(hwnd);
+    }
+
+    if (out_path[0] && g_editp && editp_is_editing(g_editp))
+    {
+        BOOL prev_no_confirm = g_cli_no_confirm;
+        g_cli_no_confirm = TRUE;
+        if (is_batch)
+        {
+            if (out_mode == 'w')
+            {
+                avi_tools_batch_register_ex(hwnd, g_editp, out_path, NULL,
+                                            OUTPUT_INFO_FLAG_AUDIO | OUTPUT_INFO_FLAG_BATCH, NULL);
+            }
+            else if (out_mode == 'p')
+            {
+                int auo_idx = video_export_get_last_auo_index();
+                const char *auo_name = video_export_get_auo_name(auo_idx);
+                int fl = OUTPUT_INFO_FLAG_VIDEO |
+                         (editp_has_audio(g_editp) ? OUTPUT_INFO_FLAG_AUDIO : 0) |
+                         OUTPUT_INFO_FLAG_BATCH;
+                avi_tools_batch_register_ex(hwnd, g_editp, out_path,
+                                            auo_name ? auo_name : "", fl, NULL);
+            }
+            else
+            {
+                int fl = OUTPUT_INFO_FLAG_VIDEO |
+                         (editp_has_audio(g_editp) ? OUTPUT_INFO_FLAG_AUDIO : 0) |
+                         OUTPUT_INFO_FLAG_BATCH;
+                avi_tools_batch_register_current(hwnd, g_editp, out_path, fl, NULL);
+            }
+        }
+        else
+        {
+            int batch_bit = (local_quit || (io_quit && *io_quit) || depth > 0) ? OUTPUT_INFO_FLAG_BATCH : 0;
+            if (out_mode == 'w')
+            {
+                video_export_wav_file(hwnd, g_editp, out_path);
+            }
+            else if (out_mode == 'p')
+            {
+                int auo_idx = video_export_get_last_auo_index();
+                int fl = OUTPUT_INFO_FLAG_VIDEO |
+                         (editp_has_audio(g_editp) ? OUTPUT_INFO_FLAG_AUDIO : 0) |
+                         batch_bit;
+                if (auo_idx >= 0)
+                    video_export_auo_file(hwnd, g_editp, auo_idx, out_path, fl);
+            }
+            else
+            {
+                int fl = OUTPUT_INFO_FLAG_VIDEO |
+                         (editp_has_audio(g_editp) ? OUTPUT_INFO_FLAG_AUDIO : 0) |
+                         batch_bit;
+                video_export_avi_file(hwnd, g_editp, out_path, fl);
+            }
+        }
+        g_cli_no_confirm = prev_no_confirm;
+    }
+
+    if (batch_start && g_editp)
+    {
+        BOOL auto_close = (local_quit || (io_quit && *io_quit) || depth > 0);
+        avi_tools_run_batch_dialog_ex(hwnd, g_editp, cb_batch_ui_refresh, TRUE, auto_close);
+    }
+}
+
 static void show_preview_context_menu(HWND hwnd, int screen_x, int screen_y)
 {
     HMENU hMenu = i18n_load_menu("CONTEXT");
@@ -3184,38 +3620,87 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DROPFILES:
     {
-        char path[MAX_PATH] = {0};
         HDROP hDrop = (HDROP)wp;
+        UINT nfiles = DragQueryFileA(hDrop, 0xFFFFFFFFu, NULL, 0);
+        UINT i;
+        BOOL ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        BOOL drop_quit = FALSE;
         const AviUtlSystemConfig *scfg = preview_get_sys_config();
+
         if (scfg && scfg->dragdropactive)
         {
             SetForegroundWindow(hwnd);
         }
-        if (DragQueryFileA(hDrop, 0, path, MAX_PATH) > 0)
+        for (i = 0; i < nfiles; i++)
         {
-            const char *ext = strrchr(path, '.');
-            if (ext && lstrcmpiA(ext, ".wav") == 0 && g_editp && editp_is_editing(g_editp))
+            char path[MAX_PATH] = {0};
+            const char *ext;
+            if (DragQueryFileA(hDrop, i, path, MAX_PATH) == 0 || !path[0])
+                continue;
+            ext = gui_path_ext_dbcs(path);
+
+            if (lstrcmpiA(ext, ".aus") == 0)
             {
-                if (scfg && scfg->dragdropdialog)
+                char qline[MAX_PATH + 4];
+                _snprintf(qline, sizeof(qline), "\"%s\"", path);
+                qline[sizeof(qline) - 1] = '\0';
+                execute_cli_line(hwnd, qline, 0, &drop_quit);
+                continue;
+            }
+
+            if (i == 0)
+            {
+                if (is_pure_audio_ext(ext) && g_editp && editp_is_editing(g_editp))
                 {
-                    reaviutl_audio_open_with_initial(hwnd, path);
+                    if (scfg && scfg->dragdropdialog && nfiles == 1)
+                        reaviutl_audio_open_with_initial(hwnd, path);
+                    else
+                        load_audio_into_current_edit(hwnd, path);
+                }
+                else if (ctrl_down && g_editp && editp_is_editing(g_editp) &&
+                         !(lstrcmpiA(ext, ".aup") == 0 || lstrcmpiA(ext, ".exo") == 0))
+                {
+                    if (scfg && scfg->dragdropdialog && nfiles == 1)
+                        reaviutl_file_append_with_initial(hwnd, path);
+                    else
+                        append_video_direct(hwnd, path);
+                }
+                else if (scfg && scfg->dragdropdialog && nfiles == 1 &&
+                         !(lstrcmpiA(ext, ".aup") == 0 || lstrcmpiA(ext, ".exo") == 0))
+                {
+                    reaviutl_file_open_with_initial(hwnd, path);
                 }
                 else
                 {
-                    load_audio_into_current_edit(hwnd, path);
+                    open_media_or_exo_ex(hwnd, path, FALSE);
                 }
-            }
-            else if (scfg && scfg->dragdropdialog &&
-                     !(ext && (lstrcmpiA(ext, ".aup") == 0 || lstrcmpiA(ext, ".exo") == 0)))
-            {
-                reaviutl_file_open_with_initial(hwnd, path);
             }
             else
             {
-                open_media_or_exo_ex(hwnd, path, TRUE);
+                if (is_pure_audio_ext(ext) && g_editp && editp_is_editing(g_editp))
+                {
+                    load_audio_into_current_edit(hwnd, path);
+                }
+                else if (lstrcmpiA(ext, ".exo") == 0)
+                {
+                    open_media_or_exo_ex(hwnd, path, FALSE);
+                }
+                else if (g_editp && editp_is_editing(g_editp))
+                {
+                    append_video_direct(hwnd, path);
+                }
+                else
+                {
+                    open_media_or_exo_ex(hwnd, path, FALSE);
+                }
             }
         }
         DragFinish(hDrop);
+        if (drop_quit)
+        {
+            g_cli_no_confirm = TRUE;
+            PostMessageA(hwnd, WM_CLOSE, 0, 0);
+        }
         return 0;
     }
 
@@ -4286,10 +4771,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
         dbg_info("ready (type 'help' for commands)");
     }
 
-    // open file passed on command line if any (supports --smoke-exit for automated GUI tests)
-    if (cmdline && cmdline[0])
+    // 0x00402e70 + 0x00407b50: auto-resume <exe_dir>\aviutl.aup first, then run CLI / .aus (0x0040fa20)
     {
-        if (strstr(cmdline, "--smoke-exit") != NULL)
+        BOOL cli_quit = FALSE;
+        const char *trimmed_cmd = cmdline ? cmdline : "";
+        while (*trimmed_cmd == ' ' || *trimmed_cmd == '\t')
+            trimmed_cmd++;
+
+        if (g_smoke_exit)
         {
             open_media_or_exo(hwnd, "1280x720_30fps_44100Hz.exedit");
             if (ex_idx >= 0)
@@ -4303,24 +4792,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
         }
         else
         {
-            char arg[MAX_PATH];
-            const char *s = cmdline;
-            while (*s == ' ')
-                s++;
-            if (*s == '"')
+            if (preview_get_sys_config()->editresume != 0)
             {
-                int k = 0;
-                s++;
-                while (*s && *s != '"' && k < MAX_PATH - 1)
-                    arg[k++] = *s++;
-                arg[k] = '\0';
+                char resume_aup[MAX_PATH];
+                DWORD attr;
+                get_resume_aup_path(resume_aup, sizeof(resume_aup));
+                attr = GetFileAttributesA(resume_aup);
+                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+                {
+                    if (plugin_manager_load_aup(resume_aup, g_editp))
+                    {
+                        editp_set_project_path(g_editp, "");
+                        plugin_manager_notify_update(g_editp);
+                        g_last_auto_w = 0;
+                        g_last_auto_h = 0;
+                        apply_menu(hwnd);
+                        refresh_current_frame(hwnd);
+                    }
+                }
             }
-            else
+            if (trimmed_cmd[0])
             {
-                lstrcpynA(arg, s, MAX_PATH);
+                execute_cli_line(hwnd, trimmed_cmd, 0, &cli_quit);
+                if (cli_quit)
+                {
+                    g_cli_no_confirm = TRUE;
+                    PostMessageA(hwnd, WM_CLOSE, 0, 0);
+                }
             }
-            if (arg[0])
-                open_media_or_exo(hwnd, arg);
         }
     }
 

@@ -137,6 +137,13 @@ struct VFWInput
     size_t dib_size;
     PIXEL_YC *aui_yc_tmp;
 
+    // sequential numbered still image state (0x0042c680 / 0x0042c740)
+    char seq_prefix[MAX_PATH];
+    char seq_ext[64];
+    int seq_digits;
+    int seq_start_num;
+    int cached_img_frame;
+
     // native / bridged .aui state
     InputPluginInstance *aui_inst;
     int aui_flags;
@@ -1322,7 +1329,7 @@ static BOOL parse_exedit_canvas_spec(const char *filepath,
     return TRUE;
 }
 
-static BOOL try_open_still_image(VFWInput *input, const char *filepath)
+static BOOL load_still_image_into_buffers(VFWInput *input, const char *filepath, BOOL initial_alloc)
 {
     WCHAR wpath[MAX_PATH];
     void *bmp = NULL;
@@ -1332,14 +1339,15 @@ static BOOL try_open_still_image(VFWInput *input, const char *filepath)
         INT X, Y, Width, Height;
     } rect;
     GdipBitmapData bd;
-    UINT y, x;
+    UINT y, x, copy_w, copy_h;
     int dst_stride;
 
-    if (!ensure_gdiplus())
+    if (!ensure_gdiplus() || !filepath || !filepath[0])
     {
         return FALSE;
     }
-    if (MultiByteToWideChar(CP_ACP, 0, filepath, -1, wpath, MAX_PATH) <= 0)
+    if (MultiByteToWideChar(CP_ACP, 0, filepath, -1, wpath, MAX_PATH) <= 0 &&
+        MultiByteToWideChar(932, 0, filepath, -1, wpath, MAX_PATH) <= 0)
     {
         return FALSE;
     }
@@ -1367,33 +1375,54 @@ static BOOL try_open_still_image(VFWInput *input, const char *filepath)
         return FALSE;
     }
 
-    input->kind = INPUT_KIND_STILL_IMAGE;
-    input->width = (int)w;
-    input->height = (int)h;
-    input->frame_count = 1;
-    input->fps_num = 30;
-    input->fps_den = 1;
-    input->decode_bpp = 32;
-
-    dst_stride = (int)w * 4;
-    input->dib_size = (size_t)dst_stride * (size_t)h;
-    input->dib_buffer = (unsigned char *)calloc(1, input->dib_size);
-    input->rgb_buffer = (PIXEL *)calloc((size_t)w * (size_t)h, sizeof(PIXEL));
-    if (!input->dib_buffer || !input->rgb_buffer)
+    if (initial_alloc)
     {
-        pGdipBitmapUnlockBits(bmp, &bd);
-        pGdipDisposeImage(bmp);
-        return FALSE;
+        input->kind = INPUT_KIND_STILL_IMAGE;
+        input->width = (int)w;
+        input->height = (int)h;
+        input->frame_count = 1;
+        input->fps_num = 30;
+        input->fps_den = 1;
+        input->decode_bpp = 32;
+
+        dst_stride = (int)w * 4;
+        input->dib_size = (size_t)dst_stride * (size_t)h;
+        input->dib_buffer = (unsigned char *)calloc(1, input->dib_size);
+        input->rgb_buffer = (PIXEL *)calloc((size_t)w * (size_t)h, sizeof(PIXEL));
+        if (!input->dib_buffer || !input->rgb_buffer)
+        {
+            pGdipBitmapUnlockBits(bmp, &bd);
+            pGdipDisposeImage(bmp);
+            return FALSE;
+        }
+    }
+    else
+    {
+        dst_stride = input->width * 4;
+        if (!input->dib_buffer || !input->rgb_buffer)
+        {
+            pGdipBitmapUnlockBits(bmp, &bd);
+            pGdipDisposeImage(bmp);
+            return FALSE;
+        }
+        if ((int)w != input->width || (int)h != input->height)
+        {
+            memset(input->dib_buffer, 0, input->dib_size);
+            memset(input->rgb_buffer, 0, (size_t)input->width * (size_t)input->height * sizeof(PIXEL));
+        }
     }
 
-    for (y = 0; y < h; y++)
+    copy_w = ((int)w < input->width) ? w : (UINT)input->width;
+    copy_h = ((int)h < input->height) ? h : (UINT)input->height;
+
+    for (y = 0; y < copy_h; y++)
     {
         const unsigned char *src_row = (const unsigned char *)bd.Scan0 + (ptrdiff_t)y * bd.Stride;
         // bottom-up BGRA32 for avi_file_get_video_pixelp
-        unsigned char *dib_row = input->dib_buffer + (size_t)(h - 1 - y) * (size_t)dst_stride;
-        PIXEL *rgb_row = input->rgb_buffer + (size_t)y * (size_t)w;
-        memcpy(dib_row, src_row, (size_t)dst_stride);
-        for (x = 0; x < w; x++)
+        unsigned char *dib_row = input->dib_buffer + (size_t)((UINT)input->height - 1u - y) * (size_t)dst_stride;
+        PIXEL *rgb_row = input->rgb_buffer + (size_t)y * (size_t)input->width;
+        memcpy(dib_row, src_row, (size_t)copy_w * 4u);
+        for (x = 0; x < copy_w; x++)
         {
             rgb_row[x].b = src_row[x * 4 + 0];
             rgb_row[x].g = src_row[x * 4 + 1];
@@ -1403,6 +1432,149 @@ static BOOL try_open_still_image(VFWInput *input, const char *filepath)
 
     pGdipBitmapUnlockBits(bmp, &bd);
     pGdipDisposeImage(bmp);
+    return TRUE;
+}
+
+// 0x0042c680 / 0x0042c740: detect sequential numbered still images (e.g. img_0001.png .. img_0100.png)
+static void detect_still_image_sequence(VFWInput *input, const char *filepath)
+{
+    const char *base = filepath;
+    const char *dot = NULL;
+    const char *ext;
+    const char *digit_run = NULL;
+    const unsigned char *p;
+    int digits = 0;
+    int start_num = 0;
+    size_t prefix_len;
+    int count;
+
+    input->seq_prefix[0] = '\0';
+    input->seq_ext[0] = '\0';
+    input->seq_digits = 0;
+    input->seq_start_num = 0;
+    input->cached_img_frame = 0;
+
+    if (!filepath || !filepath[0])
+        return;
+
+    for (p = (const unsigned char *)filepath; *p; )
+    {
+        if (IsDBCSLeadByte(*p) && p[1])
+        {
+            p += 2;
+            continue;
+        }
+        if (*p == '\\' || *p == '/')
+        {
+            base = (const char *)(p + 1);
+            dot = NULL;
+        }
+        else if (*p == '.')
+        {
+            dot = (const char *)p;
+        }
+        p++;
+    }
+    ext = dot ? dot : (filepath + strlen(filepath));
+
+    for (p = (const unsigned char *)base; (const char *)p < ext; )
+    {
+        if (IsDBCSLeadByte(*p) && p[1])
+        {
+            digit_run = NULL;
+            p += 2;
+            continue;
+        }
+        if (*p >= '0' && *p <= '9')
+        {
+            if (!digit_run)
+                digit_run = (const char *)p;
+        }
+        else
+        {
+            digit_run = NULL;
+        }
+        p++;
+    }
+
+    if (!digit_run)
+        return;
+
+    digits = (int)(ext - digit_run);
+    if (digits < 1 || digits > 9)
+        return;
+
+    prefix_len = (size_t)(digit_run - filepath);
+    if (prefix_len >= sizeof(input->seq_prefix) || strlen(ext) >= sizeof(input->seq_ext))
+        return;
+
+    for (count = 0; count < digits; count++)
+    {
+        start_num = start_num * 10 + (digit_run[count] - '0');
+    }
+
+    memcpy(input->seq_prefix, filepath, prefix_len);
+    input->seq_prefix[prefix_len] = '\0';
+    lstrcpynA(input->seq_ext, ext, (int)sizeof(input->seq_ext));
+    input->seq_digits = digits;
+    input->seq_start_num = start_num;
+
+    for (count = 1; count < 0x7fffff && start_num <= 0x7fffffff - count; count++)
+    {
+        char cand[MAX_PATH * 2];
+        DWORD attr;
+        int n = _snprintf(cand, sizeof(cand), "%s%0*d%s",
+                          input->seq_prefix, input->seq_digits,
+                          start_num + count, input->seq_ext);
+        cand[sizeof(cand) - 1] = '\0';
+        if (n <= 0 || n >= MAX_PATH)
+            break;
+        attr = GetFileAttributesA(cand);
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+            break;
+    }
+
+    input->frame_count = count;
+}
+
+static BOOL ensure_still_image_frame(VFWInput *input, int frame_num)
+{
+    int f;
+    char cand[MAX_PATH * 2];
+    int n;
+
+    if (!input || input->kind != INPUT_KIND_STILL_IMAGE)
+        return FALSE;
+    if (input->frame_count <= 1 || input->seq_digits <= 0)
+        return TRUE;
+
+    f = frame_num;
+    if (f < 0)
+        f = 0;
+    if (f >= input->frame_count)
+        f = input->frame_count - 1;
+    if (f == input->cached_img_frame)
+        return TRUE;
+
+    n = _snprintf(cand, sizeof(cand), "%s%0*d%s",
+                  input->seq_prefix, input->seq_digits,
+                  input->seq_start_num + f, input->seq_ext);
+    cand[sizeof(cand) - 1] = '\0';
+    if (n <= 0 || n >= MAX_PATH)
+        return FALSE;
+    if (!load_still_image_into_buffers(input, cand, FALSE))
+        return FALSE;
+    input->cached_img_frame = f;
+    return TRUE;
+}
+
+static BOOL try_open_still_image(VFWInput *input, const char *filepath)
+{
+    if (!load_still_image_into_buffers(input, filepath, TRUE))
+    {
+        return FALSE;
+    }
+    detect_still_image_sequence(input, filepath);
     return TRUE;
 }
 
@@ -2503,6 +2675,8 @@ BOOL vfw_input_read_frame_stride(VFWInput *input, int frame_num, PIXEL_YC *ycp, 
 
     if (input->kind == INPUT_KIND_STILL_IMAGE)
     {
+        if (!ensure_still_image_frame(input, frame_num))
+            return FALSE;
         for (y = 0; y < input->height; y++)
         {
             rgb2yc(ycp + (size_t)y * (size_t)yc_stride,
@@ -3413,8 +3587,14 @@ void *vfw_input_get_dib_pixelp(VFWInput *input, int frame_num)
         yc2rgb_dib24(input->dib_buffer, dib_stride, input->aui_yc_tmp, w, w, h, TRUE);
         return input->dib_buffer;
     }
-    if (input->kind == INPUT_KIND_EXEDIT_CANVAS || input->kind == INPUT_KIND_STILL_IMAGE)
+    if (input->kind == INPUT_KIND_EXEDIT_CANVAS)
     {
+        return input->dib_buffer;
+    }
+    if (input->kind == INPUT_KIND_STILL_IMAGE)
+    {
+        if (!ensure_still_image_frame(input, frame_num))
+            return NULL;
         return input->dib_buffer;
     }
     if (input->kind == INPUT_KIND_VFW && input->pgf && input->pavi_stream)
@@ -3470,8 +3650,14 @@ PIXEL *vfw_input_get_pixel_buffer(VFWInput *input, int frame_num)
     {
         return NULL;
     }
-    if (input->kind == INPUT_KIND_EXEDIT_CANVAS || input->kind == INPUT_KIND_STILL_IMAGE)
+    if (input->kind == INPUT_KIND_EXEDIT_CANVAS)
     {
+        return input->rgb_buffer;
+    }
+    if (input->kind == INPUT_KIND_STILL_IMAGE)
+    {
+        if (!ensure_still_image_frame(input, frame_num))
+            return NULL;
         return input->rgb_buffer;
     }
     if (input->kind != INPUT_KIND_VFW || !input->pgf || !input->pavi_stream)

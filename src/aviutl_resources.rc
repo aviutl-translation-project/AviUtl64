@@ -1,0 +1,123 @@
+#include <windows.h>
+#pragma code_page(65001)
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+
+// icons
+ICON            ICON "../resources/ICON.ico"
+ICON_BACK       ICON "../resources/ICON_BACK.ico"
+ICON_BACK2      ICON "../resources/ICON_BACK2.ico"
+ICON_DEL        ICON "../resources/ICON_DEL.ico"
+ICON_DEL2       ICON "../resources/ICON_DEL2.ico"
+ICON_DRAG       ICON "../resources/ICON_DRAG.ico"
+ICON_FORWARD    ICON "../resources/ICON_FORWARD.ico"
+ICON_FORWARD2   ICON "../resources/ICON_FORWARD2.ico"
+ICON_IN         ICON "../resources/ICON_IN.ico"
+ICON_I_AUTO     ICON "../resources/ICON_I_AUTO.ico"
+ICON_I_EVEN     ICON "../resources/ICON_I_EVEN.ico"
+ICON_I_MIX      ICON "../resources/ICON_I_MIX.ico"
+ICON_I_NORM     ICON "../resources/ICON_I_NORM.ico"
+ICON_I_ODD      ICON "../resources/ICON_I_ODD.ico"
+ICON_I_REV      ICON "../resources/ICON_I_REV.ico"
+ICON_LEFT       ICON "../resources/ICON_LEFT.ico"
+ICON_MARK       ICON "../resources/ICON_MARK.ico"
+ICON_OUT        ICON "../resources/ICON_OUT.ico"
+ICON_PAUSE      ICON "../resources/ICON_PAUSE.ico"
+ICON_PLAY       ICON "../resources/ICON_PLAY.ico"
+ICON_RIGHT      ICON "../resources/ICON_RIGHT.ico"
+ICON_STOP       ICON "../resources/ICON_STOP.ico"
+ICON_VOL        ICON "../resources/ICON_VOL.ico"
+ICON_Z_1        ICON "../resources/ICON_Z_1.ico"
+ICON_Z_2        ICON "../resources/ICON_Z_2.ico"
+ICON_Z_3        ICON "../resources/ICON_Z_3.ico"
+ICON_Z_4        ICON "../resources/ICON_Z_4.ico"
+
+// preview context menu (0x004125e8)
+CONTEXT MENU
+BEGIN
+    POPUP "context"
+    BEGIN
+        POPUP "拡大表示"
+        BEGIN
+            MENUITEM "25%",         9200
+            MENUITEM "50%",         9201
+            MENUITEM "100%",        9202
+            MENUITEM "200%",        9203
+            MENUITEM "300%",        9204
+            MENUITEM "400%",        9205
+            MENUITEM "WindowSize",  9206
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "画像をコピー",                         1020
+        MENUITEM "画像を貼り付け",                       5117
+        MENUITEM "クリップボードにコピー",               1026
+        MENUITEM "クリップボードから貼り付け",           5123
+        MENUITEM "クリップボードに出力イメージをコピー", 1070
+        MENUITEM "選択範囲の切り出し",                   5143
+        MENUITEM "選択範囲の削除",                       5101
+        MENUITEM SEPARATOR
+        MENUITEM "元に戻す",                             5147
+        MENUITEM "すべてを選択",                         5112
+        MENUITEM SEPARATOR
+        MENUITEM "マークする",                           5130
+    END
+END
+
+CONTEXT_EN MENU
+BEGIN
+    POPUP "context"
+    BEGIN
+        POPUP "Zoom"
+        BEGIN
+            MENUITEM "25%",         9200
+            MENUITEM "50%",         9201
+            MENUITEM "100%",        9202
+            MENUITEM "200%",        9203
+            MENUITEM "300%",        9204
+            MENUITEM "400%",        9205
+            MENUITEM "WindowSize",  9206
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "Copy Frame Image",                1020
+        MENUITEM "Paste Frame Image",               5117
+        MENUITEM "Copy to Clipboard",               1026
+        MENUITEM "Paste from Clipboard",            5123
+        MENUITEM "Copy Output Image to Clipboard",  1070
+        MENUITEM "Trim to Selection",               5143
+        MENUITEM "Delete Selection",                5101
+        MENUITEM SEPARATOR
+        MENUITEM "Undo",                            5147
+        MENUITEM "Select All",                      5112
+        MENUITEM SEPARATOR
+        MENUITEM "Mark Frame",                      5130
+    END
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,10,0,0
+PRODUCTVERSION  1,10,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS__WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104b0"
+        BEGIN
+            VALUE "CompanyName",      "KENくん"
+            VALUE "FileDescription",  "AviUtl"
+            VALUE "FileVersion",      "1.10"
+            VALUE "InternalName",     "aviutl"
+            VALUE "LegalCopyright",   "Copyright (C) 1997-2019 KENくん"
+            VALUE "OriginalFilename", "aviutl.exe"
+            VALUE "ProductName",      "AviUtl"
+            VALUE "ProductVersion",   "1.10"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x411, 1200
+    END
+END

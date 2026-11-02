@@ -5,6 +5,7 @@
 
 #include "input_plugin.h"
 #include "plugin_bridge.h"
+#include "plugin_cache.h"
 #include "debug_console.h"
 
 typedef INPUT_PLUGIN_TABLE *(__stdcall *GetInputPluginTableFn)(void);
@@ -443,15 +444,47 @@ static void add_builtin_reader(const char *name, const char *flt, int flt_len,
     g_input_count++;
 }
 
-static void scan_single_aui(const char *full_path)
+static void scan_single_aui(const char *full_path, const WIN32_FIND_DATAA *fd, const char *ini_path)
 {
     HMODULE hmod;
     GetInputPluginTableFn fn;
     INPUT_PLUGIN_TABLE *tbl = NULL;
     InputPluginEntry *e;
+    int host_arch = REAVIUTL_X64 ? 64 : 32;
+    int cached_flag = 0, cached_flt_len = 0;
+    char cached_name[128] = {0};
+    char cached_flt[1024] = {0};
+    char cached_info[256] = {0};
+    PluginCacheLookup clk;
 
     if (!full_path || !full_path[0] || g_input_count >= INPUT_PLUGIN_MAX || has_aui_path(full_path))
     {
+        return;
+    }
+
+    clk = plugin_cache_try_load(ini_path, full_path, fd, host_arch,
+                                &cached_flag, cached_name, sizeof(cached_name),
+                                cached_flt, sizeof(cached_flt), &cached_flt_len,
+                                cached_info, sizeof(cached_info));
+    if (clk == PLUGIN_CACHE_HIT_OTHER_ARCH)
+    {
+        return;
+    }
+    if (clk == PLUGIN_CACHE_HIT_NATIVE && cached_name[0])
+    {
+        e = &g_inputs[g_input_count++];
+        memset(e, 0, sizeof(*e));
+        lstrcpynA(e->name, cached_name, sizeof(e->name));
+        memcpy(e->filefilter, cached_flt, sizeof(e->filefilter));
+        e->filefilter_len = cached_flt_len;
+        lstrcpynA(e->information, cached_info[0] ? cached_info : e->name, sizeof(e->information));
+        lstrcpynA(e->path, full_path, sizeof(e->path));
+        e->flag = cached_flag & ~(INPUT_PLUGIN_FLAG_BUILTIN | INPUT_PLUGIN_FLAG_HIDE_LIST | 0x100);
+        e->builtin_kind = BUILTIN_INPUT_NONE;
+        e->has_config = (cached_flag & 0x100) != 0;
+        e->priority = g_input_count - 1;
+        e->bridge_aui_idx = -1;
+        dbg_plugin("Cached .aui input plugin: '%s' (%s)", e->name, full_path);
         return;
     }
 
@@ -502,6 +535,12 @@ static void scan_single_aui(const char *full_path)
     e->priority = g_input_count;
     e->bridge_aui_idx = -1;
 
+    {
+        int save_flag = e->flag | (e->has_config ? 0x100 : 0);
+        plugin_cache_save(ini_path, full_path, fd, host_arch,
+                          &save_flag, e->name, e->filefilter, e->information);
+    }
+
     // 0x004253e0: unload after metadata probe; lazy-load & func_init on first open/config
     FreeLibrary(hmod);
     g_input_count++;
@@ -509,7 +548,7 @@ static void scan_single_aui(const char *full_path)
     dbg_plugin("Discovered .aui input plugin: '%s' (%s)", e->name, full_path);
 }
 
-static void scan_aui_dir(const char *dir)
+static void scan_aui_dir(const char *dir, const char *ini_path)
 {
     char pattern[MAX_PATH];
     WIN32_FIND_DATAA fd;
@@ -536,7 +575,7 @@ static void scan_aui_dir(const char *dir)
             char full[MAX_PATH];
             _snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
             full[sizeof(full) - 1] = '\0';
-            scan_single_aui(full);
+            scan_single_aui(full, &fd, ini_path);
         }
     } while (g_input_count < INPUT_PLUGIN_MAX && FindNextFileA(hfind, &fd));
 
@@ -631,11 +670,11 @@ void input_plugin_init(const char *plugin_dir, HWND main_hwnd)
 
     if (exe_dir[0])
     {
-        scan_aui_dir(exe_dir);
+        scan_aui_dir(exe_dir, ini);
     }
     if (plugin_dir && plugin_dir[0] && (!exe_dir[0] || lstrcmpiA(exe_dir, plugin_dir) != 0))
     {
-        scan_aui_dir(plugin_dir);
+        scan_aui_dir(plugin_dir, ini);
     }
 
 #if REAVIUTL_X64

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "filter.h"
+#include "editp.h"
 #include "plugin_loader.h"
 
 EXFUNC *exfunc_get_table(void);
@@ -13,12 +14,62 @@ EXFUNC *exfunc_get_table(void);
 typedef FILTER_DLL *(__stdcall *GetFilterTableFn)(void);
 typedef FILTER_DLL **(__stdcall *GetFilterTableListFn)(void);
 
+static int populate_from_exports(HMODULE mod, PluginReport *rep, BOOL yuy2_exports)
+{
+    GetFilterTableFn get1 = NULL;
+    GetFilterTableListFn getN = NULL;
+    int count = 0;
+
+    if (yuy2_exports)
+    {
+        getN = (GetFilterTableListFn)GetProcAddress(mod, "GetFilterTableListYUY2");
+        if (!getN)
+            getN = (GetFilterTableListFn)GetProcAddress(mod, "_GetFilterTableListYUY2@0");
+        get1 = (GetFilterTableFn)GetProcAddress(mod, "GetFilterTableYUY2");
+        if (!get1)
+            get1 = (GetFilterTableFn)GetProcAddress(mod, "_GetFilterTableYUY2@0");
+    }
+    else
+    {
+        getN = (GetFilterTableListFn)GetProcAddress(mod, "GetFilterTableList");
+        if (!getN)
+            getN = (GetFilterTableListFn)GetProcAddress(mod, "_GetFilterTableList@0");
+        get1 = (GetFilterTableFn)GetProcAddress(mod, "GetFilterTable");
+        if (!get1)
+            get1 = (GetFilterTableFn)GetProcAddress(mod, "_GetFilterTable@0");
+    }
+
+    if (getN)
+    {
+        FILTER_DLL **list = getN();
+        if (list)
+        {
+            while (list[count] && count < PLUGIN_MAX_FILTERS)
+            {
+                rep->filters[count] = list[count];
+                rep->is_yuy2[count] = yuy2_exports;
+                count++;
+            }
+        }
+    }
+    else if (get1)
+    {
+        FILTER_DLL *t = get1();
+        if (t)
+        {
+            rep->filters[0] = t;
+            rep->is_yuy2[0] = yuy2_exports;
+            count = 1;
+        }
+    }
+    return count;
+}
+
 int plugin_inspect_auf(const char *path, PluginReport *rep)
 {
     HMODULE mod = NULL;
-    GetFilterTableFn get1;
-    GetFilterTableListFn getN;
     char abs_path[MAX_PATH];
+    BOOL prefer_yuy2;
     int count = 0;
 
     if (!rep)
@@ -59,39 +110,14 @@ int plugin_inspect_auf(const char *path, PluginReport *rep)
     }
     rep->module = mod;
 
-    getN = (GetFilterTableListFn)GetProcAddress(mod, "GetFilterTableList");
-    if (!getN)
+    // 0x0042e920: prefer GetFilterTableYUY2/ListYUY2 when [system] yuy2mode=1, with fallback in both modes
+    prefer_yuy2 = editp_is_yuy2_mode();
+    count = populate_from_exports(mod, rep, prefer_yuy2);
+    if (count <= 0)
     {
-        getN = (GetFilterTableListFn)GetProcAddress(mod, "_GetFilterTableList@0");
+        count = populate_from_exports(mod, rep, !prefer_yuy2);
     }
-    get1 = (GetFilterTableFn)GetProcAddress(mod, "GetFilterTable");
-    if (!get1)
-    {
-        get1 = (GetFilterTableFn)GetProcAddress(mod, "_GetFilterTable@0");
-    }
-
-    if (getN)
-    {
-        FILTER_DLL **list = getN();
-        if (list)
-        {
-            while (list[count] && count < PLUGIN_MAX_FILTERS)
-            {
-                rep->filters[count] = list[count];
-                count++;
-            }
-        }
-    }
-    else if (get1)
-    {
-        FILTER_DLL *t = get1();
-        if (t)
-        {
-            rep->filters[0] = t;
-            count = 1;
-        }
-    }
-    else
+    if (count <= 0)
     {
         wsprintfA(rep->err, "missing GetFilterTable/GetFilterTableList export");
         FreeLibrary(mod);

@@ -4,6 +4,7 @@
 
 #include "i18n.h"
 #include "aviutl_dlg.h"
+#include "plugin_cache.h"
 
 #define I18N_MAX_PACKS 16
 #define I18N_CACHE_LOW 256
@@ -227,11 +228,17 @@ static void clear_string_cache(void)
 static void scan_aul_dir(const char *dir)
 {
     char pattern[MAX_PATH];
+    char exe_dir[MAX_PATH];
+    char ini_a[MAX_PATH];
     WIN32_FIND_DATAA fd;
     HANDLE hFind;
 
     if (!dir || !dir[0] || g_pack_count >= I18N_MAX_PACKS)
         return;
+
+    get_exe_dir(exe_dir, sizeof(exe_dir));
+    _snprintf(ini_a, sizeof(ini_a), "%saviutl.ini", exe_dir);
+    ini_a[sizeof(ini_a) - 1] = '\0';
 
     _snprintf(pattern, sizeof(pattern), "%s*.aul", dir);
     pattern[sizeof(pattern) - 1] = '\0';
@@ -247,6 +254,9 @@ static void scan_aul_dir(const char *dir)
         WORD lang = 0;
         HRSRC hRes;
         wchar_t nm[260], cr[260];
+        int cached_lang = 0;
+        char cached_nm_a[260] = {0};
+        char cached_cr_a[260] = {0};
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
@@ -255,6 +265,34 @@ static void scan_aul_dir(const char *dir)
 
         _snprintf(full, sizeof(full), "%s%s", dir, fd.cFileName);
         full[sizeof(full) - 1] = '\0';
+
+        // 0x004541e0: check [system] plugincache=1 before loading .aul resource DLL
+        if (plugin_cache_try_load(ini_a, full, &fd, 0,
+                                  &cached_lang, cached_nm_a, sizeof(cached_nm_a),
+                                  NULL, 0, NULL,
+                                  cached_cr_a, sizeof(cached_cr_a)) == PLUGIN_CACHE_HIT_NATIVE &&
+            cached_nm_a[0])
+        {
+            char sec[MAX_PATH], u8_nm[520] = {0}, u8_cr[520] = {0};
+            LangPackEntry *e = &g_packs[g_pack_count++];
+            ZeroMemory(e, sizeof(*e));
+            e->valid = TRUE;
+            e->is_exe = FALSE;
+            e->langid = (cached_lang > 0 && cached_lang != 0xFFFF) ? (LANGID)cached_lang : 0x0409;
+            lstrcpynA(e->path, full, sizeof(e->path));
+            plugin_cache_make_section(full, sec, sizeof(sec));
+            GetPrivateProfileStringA(sec, "name_u8", "", u8_nm, (DWORD)sizeof(u8_nm), ini_a);
+            GetPrivateProfileStringA(sec, "info_u8", "", u8_cr, (DWORD)sizeof(u8_cr), ini_a);
+            if (!u8_nm[0] || MultiByteToWideChar(CP_UTF8, 0, u8_nm, -1, e->name_w, 260) <= 0)
+            {
+                MultiByteToWideChar(CP_ACP, 0, cached_nm_a, -1, e->name_w, 260);
+            }
+            if (!u8_cr[0] || MultiByteToWideChar(CP_UTF8, 0, u8_cr, -1, e->credit_w, 260) <= 0)
+            {
+                MultiByteToWideChar(CP_ACP, 0, cached_cr_a, -1, e->credit_w, 260);
+            }
+            continue;
+        }
 
         // LOAD_LIBRARY_AS_DATAFILE allows 64-bit reaviutl to load 32-bit .aul resource DLLs
         hMod = LoadLibraryExA(full, NULL, LOAD_LIBRARY_AS_DATAFILE);
@@ -274,6 +312,26 @@ static void scan_aul_dir(const char *dir)
             if (load_string_from_mod(hMod, 1, cr, 260))
             {
                 lstrcpynW(e->credit_w, cr, 260);
+            }
+
+            if (plugin_cache_is_enabled(ini_a) &&
+                GetPrivateProfileIntA("system", "tempconfig", 0, ini_a) == 0)
+            {
+                int save_lang = (int)e->langid;
+                char nm_acp[260] = {0}, cr_acp[260] = {0};
+                char nm_u8[520] = {0}, cr_u8[520] = {0}, sec[MAX_PATH];
+                WideCharToMultiByte(CP_ACP, 0, e->name_w, -1, nm_acp, sizeof(nm_acp), NULL, NULL);
+                WideCharToMultiByte(CP_ACP, 0, e->credit_w, -1, cr_acp, sizeof(cr_acp), NULL, NULL);
+                plugin_cache_save(ini_a, full, &fd, 0, &save_lang,
+                                  nm_acp[0] ? nm_acp : fd.cFileName, NULL, cr_acp);
+                plugin_cache_make_section(full, sec, sizeof(sec));
+                if (sec[0])
+                {
+                    WideCharToMultiByte(CP_UTF8, 0, e->name_w, -1, nm_u8, sizeof(nm_u8), NULL, NULL);
+                    WideCharToMultiByte(CP_UTF8, 0, e->credit_w, -1, cr_u8, sizeof(cr_u8), NULL, NULL);
+                    WritePrivateProfileStringA(sec, "name_u8", nm_u8, ini_a);
+                    WritePrivateProfileStringA(sec, "info_u8", cr_u8, ini_a);
+                }
             }
         }
         FreeLibrary(hMod);

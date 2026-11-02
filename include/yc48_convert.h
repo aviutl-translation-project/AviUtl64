@@ -37,6 +37,10 @@ extern "C"
                          const PIXEL_YC *ycp, int yc_stride,
                          int w, int h, BOOL bt709);
 
+    // 0x00441060, [system] yuy2limit=1 ITU-R BT.601 studio-swing clamping (Y: 16..235, UV: 16..240)
+    void yc48_set_yuy2_limit(BOOL enable);
+    BOOL yc48_get_yuy2_limit(void);
+
     // 0x00420e70, format helpers ('DIB ', 'YUY2', 'YC48', and .auc fourccs)
     DWORD yc48_normalize_format(DWORD format);
     size_t yc48_format_frame_size(int w, int h, DWORD format);

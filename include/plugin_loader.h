@@ -13,6 +13,7 @@ typedef struct PluginReport
     void *module;
     int count;
     FILTER_DLL *filters[PLUGIN_MAX_FILTERS];
+    BOOL is_yuy2[PLUGIN_MAX_FILTERS];
     DWORD last_error;
     char err[256];
 } PluginReport;

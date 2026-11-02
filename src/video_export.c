@@ -13,6 +13,7 @@
 #include "avi_tools.h"
 #include "plugin_manager.h"
 #include "plugin_bridge.h"
+#include "plugin_cache.h"
 #include "builtin_filters.h"
 #include "yc48_convert.h"
 #include "exfunc.h"
@@ -989,12 +990,14 @@ static BOOL cb_exfunc_edit_output(EDITP *ep, const char *file, int flag, const c
 }
 
 static BOOL inspect_and_register_auo(const char *full_path, const char *file_name,
-                                     BOOL *saw_32bit_on_x64)
+                                     const WIN32_FIND_DATAA *fd, BOOL *saw_32bit_on_x64)
 {
     HMODULE mod;
     GET_OUTPUT_PLUGIN_TABLE_FN fn;
     OUTPUT_PLUGIN_TABLE *tbl;
     LocalAuoEntry *e;
+    char ini[MAX_PATH];
+    int host_arch = REAVIUTL_X64 ? 64 : 32;
     int k;
 
     if (g_local_auo_count >= AUO_MAX_PLUGINS)
@@ -1007,6 +1010,42 @@ static BOOL inspect_and_register_auo(const char *full_path, const char *file_nam
         if (lstrcmpiA(base, file_name) == 0)
         {
             return FALSE;
+        }
+    }
+
+    get_export_ini_path(ini, sizeof(ini));
+    if (fd)
+    {
+        int cached_flag = 0;
+        char cached_name[128] = {0};
+        char cached_flt[512] = {0};
+        char cached_info[256] = {0};
+        PluginCacheLookup clk = plugin_cache_try_load(
+            ini, full_path, fd, host_arch,
+            &cached_flag, cached_name, sizeof(cached_name),
+            cached_flt, sizeof(cached_flt), NULL,
+            cached_info, sizeof(cached_info));
+        if (clk == PLUGIN_CACHE_HIT_OTHER_ARCH)
+        {
+#if REAVIUTL_X64
+            if (saw_32bit_on_x64)
+                *saw_32bit_on_x64 = TRUE;
+#endif
+            return FALSE;
+        }
+        if (clk == PLUGIN_CACHE_HIT_NATIVE && cached_name[0])
+        {
+            e = &g_local_auos[g_local_auo_count++];
+            ZeroMemory(e, sizeof(*e));
+            lstrcpynA(e->path, full_path, MAX_PATH);
+            lstrcpynA(e->name, cached_name, sizeof(e->name));
+            copy_double_nul_filter(e->filefilter, sizeof(e->filefilter), cached_flt);
+            lstrcpynA(e->information, cached_info[0] ? cached_info : e->name, sizeof(e->information));
+            e->flag = cached_flag;
+            e->has_config = (cached_flag & OUTPUT_PLUGIN_TABLE_FLAG_HAS_CONFIG) != 0;
+            dbg_plugin("Cached output plugin [%d] '%s' (%s)",
+                       g_local_auo_count - 1, e->name, file_name);
+            return TRUE;
         }
     }
 
@@ -1056,6 +1095,12 @@ static BOOL inspect_and_register_auo(const char *full_path, const char *file_nam
     e->flag = tbl->flag | (tbl->func_config ? OUTPUT_PLUGIN_TABLE_FLAG_HAS_CONFIG : 0);
     e->has_config = (tbl->func_config != NULL);
 
+    if (fd)
+    {
+        plugin_cache_save(ini, full_path, fd, host_arch,
+                          &e->flag, e->name, e->filefilter, e->information);
+    }
+
     // match 0x0042ac80: release probe HMODULE now; lazy-load & func_init() on first use
     FreeLibrary(mod);
     dbg_plugin("Discovered output plugin [%d] '%s' (%s)",
@@ -1084,7 +1129,7 @@ static void scan_auo_dir_single(const char *dir, BOOL *saw_32bit_on_x64)
         if (g_local_auo_count >= AUO_MAX_PLUGINS)
             break;
         wsprintfA(full_path, "%s\\%s", dir, fd.cFileName);
-        inspect_and_register_auo(full_path, fd.cFileName, saw_32bit_on_x64);
+        inspect_and_register_auo(full_path, fd.cFileName, &fd, saw_32bit_on_x64);
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
@@ -1152,9 +1197,19 @@ BOOL video_export_load_single_auo(const char *auo_path, HWND main_hwnd, EDITP *e
         lstrcpynA(abs_path, auo_path, MAX_PATH);
     }
 
-    if (inspect_and_register_auo(abs_path, path_basename_dbcs(abs_path), &saw_32bit))
     {
-        return TRUE;
+        WIN32_FIND_DATAA fd;
+        HANDLE hf = FindFirstFileA(abs_path, &fd);
+        const WIN32_FIND_DATAA *fdp = NULL;
+        if (hf != INVALID_HANDLE_VALUE)
+        {
+            FindClose(hf);
+            fdp = &fd;
+        }
+        if (inspect_and_register_auo(abs_path, path_basename_dbcs(abs_path), fdp, &saw_32bit))
+        {
+            return TRUE;
+        }
     }
 
 #if REAVIUTL_X64

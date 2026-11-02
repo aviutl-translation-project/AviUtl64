@@ -12,6 +12,7 @@
 #include "aup_project.h"
 #include "editp.h"
 #include "exfunc.h"
+#include "yc48_convert.h"
 #include "i18n.h"
 #include "aviutl_dlg.h"
 #include "winsnap.h"
@@ -80,6 +81,7 @@ typedef struct
     int default_flag;
     int default_priority;
     BOOL is_builtin;
+    BOOL is_yuy2_filter;
     BOOL stage1_initialized;
     BOOL stage2_initialized;
     BOOL faulted;
@@ -122,6 +124,34 @@ static int g_menu_item_count = 0;
 static HWND g_main_hwnd = NULL;
 static HWND g_dummy_owner_hwnd = NULL;
 static BOOL g_classes_registered = FALSE;
+static unsigned char *g_yuy2_edit_buf = NULL;
+static unsigned char *g_yuy2_temp_buf = NULL;
+static size_t g_yuy2_buf_cap = 0;
+
+static BOOL ensure_yuy2_filter_buffers(int max_w, int max_h)
+{
+    size_t need;
+    if (max_w <= 0 || max_h <= 0)
+        return FALSE;
+    need = (size_t)max_w * (size_t)max_h * 2u + 64u;
+    if (need > g_yuy2_buf_cap || !g_yuy2_edit_buf || !g_yuy2_temp_buf)
+    {
+        unsigned char *ne = (unsigned char *)realloc(g_yuy2_edit_buf, need);
+        unsigned char *nt = (unsigned char *)realloc(g_yuy2_temp_buf, need);
+        if (!ne || !nt)
+        {
+            if (ne)
+                g_yuy2_edit_buf = ne;
+            if (nt)
+                g_yuy2_temp_buf = nt;
+            return FALSE;
+        }
+        g_yuy2_edit_buf = ne;
+        g_yuy2_temp_buf = nt;
+        g_yuy2_buf_cap = need;
+    }
+    return TRUE;
+}
 
 // shift-jis (CP932) to UTF-16 helper so Japanese plugin labels render on all locales
 static void sjis_to_wide(const char *src, wchar_t *dst, int dst_cch)
@@ -147,6 +177,7 @@ static void post_host_redraw(WPARAM kind)
 static BOOL safe_call_func_init(PluginEntry *e)
 {
     BOOL ok = FALSE;
+    editp_set_yuy2_sysinfo_override(e->is_yuy2_filter ? 1 : (e->is_builtin ? 0 : 2));
     __try
     {
         ok = e->runtime.func_init(&e->runtime);
@@ -156,6 +187,7 @@ static BOOL safe_call_func_init(PluginEntry *e)
         e->faulted = TRUE;
         ok = FALSE;
     }
+    editp_set_yuy2_sysinfo_override(0);
     return ok;
 }
 
@@ -165,6 +197,7 @@ static BOOL safe_call_wndproc(PluginEntry *e, HWND hwnd, UINT msg,
     BOOL res = FALSE;
     if (!e || e->faulted || !e->runtime.func_WndProc)
         return FALSE;
+    editp_set_yuy2_sysinfo_override(e->is_yuy2_filter ? 1 : (e->is_builtin ? 0 : 2));
     __try
     {
         res = e->runtime.func_WndProc(hwnd, msg, wp, lp, editp, &e->runtime);
@@ -175,6 +208,7 @@ static BOOL safe_call_wndproc(PluginEntry *e, HWND hwnd, UINT msg,
         e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
         res = FALSE;
     }
+    editp_set_yuy2_sysinfo_override(0);
     return res;
 }
 
@@ -183,6 +217,7 @@ static BOOL safe_call_func_proc(PluginEntry *e, FILTER_PROC_INFO *fpip)
     BOOL res = FALSE;
     if (!e || e->faulted || !e->runtime.func_proc)
         return FALSE;
+    editp_set_yuy2_sysinfo_override(e->is_yuy2_filter ? 1 : (e->is_builtin ? 0 : 2));
     __try
     {
         res = e->runtime.func_proc(&e->runtime, fpip);
@@ -193,6 +228,7 @@ static BOOL safe_call_func_proc(PluginEntry *e, FILTER_PROC_INFO *fpip)
         e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
         res = FALSE;
     }
+    editp_set_yuy2_sysinfo_override(0);
     return res;
 }
 
@@ -518,6 +554,39 @@ static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep, int frame
     fpip.audio_ch = editp_get_audio_ch(ep);
     fpip.pixelp = NULL;
     fpip.editp = ep;
+    if (e->is_yuy2_filter)
+    {
+        int prev_w = fpip.w, prev_h = fpip.h;
+        int yuy2_stride = fpip.max_w * 2;
+        if (!ensure_yuy2_filter_buffers(fpip.max_w, fpip.max_h))
+            return;
+        if (!yc48_to_yuy2(g_yuy2_edit_buf, yuy2_stride,
+                          editp_get_ycp_edit(ep), fpip.max_w, prev_w, prev_h))
+            return;
+        memset(g_yuy2_temp_buf, 0, (size_t)yuy2_stride * (size_t)fpip.max_h);
+        fpip.ycp_edit = (PIXEL_YC *)g_yuy2_edit_buf;
+        fpip.ycp_temp = (PIXEL_YC *)g_yuy2_temp_buf;
+        fpip.yc_size = 2;
+        fpip.line_size = yuy2_stride;
+        e->runtime_tail.mode_yuy2 = 1u;
+
+        safe_call_func_proc(e, &fpip);
+
+        if (!e->faulted && fpip.ycp_edit)
+        {
+            int out_w = (fpip.w > 0 && fpip.w <= fpip.max_w) ? fpip.w : prev_w;
+            int out_h = (fpip.h > 0 && fpip.h <= fpip.max_h) ? fpip.h : prev_h;
+            const unsigned char *res_yuy2 =
+                (fpip.ycp_edit == (PIXEL_YC *)g_yuy2_temp_buf)
+                    ? g_yuy2_temp_buf
+                    : (const unsigned char *)fpip.ycp_edit;
+            yuy2_to_yc48(editp_get_ycp_edit(ep), fpip.max_w,
+                         res_yuy2, yuy2_stride, out_w, out_h, FALSE);
+            editp_set_frame_dimensions(ep, out_w, out_h);
+        }
+        return;
+    }
+
     fpip.yc_size = (int)sizeof(PIXEL_YC);
     fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
 
@@ -1483,6 +1552,7 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp, BOOL de
             e->runtime_tail.hwnd_active_btn = e->hwnd_active_chk;
             e->runtime_tail.hmenu_main = host_menu;
             e->runtime_tail.hinst_parent = host_hinst;
+            e->runtime_tail.mode_yuy2 = e->is_yuy2_filter ? 1u : 0u;
 
             fl = e->runtime.flag;
             e->default_flag = fl;
@@ -1739,10 +1809,44 @@ static void scan_auf_directory(const char *dir, BOOL *saw_32bit_plugin_on_x64)
             e->module = (HMODULE)rep.module;
             e->src_dll = rep.filters[i];
             e->is_builtin = FALSE;
+            e->is_yuy2_filter = rep.is_yuy2[i];
             e->cmd_slot = g_next_seq_cmd_slot++;
             e->cmd_id = PLUGIN_CMD_WINDOW_BASE + e->cmd_slot;
             g_plugin_count++;
         }
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+// 0x0042c530 / 0x0042e920: scan one level of subdirectories under plugins\ for *.auf
+static void scan_auf_subdirectories(const char *plugin_dir, BOOL *saw_32bit_plugin_on_x64)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind;
+    char pattern[MAX_PATH];
+
+    if (!plugin_dir || !plugin_dir[0])
+        return;
+    _snprintf(pattern, sizeof(pattern), "%s\\*", plugin_dir);
+    pattern[sizeof(pattern) - 1] = '\0';
+
+    hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        char subdir[MAX_PATH];
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        if (fd.cFileName[0] == '.')
+            continue;
+        if (g_plugin_count >= MAX_PLUGINS)
+            break;
+        _snprintf(subdir, sizeof(subdir), "%s\\%s", plugin_dir, fd.cFileName);
+        subdir[sizeof(subdir) - 1] = '\0';
+        scan_auf_directory(subdir, saw_32bit_plugin_on_x64);
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
@@ -1819,6 +1923,7 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
     {
         scan_auf_directory(parent_dir, &saw_32bit_plugin_on_x64);
     }
+    scan_auf_subdirectories(plugin_dir, &saw_32bit_plugin_on_x64);
     scan_auf_directory(plugin_dir, &saw_32bit_plugin_on_x64);
 
     if (g_plugin_count > 0)
@@ -1908,6 +2013,7 @@ BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP 
         e->module = (HMODULE)rep.module;
         e->src_dll = rep.filters[i];
         e->is_builtin = FALSE;
+        e->is_yuy2_filter = rep.is_yuy2[i];
         e->cmd_slot = g_next_seq_cmd_slot++;
         e->cmd_id = PLUGIN_CMD_WINDOW_BASE + e->cmd_slot;
         g_plugin_count++;
@@ -2035,6 +2141,11 @@ void plugin_manager_shutdown(void)
     g_menu_item_count = 0;
     g_config_cmd_count = 0;
     g_next_seq_cmd_slot = 21;
+    free(g_yuy2_edit_buf);
+    free(g_yuy2_temp_buf);
+    g_yuy2_edit_buf = NULL;
+    g_yuy2_temp_buf = NULL;
+    g_yuy2_buf_cap = 0;
     aup_clear_preserved_chunks();
     editp_set_registered_filter_count(0);
 
@@ -3580,8 +3691,8 @@ int plugin_manager_apply_audio_filter(int filter_id, EDITP *ep, int frame_num,
     fpip.audio_n = samples;
     fpip.audio_ch = editp_get_audio_ch(ep);
     fpip.editp = ep;
-    fpip.yc_size = (int)sizeof(PIXEL_YC);
-    fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+    fpip.yc_size = e->is_yuy2_filter ? 2 : (int)sizeof(PIXEL_YC);
+    fpip.line_size = fpip.max_w * fpip.yc_size;
 
     safe_call_func_proc(e, &fpip);
     if (fpip.audio_n > 0)

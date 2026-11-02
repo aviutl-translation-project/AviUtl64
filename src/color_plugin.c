@@ -21,6 +21,7 @@ typedef struct ColorPluginEntry
     int flag;
     int builtin_kind; // 0 = external, 1 = bt601, 2 = bt709, 3 = auto
     BOOL inited;
+    BOOL is_yuy2_table;
     BOOL bridged_x86;
 } ColorPluginEntry;
 
@@ -172,6 +173,7 @@ static void load_single_auc(const char *full_path)
     GetColorPluginTableFn fn = NULL;
     COLOR_PLUGIN_TABLE *tbl = NULL;
     ColorPluginEntry *e;
+    BOOL used_yuy2 = FALSE;
 
     if (!full_path || !full_path[0] || g_color_count >= COLOR_PLUGIN_MAX || has_auc_path(full_path))
     {
@@ -191,6 +193,8 @@ static void load_single_auc(const char *full_path)
         {
             fn = (GetColorPluginTableFn)GetProcAddress(hmod, "_GetColorPluginTableYUY2@0");
         }
+        if (fn)
+            used_yuy2 = TRUE;
     }
     if (!fn)
     {
@@ -199,6 +203,16 @@ static void load_single_auc(const char *full_path)
         {
             fn = (GetColorPluginTableFn)GetProcAddress(hmod, "_GetColorPluginTable@0");
         }
+    }
+    if (!fn && !g_yuy2_mode)
+    {
+        fn = (GetColorPluginTableFn)GetProcAddress(hmod, "GetColorPluginTableYUY2");
+        if (!fn)
+        {
+            fn = (GetColorPluginTableFn)GetProcAddress(hmod, "_GetColorPluginTableYUY2@0");
+        }
+        if (fn)
+            used_yuy2 = TRUE;
     }
 
     if (fn)
@@ -241,6 +255,7 @@ static void load_single_auc(const char *full_path)
     e->flag = tbl->flag & ~COLOR_PLUGIN_FLAG_BUILTIN;
     e->builtin_kind = 0;
     e->inited = TRUE;
+    e->is_yuy2_table = used_yuy2;
 
     dbg_plugin("Loaded .auc color plugin: '%s' (%s)", e->name, full_path);
 }
@@ -471,6 +486,59 @@ static void fill_color_proc_info(COLOR_PROC_INFO *cpi, PIXEL_YC *ycp, int yc_str
     cpi->exec_multi_thread_func = exf ? exf->exec_multi_thread_func : NULL;
 }
 
+static BOOL invoke_auc_pixel2yc(ColorPluginEntry *e, COLOR_PROC_INFO *cpi,
+                                PIXEL_YC *ycp, int yc_stride, int w, int h)
+{
+    if (!e || e->builtin_kind != 0 || e->bridged_x86 || !e->table)
+        return FALSE;
+    if (!e->is_yuy2_table)
+        return seh_color_pixel2yc(e->table, cpi);
+    {
+        int yuy2_stride = ((w + 1) / 2) * 4;
+        unsigned char *yuy2_buf = (unsigned char *)calloc((size_t)yuy2_stride, (size_t)h);
+        COLOR_PROC_INFO ycpi = *cpi;
+        BOOL ok;
+        if (!yuy2_buf)
+            return FALSE;
+        ycpi.ycp = (PIXEL_YC *)yuy2_buf;
+        ycpi.yc_size = 2;
+        ycpi.line_size = yuy2_stride;
+        ok = seh_color_pixel2yc(e->table, &ycpi);
+        if (ok)
+        {
+            yuy2_to_yc48(ycp, yc_stride, yuy2_buf, yuy2_stride, w, h, FALSE);
+        }
+        free(yuy2_buf);
+        return ok;
+    }
+}
+
+static BOOL invoke_auc_yc2pixel(ColorPluginEntry *e, COLOR_PROC_INFO *cpi,
+                                const PIXEL_YC *ycp, int yc_stride, int w, int h)
+{
+    if (!e || e->builtin_kind != 0 || e->bridged_x86 || !e->table)
+        return FALSE;
+    if (!e->is_yuy2_table)
+        return seh_color_yc2pixel(e->table, cpi);
+    {
+        int yuy2_stride = ((w + 1) / 2) * 4;
+        unsigned char *yuy2_buf = (unsigned char *)malloc((size_t)yuy2_stride * (size_t)h);
+        COLOR_PROC_INFO ycpi = *cpi;
+        BOOL ok = FALSE;
+        if (!yuy2_buf)
+            return FALSE;
+        if (yc48_to_yuy2(yuy2_buf, yuy2_stride, ycp, yc_stride, w, h))
+        {
+            ycpi.ycp = (PIXEL_YC *)yuy2_buf;
+            ycpi.yc_size = 2;
+            ycpi.line_size = yuy2_stride;
+            ok = seh_color_yc2pixel(e->table, &ycpi);
+        }
+        free(yuy2_buf);
+        return ok;
+    }
+}
+
 // 0x00425100: convert raw pixel format to yc48
 BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
                            const void *pixelp, DWORD format,
@@ -503,25 +571,15 @@ BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
     // explicit external .auc selection first
     if (sel >= 0 && sel < g_color_count)
     {
-        ColorPluginEntry *es = &g_color_plugins[sel];
-        if (es->builtin_kind == 0 && !es->bridged_x86 && es->table)
-        {
-            if (seh_color_pixel2yc(es->table, &cpi))
-                return TRUE;
-        }
+        if (invoke_auc_pixel2yc(&g_color_plugins[sel], &cpi, ycp, yc_stride, w, h))
+            return TRUE;
     }
 
     // try native external .auc plugins
     for (i = 0; i < g_color_count; i++)
     {
-        ColorPluginEntry *e = &g_color_plugins[i];
-        if (e->builtin_kind == 0 && !e->bridged_x86 && e->table)
-        {
-            if (seh_color_pixel2yc(e->table, &cpi))
-            {
-                return TRUE;
-            }
-        }
+        if (invoke_auc_pixel2yc(&g_color_plugins[i], &cpi, ycp, yc_stride, w, h))
+            return TRUE;
     }
 
     // built-in "自動" (auto: BT.601 for h < 720, BT.709 for h >= 720) handles YUY2
@@ -565,24 +623,14 @@ BOOL color_plugin_yc2pixel(void *pixelp, const PIXEL_YC *ycp, int yc_stride,
 
     if (sel >= 0 && sel < g_color_count)
     {
-        ColorPluginEntry *es = &g_color_plugins[sel];
-        if (es->builtin_kind == 0 && !es->bridged_x86 && es->table)
-        {
-            if (seh_color_yc2pixel(es->table, &cpi))
-                return TRUE;
-        }
+        if (invoke_auc_yc2pixel(&g_color_plugins[sel], &cpi, ycp, yc_stride, w, h))
+            return TRUE;
     }
 
     for (i = 0; i < g_color_count; i++)
     {
-        ColorPluginEntry *e = &g_color_plugins[i];
-        if (e->builtin_kind == 0 && !e->bridged_x86 && e->table)
-        {
-            if (seh_color_yc2pixel(e->table, &cpi))
-            {
-                return TRUE;
-            }
-        }
+        if (invoke_auc_yc2pixel(&g_color_plugins[i], &cpi, ycp, yc_stride, w, h))
+            return TRUE;
     }
 
     if (norm == 0x32595559u) // "YUY2"

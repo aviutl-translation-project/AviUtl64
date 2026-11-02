@@ -183,6 +183,8 @@ static int g_sys_max_h = REAVIUTL_DEFAULT_VRAM_H;
 static int g_sys_max_frame = REAVIUTL_DEFAULT_MAX_FRAME;
 static BOOL g_sys_use_sse = TRUE;
 static BOOL g_sys_use_sse2 = TRUE;
+static BOOL g_sys_yuy2_mode = FALSE;
+static int g_sys_yuy2_override = 0; // 0 = default, 1 = force YUY2 (2), 2 = force YC48 (6)
 
 void editp_set_sys_limits(int max_w, int max_h, int max_frame)
 {
@@ -212,6 +214,18 @@ void editp_reload_sys_flags_from_ini(const char *ini_path)
         return;
     g_sys_use_sse = GetPrivateProfileIntA("system", "sse", 1, ini_path) != 0;
     g_sys_use_sse2 = GetPrivateProfileIntA("system", "sse2", 1, ini_path) != 0;
+    g_sys_yuy2_mode = GetPrivateProfileIntA("system", "yuy2mode", 0, ini_path) != 0;
+    yc48_set_yuy2_limit(GetPrivateProfileIntA("system", "yuy2limit", 0, ini_path) != 0);
+}
+
+BOOL editp_is_yuy2_mode(void)
+{
+    return g_sys_yuy2_mode;
+}
+
+void editp_set_yuy2_sysinfo_override(int override_mode)
+{
+    g_sys_yuy2_override = override_mode;
 }
 
 void editp_init_sys_limits_from_ini(const char *ini_path)
@@ -1309,7 +1323,22 @@ BOOL editp_load_frame(EDITP *ep, int frame_num)
         ep->abi.vram_cur_h = ep->h;
     }
 
-    return read_mapped_video_frame(ep, frame_num, ep->ycp_edit, ep->max_w, ep->w, ep->h);
+    if (!read_mapped_video_frame(ep, frame_num, ep->ycp_edit, ep->max_w, ep->w, ep->h))
+    {
+        return FALSE;
+    }
+    if (g_sys_yuy2_mode && ep->ycp_edit && ep->ycp_temp && ep->w > 0 && ep->h > 0)
+    {
+        int yuy2_stride = ((ep->w + 1) / 2) * 4;
+        if (yc48_to_yuy2((unsigned char *)ep->ycp_temp, yuy2_stride,
+                         ep->ycp_edit, ep->max_w, ep->w, ep->h))
+        {
+            yuy2_to_yc48(ep->ycp_edit, ep->max_w,
+                         (const unsigned char *)ep->ycp_temp, yuy2_stride,
+                         ep->w, ep->h, FALSE);
+        }
+    }
+    return TRUE;
 }
 
 BOOL editp_read_source_frame(EDITP *ep, int frame_num, PIXEL_YC *dst, int dst_stride)
@@ -2521,8 +2550,14 @@ void editp_get_sys_info(EDITP *ep, SYS_INFO *si)
     si->output_name = ep ? ep->abi.output_name : g_empty_str;
     si->vram_w = vram_w;
     si->vram_h = vram_h;
-    si->vram_byte_size = sizeof(PIXEL_YC);
-    si->vram_yc_size = vram_w * (int)sizeof(PIXEL_YC);
+    {
+        BOOL report_yuy2 = (g_sys_yuy2_override == 1)
+                               ? TRUE
+                               : ((g_sys_yuy2_override == 2) ? FALSE : g_sys_yuy2_mode);
+        int yc_sz = report_yuy2 ? 2 : (int)sizeof(PIXEL_YC);
+        si->vram_byte_size = yc_sz;
+        si->vram_yc_size = vram_w * yc_sz;
+    }
     si->hfont = editp_get_ui_font();
     si->build = REAVIUTL_BUILD;
     si->reserve[0] = 0;

@@ -17,6 +17,8 @@ void editp_set_sys_limits(int max_w, int max_h, int max_frame);
 int editp_get_sys_max_w(void);
 int editp_get_sys_max_h(void);
 int editp_get_sys_max_frame(void);
+BOOL editp_is_yuy2_mode(void);
+void editp_set_yuy2_sysinfo_override(int override_mode);
 
 #define REAVIUTL_VRAM_W (editp_get_sys_max_w())
 #define REAVIUTL_VRAM_H (editp_get_sys_max_h())

@@ -389,6 +389,8 @@ extern "C"
 #endif
     FILTER *__stdcall GetFilterTable(void);
     FILTER **__stdcall GetFilterTableList(void);
+    FILTER *__stdcall GetFilterTableYUY2(void);
+    FILTER **__stdcall GetFilterTableListYUY2(void);
 #ifdef __cplusplus
 }
 #endif

@@ -3,6 +3,18 @@
 #include "yc48_convert.h"
 #include "color_plugin.h"
 
+static BOOL g_yuy2_limit = FALSE;
+
+void yc48_set_yuy2_limit(BOOL enable)
+{
+    g_yuy2_limit = enable ? TRUE : FALSE;
+}
+
+BOOL yc48_get_yuy2_limit(void)
+{
+    return g_yuy2_limit;
+}
+
 static __inline unsigned char clamp_u8(int v)
 {
     if (v < 0)
@@ -13,6 +25,24 @@ static __inline unsigned char clamp_u8(int v)
     {
         return 255;
     }
+    return (unsigned char)v;
+}
+
+static __inline unsigned char clamp_y_tv(int v)
+{
+    if (v < 16)
+        return 16;
+    if (v > 235)
+        return 235;
+    return (unsigned char)v;
+}
+
+static __inline unsigned char clamp_uv_tv(int v)
+{
+    if (v < 16)
+        return 16;
+    if (v > 240)
+        return 240;
     return (unsigned char)v;
 }
 
@@ -255,10 +285,20 @@ BOOL yc48_to_yuy2_ex(unsigned char *dst_yuy2, int dst_stride,
                 y1 = 16 + ((187 * r1 + 629 * g1 + 63 * b1 + 512) >> 10);
                 u0 = 128 + ((-103 * r0 - 347 * g0 + 450 * b0 + 512) >> 10);
                 v0 = 128 + ((450 * r0 - 409 * g0 - 41 * b0 + 512) >> 10);
-                dst[(x / 2) * 4 + 0] = clamp_u8(y0);
-                dst[(x / 2) * 4 + 1] = clamp_u8(u0);
-                dst[(x / 2) * 4 + 2] = clamp_u8(y1);
-                dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+                if (g_yuy2_limit)
+                {
+                    dst[(x / 2) * 4 + 0] = clamp_y_tv(y0);
+                    dst[(x / 2) * 4 + 1] = clamp_uv_tv(u0);
+                    dst[(x / 2) * 4 + 2] = clamp_y_tv(y1);
+                    dst[(x / 2) * 4 + 3] = clamp_uv_tv(v0);
+                }
+                else
+                {
+                    dst[(x / 2) * 4 + 0] = clamp_u8(y0);
+                    dst[(x / 2) * 4 + 1] = clamp_u8(u0);
+                    dst[(x / 2) * 4 + 2] = clamp_u8(y1);
+                    dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+                }
             }
             else
             {
@@ -266,10 +306,20 @@ BOOL yc48_to_yuy2_ex(unsigned char *dst_yuy2, int dst_stride,
                 int u0 = (((int)clamp_s16((int)p0->cb + 2350) * 14336) >> 16) >> 2;
                 int y1 = (((int)clamp_s16((int)p1->y + 301) * 14016) >> 16) >> 2;
                 int v0 = (((int)clamp_s16((int)p0->cr + 2350) * 14336) >> 16) >> 2;
-                dst[(x / 2) * 4 + 0] = clamp_u8(y0);
-                dst[(x / 2) * 4 + 1] = clamp_u8(u0);
-                dst[(x / 2) * 4 + 2] = clamp_u8(y1);
-                dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+                if (g_yuy2_limit)
+                {
+                    dst[(x / 2) * 4 + 0] = clamp_y_tv(y0);
+                    dst[(x / 2) * 4 + 1] = clamp_uv_tv(u0);
+                    dst[(x / 2) * 4 + 2] = clamp_y_tv(y1);
+                    dst[(x / 2) * 4 + 3] = clamp_uv_tv(v0);
+                }
+                else
+                {
+                    dst[(x / 2) * 4 + 0] = clamp_u8(y0);
+                    dst[(x / 2) * 4 + 1] = clamp_u8(u0);
+                    dst[(x / 2) * 4 + 2] = clamp_u8(y1);
+                    dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+                }
             }
         }
     }

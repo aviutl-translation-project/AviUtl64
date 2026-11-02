@@ -4,6 +4,9 @@
 #include <msacm.h>
 #include "vfw_input.h"
 #include "yc48_convert.h"
+#include "color_plugin.h"
+#include "input_plugin.h"
+#include "plugin_bridge.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,18 +34,23 @@ typedef enum
     INPUT_KIND_VFW = 0,
     INPUT_KIND_EXEDIT_CANVAS = 1,
     INPUT_KIND_STILL_IMAGE = 2,
-    INPUT_KIND_AUDIO_FILE = 3
+    INPUT_KIND_AUDIO_FILE = 3,
+    INPUT_KIND_AUI_NATIVE = 4,
+    INPUT_KIND_AUI_BRIDGED = 5
 } InputKind;
 
 typedef enum
 {
     AUDIO_SRC_NONE = 0,
-    AUDIO_SRC_SILENT = 1,  // .exedit virtual canvas
-    AUDIO_SRC_WAV_PCM = 2, // uncompressed WAV (PCM 8/16/24/32 or IEEE Float 32/64)
-    AUDIO_SRC_WAV_ACM = 3, // compressed WAV chunk decoded via msacm32.dll
-    AUDIO_SRC_MP3_ACM = 4, // indexed MPEG-1/2/2.5 Layer III frames via msacm32.dll
-    AUDIO_SRC_VFW_PCM = 5, // uncompressed AVI audio stream via AVIStreamRead
-    AUDIO_SRC_VFW_ACM = 6  // compressed AVI audio stream via AVIStreamRead + ACM
+    AUDIO_SRC_SILENT = 1,     // .exedit virtual canvas
+    AUDIO_SRC_WAV_PCM = 2,    // uncompressed WAV (PCM 8/16/24/32 or IEEE Float 32/64)
+    AUDIO_SRC_WAV_ACM = 3,    // compressed WAV chunk decoded via msacm32.dll
+    AUDIO_SRC_MP3_ACM = 4,    // indexed MPEG-1/2/2.5 Layer III frames via msacm32.dll
+    AUDIO_SRC_VFW_PCM = 5,    // uncompressed AVI audio stream via AVIStreamRead
+    AUDIO_SRC_VFW_ACM = 6,    // compressed AVI audio stream via AVIStreamRead + ACM
+    AUDIO_SRC_AUI_PCM = 7,    // uncompressed PCM/Float audio via .aui func_read_audio
+    AUDIO_SRC_AUI_ACM = 8,    // compressed audio via .aui func_read_audio + ACM
+    AUDIO_SRC_AUI_BRIDGED = 9 // 32-bit .aui audio via IPC bridge
 } AudioSrcKind;
 
 typedef struct
@@ -125,6 +133,28 @@ struct VFWInput
     PIXEL *rgb_buffer;         // top-down PIXEL[width * height]
     unsigned char *dib_buffer; // bottom-up BGR24 or BGRA32 for avi_file_get_video_pixelp
     size_t dib_size;
+    PIXEL_YC *aui_yc_tmp;
+
+    // native / bridged .aui state
+    InputPluginInstance *aui_inst;
+    int aui_flags;
+    DWORD aui_vid_comp;
+    int aui_vid_bpp;
+    BOOL aui_vid_bottom_up;
+    uint32_t aui_vid_gmask;
+    BITMAPINFOHEADER *aui_vid_bih;
+    int aui_vid_bih_bytes;
+    unsigned char *aui_vid_buf;
+    size_t aui_vid_buf_cap;
+    HIC aui_hic;
+    BITMAPINFOHEADER aui_hic_out_bih;
+    unsigned char *aui_hic_out_buf;
+    int aui_last_decoded_frame;
+    int aui_aud_block_align;
+    int aui_aud_raw_ch;
+    BOOL aui_aud_is_float;
+    int aui_aud_cur_pos;
+    int bridge_aui_slot;
 };
 
 static BOOL g_vfw_initialized = FALSE;
@@ -811,7 +841,7 @@ static BOOL index_mp3_stream(VFWInput *input, HANDLE hf, uint64_t start_off, uin
     return TRUE;
 }
 
-static BOOL try_open_wav_or_mp3_file(VFWInput *input, const char *filepath)
+static BOOL try_open_wav_or_mp3_file(VFWInput *input, const char *filepath, BOOL wav_only)
 {
     HANDLE hf;
     LARGE_INTEGER fsz;
@@ -992,6 +1022,12 @@ static BOOL try_open_wav_or_mp3_file(VFWInput *input, const char *filepath)
             }
         }
         free(pwfx);
+        CloseHandle(hf);
+        return FALSE;
+    }
+
+    if (wav_only)
+    {
         CloseHandle(hf);
         return FALSE;
     }
@@ -1349,25 +1385,450 @@ BOOL vfw_input_get_file_info(VFWInput *input, FILE_INFO *fi)
         fi->audio_ch = input->req_audio_ch;
         if (input->src_audio_samples > 0 && input->src_audio_rate > 0)
         {
-            fi->audio_n = (int)(((int64_t)input->src_audio_samples * input->req_audio_rate) /
-                                input->src_audio_rate);
+            int64_t scaled = ((int64_t)input->src_audio_samples * input->req_audio_rate) /
+                             input->src_audio_rate;
+            if (scaled > 0x7FFFFFFFLL)
+                scaled = 0x7FFFFFFFLL;
+            fi->audio_n = (int)scaled;
         }
         else if (fi->frame_n > 0 && fi->video_rate > 0)
         {
-            fi->audio_n = (int)(((int64_t)fi->frame_n * fi->audio_rate * fi->video_scale) /
-                                fi->video_rate);
+            int64_t scaled = ((int64_t)fi->frame_n * fi->audio_rate * fi->video_scale) /
+                             fi->video_rate;
+            if (scaled > 0x7FFFFFFFLL)
+                scaled = 0x7FFFFFFFLL;
+            fi->audio_n = (int)scaled;
         }
     }
     return TRUE;
 }
 
-VFWInput *vfw_input_open_ex(const char *filepath, FILE_INFO *fi, int open_flag)
+static VFWInput *alloc_vfw_input(const char *filepath)
 {
-    VFWInput *input;
+    VFWInput *input = (VFWInput *)calloc(1, sizeof(VFWInput));
+    if (!input)
+    {
+        return NULL;
+    }
+    input->hfile = INVALID_HANDLE_VALUE;
+    input->aui_last_decoded_frame = -1;
+    input->bridge_aui_slot = -1;
+    strncpy(input->filepath, filepath, MAX_PATH - 1);
+    input->filepath[MAX_PATH - 1] = '\0';
+    return input;
+}
+
+static BOOL try_open_avi_vfw(VFWInput *input, const char *filepath, BOOL want_video, BOOL want_audio)
+{
     AVISTREAMINFOA asi;
     BITMAPINFOHEADER req_bih;
     HRESULT hr;
+    BOOL video_ok = FALSE;
+    BOOL audio_ok = FALSE;
+
+    hr = AVIFileOpenA(&input->pavi_file, filepath, OF_READ | OF_SHARE_DENY_WRITE, NULL);
+    if (FAILED(hr) || !input->pavi_file)
+    {
+        input->pavi_file = NULL;
+        return FALSE;
+    }
+
+    if (want_video &&
+        SUCCEEDED(AVIFileGetStream(input->pavi_file, &input->pavi_stream, streamtypeVIDEO, 0)) &&
+        input->pavi_stream &&
+        SUCCEEDED(AVIStreamInfoA(input->pavi_stream, &asi, sizeof(asi))))
+    {
+        input->width = asi.rcFrame.right - asi.rcFrame.left;
+        input->height = asi.rcFrame.bottom - asi.rcFrame.top;
+        input->frame_count = (int)AVIStreamLength(input->pavi_stream);
+        input->fps_num = (int)(asi.dwRate ? asi.dwRate : 30);
+        input->fps_den = (int)(asi.dwScale ? asi.dwScale : 1);
+
+        memset(&req_bih, 0, sizeof(req_bih));
+        req_bih.biSize = sizeof(req_bih);
+        req_bih.biWidth = input->width;
+        req_bih.biHeight = input->height;
+        req_bih.biPlanes = 1;
+        req_bih.biBitCount = 24;
+        req_bih.biCompression = BI_RGB;
+
+        input->pgf = AVIStreamGetFrameOpen(input->pavi_stream, &req_bih);
+        if (!input->pgf)
+        {
+            input->pgf = AVIStreamGetFrameOpen(input->pavi_stream, NULL);
+        }
+        if (input->pgf && input->width > 0 && input->height > 0)
+        {
+            LPBITMAPINFOHEADER pbmi0 =
+                (LPBITMAPINFOHEADER)AVIStreamGetFrame(input->pgf, 0);
+            input->decode_bpp = (pbmi0 && pbmi0->biBitCount == 32) ? 32 : 24;
+            input->rgb_buffer = (PIXEL *)calloc(
+                (size_t)input->width * (size_t)input->height, sizeof(PIXEL));
+            if (input->rgb_buffer)
+            {
+                video_ok = TRUE;
+            }
+        }
+    }
+
+    if (want_audio &&
+        SUCCEEDED(AVIFileGetStream(input->pavi_file, &input->pavi_audio, streamtypeAUDIO, 0)) &&
+        input->pavi_audio)
+    {
+        if (init_vfw_audio_stream(input, input->pavi_audio))
+        {
+            audio_ok = TRUE;
+        }
+        else
+        {
+            AVIStreamRelease(input->pavi_audio);
+            input->pavi_audio = NULL;
+        }
+    }
+
+    if (video_ok || audio_ok)
+    {
+        input->kind = video_ok ? INPUT_KIND_VFW : INPUT_KIND_AUDIO_FILE;
+        if (!video_ok)
+        {
+            if (input->pgf)
+            {
+                AVIStreamGetFrameClose(input->pgf);
+                input->pgf = NULL;
+            }
+            if (input->pavi_stream)
+            {
+                AVIStreamRelease(input->pavi_stream);
+                input->pavi_stream = NULL;
+            }
+            input->width = 0;
+            input->height = 0;
+            input->frame_count = 0;
+        }
+        return TRUE;
+    }
+
+    if (input->pgf)
+    {
+        AVIStreamGetFrameClose(input->pgf);
+        input->pgf = NULL;
+    }
+    if (input->pavi_audio)
+    {
+        AVIStreamRelease(input->pavi_audio);
+        input->pavi_audio = NULL;
+    }
+    if (input->pavi_stream)
+    {
+        AVIStreamRelease(input->pavi_stream);
+        input->pavi_stream = NULL;
+    }
+    AVIFileRelease(input->pavi_file);
+    input->pavi_file = NULL;
+    return FALSE;
+}
+
+static BOOL try_open_native_aui(VFWInput *input, int aui_idx, const char *filepath,
+                                BOOL want_video, BOOL want_audio)
+{
+    INPUT_INFO iip;
+    InputPluginInstance *inst;
+    BOOL video_ok = FALSE;
+    BOOL audio_ok = FALSE;
+
+    memset(&iip, 0, sizeof(iip));
+    inst = input_plugin_open_native(aui_idx, filepath, &iip);
+    if (!inst)
+    {
+        return FALSE;
+    }
+
+    if (want_video && (iip.flag & INPUT_INFO_FLAG_VIDEO) && iip.format)
+    {
+        const BITMAPINFOHEADER *pfmt = (const BITMAPINFOHEADER *)iip.format;
+        int w = (int)pfmt->biWidth;
+        int raw_h = (int)pfmt->biHeight;
+        int h = (raw_h < 0) ? -raw_h : raw_h;
+        if (w > 0 && h > 0)
+        {
+            int bih_sz = iip.format_size;
+            size_t raw_cap;
+            if (bih_sz < (int)sizeof(BITMAPINFOHEADER))
+                bih_sz = (int)sizeof(BITMAPINFOHEADER);
+            if ((int)pfmt->biSize > bih_sz && pfmt->biSize <= 65536u)
+                bih_sz = (int)pfmt->biSize;
+
+            input->aui_vid_bih = (BITMAPINFOHEADER *)calloc(1, (size_t)bih_sz + 16u);
+            raw_cap = (size_t)w * (size_t)h * 8u + 4096u;
+            if ((size_t)pfmt->biSizeImage + 4096u > raw_cap)
+                raw_cap = (size_t)pfmt->biSizeImage + 4096u;
+            input->aui_vid_buf = (unsigned char *)calloc(1, raw_cap);
+
+            if (input->aui_vid_bih && input->aui_vid_buf)
+            {
+                DWORD comp = pfmt->biCompression;
+                int bpp = pfmt->biBitCount ? (int)pfmt->biBitCount : 24;
+                if (iip.format_size > 0)
+                    memcpy(input->aui_vid_bih, pfmt, (size_t)iip.format_size);
+                else
+                    memcpy(input->aui_vid_bih, pfmt, sizeof(BITMAPINFOHEADER));
+
+                input->aui_vid_bih_bytes = bih_sz;
+                input->aui_vid_buf_cap = raw_cap;
+                input->aui_vid_comp = comp;
+                input->aui_vid_bpp = bpp;
+                input->aui_vid_bottom_up = (raw_h >= 0);
+                input->aui_vid_gmask = 0x03E0u;
+                if (comp == BI_BITFIELDS && bih_sz >= (int)(sizeof(BITMAPINFOHEADER) + 12))
+                {
+                    memcpy(&input->aui_vid_gmask,
+                           ((const unsigned char *)input->aui_vid_bih) + sizeof(BITMAPINFOHEADER) + 4,
+                           4);
+                }
+
+                input->width = w;
+                input->height = h;
+                input->frame_count = (iip.n > 0) ? iip.n : 1;
+                input->fps_num = (iip.rate > 0) ? iip.rate : 30;
+                input->fps_den = (iip.scale > 0) ? iip.scale : 1;
+                input->decode_bpp = (bpp == 32) ? 32 : 24;
+
+                // try opening a VCM decompressor if FourCC is neither RGB/YC48 nor YUY2
+                if (comp != BI_RGB && comp != BI_BITFIELDS &&
+                    comp != 0x38344359u && comp != 0x32595559u)
+                {
+                    memset(&input->aui_hic_out_bih, 0, sizeof(input->aui_hic_out_bih));
+                    input->aui_hic_out_bih.biSize = sizeof(BITMAPINFOHEADER);
+                    input->aui_hic_out_bih.biWidth = w;
+                    input->aui_hic_out_bih.biHeight = h;
+                    input->aui_hic_out_bih.biPlanes = 1;
+                    input->aui_hic_out_bih.biBitCount = 24;
+                    input->aui_hic_out_bih.biCompression = BI_RGB;
+                    input->aui_hic_out_bih.biSizeImage = (DWORD)(((w * 3 + 3) & ~3) * h);
+
+                    input->aui_hic = ICLocate(ICTYPE_VIDEO, 0,
+                                              input->aui_vid_bih,
+                                              &input->aui_hic_out_bih,
+                                              ICMODE_DECOMPRESS);
+                    if (input->aui_hic)
+                    {
+                        if (ICDecompressBegin(input->aui_hic,
+                                              input->aui_vid_bih,
+                                              &input->aui_hic_out_bih) == ICERR_OK)
+                        {
+                            input->aui_hic_out_buf = (unsigned char *)calloc(
+                                1, (size_t)input->aui_hic_out_bih.biSizeImage + 64u);
+                        }
+                        if (!input->aui_hic_out_buf)
+                        {
+                            ICClose(input->aui_hic);
+                            input->aui_hic = NULL;
+                        }
+                    }
+                }
+
+                video_ok = TRUE;
+            }
+        }
+    }
+
+    if (want_audio && (iip.flag & INPUT_INFO_FLAG_AUDIO) &&
+        iip.audio_format && iip.audio_n > 0 &&
+        ((const WAVEFORMATEX *)iip.audio_format)->nSamplesPerSec > 0 &&
+        ((const WAVEFORMATEX *)iip.audio_format)->nChannels > 0)
+    {
+        WAVEFORMATEX *pwfx = (WAVEFORMATEX *)iip.audio_format;
+        WORD tag = pwfx->wFormatTag;
+        WORD bits = pwfx->wBitsPerSample;
+
+        if (tag == WAVE_FORMAT_EXTENSIBLE && iip.audio_format_size >= 40)
+        {
+            static const unsigned char s_guid_tail[12] = {
+                0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+            const unsigned char *sub = ((const unsigned char *)pwfx) + 24;
+            uint32_t sub_tag = 0;
+            memcpy(&sub_tag, sub, 4);
+            if (memcmp(sub + 4, s_guid_tail, 12) == 0 &&
+                (sub_tag == WAVE_FORMAT_PCM || sub_tag == WAVE_FORMAT_IEEE_FLOAT))
+            {
+                tag = (WORD)sub_tag;
+            }
+        }
+
+        input->src_audio_rate = (int)pwfx->nSamplesPerSec;
+        input->src_audio_ch = (pwfx->nChannels >= 2) ? 2 : 1;
+        input->req_audio_rate = input->src_audio_rate;
+        input->req_audio_ch = input->src_audio_ch;
+
+        if ((tag == WAVE_FORMAT_PCM && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) ||
+            (tag == WAVE_FORMAT_IEEE_FLOAT && (bits == 32 || bits == 64)))
+        {
+            int blk = (int)pwfx->nBlockAlign;
+            if (blk <= 0)
+                blk = (int)pwfx->nChannels * (bits / 8);
+            if (blk > 0)
+            {
+                input->audio_kind = AUDIO_SRC_AUI_PCM;
+                input->src_audio_bits = (int)bits;
+                input->src_audio_samples = iip.audio_n;
+                input->aui_aud_raw_ch = (int)pwfx->nChannels;
+                input->aui_aud_is_float = (tag == WAVE_FORMAT_IEEE_FLOAT);
+                input->aui_aud_block_align = blk;
+                audio_ok = TRUE;
+            }
+        }
+        else if (acm_init_decoder(input, pwfx))
+        {
+            input->audio_kind = AUDIO_SRC_AUI_ACM;
+            input->src_audio_bits = 16;
+            input->aui_aud_block_align = (pwfx->nBlockAlign > 0) ? (int)pwfx->nBlockAlign : 1;
+            input->aui_aud_cur_pos = 0;
+            if (iip.n > 0 && iip.rate > 0 && iip.scale > 0)
+            {
+                int64_t est = ((int64_t)iip.n * input->src_audio_rate * iip.scale) / iip.rate;
+                if (est > 0x7FFFFFFFLL)
+                    est = 0x7FFFFFFFLL;
+                input->src_audio_samples = (int)est;
+            }
+            else
+            {
+                input->src_audio_samples = iip.audio_n;
+            }
+            audio_ok = (input->src_audio_samples > 0);
+        }
+    }
+
+    if (!video_ok && !audio_ok)
+    {
+        if (input->aui_hic)
+        {
+            ICDecompressEnd(input->aui_hic);
+            ICClose(input->aui_hic);
+            input->aui_hic = NULL;
+        }
+        free(input->aui_hic_out_buf);
+        input->aui_hic_out_buf = NULL;
+        free(input->aui_vid_bih);
+        input->aui_vid_bih = NULL;
+        free(input->aui_vid_buf);
+        input->aui_vid_buf = NULL;
+        input_plugin_close_native(inst);
+        return FALSE;
+    }
+
+    input->aui_inst = inst;
+    input->aui_flags = iip.flag;
+    input->aui_last_decoded_frame = -1;
+    input->kind = video_ok ? INPUT_KIND_AUI_NATIVE : INPUT_KIND_AUDIO_FILE;
+    if (!video_ok)
+    {
+        free(input->aui_vid_bih);
+        input->aui_vid_bih = NULL;
+        free(input->aui_vid_buf);
+        input->aui_vid_buf = NULL;
+        input->width = 0;
+        input->height = 0;
+        input->frame_count = 0;
+    }
+    return TRUE;
+}
+
+static BOOL try_open_bridged_aui(VFWInput *input, int bridge_aui_idx, const char *filepath,
+                                 int open_flag, BOOL want_video, BOOL want_audio)
+{
+    BridgeAuiOpenInfo binfo;
+    int slot;
+    BOOL video_ok = FALSE;
+    BOOL audio_ok = FALSE;
+
+    memset(&binfo, 0, sizeof(binfo));
+    slot = plugin_bridge_aui_open(bridge_aui_idx, filepath, open_flag, &binfo);
+    if (slot < 0)
+    {
+        return FALSE;
+    }
+
+    if (want_video && binfo.has_video && binfo.w > 0 && binfo.h > 0)
+    {
+        input->width = binfo.w;
+        input->height = binfo.h;
+        input->frame_count = (binfo.frame_n > 0) ? binfo.frame_n : 1;
+        input->fps_num = (binfo.video_rate > 0) ? binfo.video_rate : 30;
+        input->fps_den = (binfo.video_scale > 0) ? binfo.video_scale : 1;
+        input->decode_bpp = binfo.decode_bpp ? binfo.decode_bpp : 24;
+        video_ok = TRUE;
+    }
+
+    if (want_audio && binfo.has_audio &&
+        binfo.audio_rate > 0 && binfo.audio_ch > 0 && binfo.audio_n > 0)
+    {
+        input->audio_kind = AUDIO_SRC_AUI_BRIDGED;
+        input->src_audio_rate = binfo.audio_rate;
+        input->src_audio_ch = (binfo.audio_ch >= 2) ? 2 : 1;
+        input->src_audio_bits = 16;
+        input->src_audio_samples = binfo.audio_n;
+        input->req_audio_rate = input->src_audio_rate;
+        input->req_audio_ch = input->src_audio_ch;
+        audio_ok = TRUE;
+    }
+
+    if (!video_ok && !audio_ok)
+    {
+        plugin_bridge_aui_close(slot);
+        return FALSE;
+    }
+
+    input->bridge_aui_slot = slot;
+    input->kind = video_ok ? INPUT_KIND_AUI_BRIDGED : INPUT_KIND_AUDIO_FILE;
+    return TRUE;
+}
+
+VFWInput *vfw_input_open_aui_index(int aui_idx, const char *filepath, FILE_INFO *fi, int open_flag)
+{
+    VFWInput *input;
+    InputPluginSummary sum;
+    BOOL opened = FALSE;
+    BOOL want_video = (open_flag & AVI_FILE_OPEN_FLAG_AUDIO_ONLY) == 0;
+    BOOL want_audio = (open_flag & AVI_FILE_OPEN_FLAG_VIDEO_ONLY) == 0;
+
+    if (!filepath || !filepath[0] || !input_plugin_get_summary(aui_idx, &sum))
+    {
+        return NULL;
+    }
+    vfw_ensure_initialized();
+    input = alloc_vfw_input(filepath);
+    if (!input)
+    {
+        return NULL;
+    }
+    if (sum.bridged_x86 && sum.bridge_aui_idx >= 0)
+    {
+        opened = try_open_bridged_aui(input, sum.bridge_aui_idx, filepath,
+                                      open_flag, want_video, want_audio);
+    }
+    else
+    {
+        opened = try_open_native_aui(input, aui_idx, filepath, want_video, want_audio);
+    }
+    if (!opened)
+    {
+        vfw_input_close(input);
+        return NULL;
+    }
+    if (fi)
+    {
+        vfw_input_get_file_info(input, fi);
+    }
+    return input;
+}
+
+VFWInput *vfw_input_open_ex(const char *filepath, FILE_INFO *fi, int open_flag)
+{
+    VFWInput *input;
     int cw, ch, crate, cscale, chz;
+    int order[INPUT_PLUGIN_MAX];
+    int order_n, k;
+    const char *ext;
     BOOL want_video = (open_flag & AVI_FILE_OPEN_FLAG_AUDIO_ONLY) == 0;
     BOOL want_audio = (open_flag & AVI_FILE_OPEN_FLAG_VIDEO_ONLY) == 0;
 
@@ -1378,16 +1839,122 @@ VFWInput *vfw_input_open_ex(const char *filepath, FILE_INFO *fi, int open_flag)
 
     vfw_ensure_initialized();
 
-    input = (VFWInput *)calloc(1, sizeof(VFWInput));
+    input = alloc_vfw_input(filepath);
     if (!input)
     {
         return NULL;
     }
-    input->hfile = INVALID_HANDLE_VALUE;
-    strncpy(input->filepath, filepath, MAX_PATH - 1);
-    input->filepath[MAX_PATH - 1] = '\0';
 
-    // virtual exedit blank project canvas ("1280x720_30fps_44100Hz.exedit")
+    ext = path_ext(filepath);
+    order_n = input_plugin_get_priority_order(order, INPUT_PLUGIN_MAX, TRUE);
+
+    // 0x004262b0: probe input plugins in ascending priority order
+    for (k = 0; k < order_n; k++)
+    {
+        InputPluginSummary sum;
+        BOOL opened = FALSE;
+        if (!input_plugin_get_summary(order[k], &sum))
+        {
+            continue;
+        }
+
+        switch (sum.builtin_kind)
+        {
+        case BUILTIN_INPUT_AVI:
+            if (_stricmp(ext, ".avi") == 0)
+            {
+                opened = try_open_avi_vfw(input, filepath, want_video, want_audio);
+            }
+            break;
+
+        case BUILTIN_INPUT_VFW:
+            if (_stricmp(ext, ".avi") == 0 || _stricmp(ext, ".avs") == 0)
+            {
+                opened = try_open_avi_vfw(input, filepath, want_video, want_audio);
+            }
+            break;
+
+        case BUILTIN_INPUT_AVIS:
+            if (_stricmp(ext, ".avs") == 0)
+            {
+                opened = try_open_avi_vfw(input, filepath, want_video, want_audio);
+            }
+            break;
+
+        case BUILTIN_INPUT_WAV:
+            if (_stricmp(ext, ".wav") == 0)
+            {
+                int wav_w = 0, wav_h = 0;
+                input_plugin_get_wav_video_size(&wav_w, &wav_h);
+                if ((want_audio || (want_video && wav_w > 0 && wav_h > 0)) &&
+                    try_open_wav_or_mp3_file(input, filepath, TRUE))
+                {
+                    if (!want_audio)
+                    {
+                        input->audio_kind = AUDIO_SRC_NONE;
+                    }
+                    if (want_video && wav_w > 0 && wav_h > 0)
+                    {
+                        int dib_stride = (wav_w * 3 + 3) & ~3;
+                        int sr = input->src_audio_rate > 0 ? input->src_audio_rate : 44100;
+                        int fc = (int)(((int64_t)input->src_audio_samples * 30 + sr - 1) / sr);
+                        if (fc < 1)
+                            fc = 1;
+                        input->kind = INPUT_KIND_EXEDIT_CANVAS;
+                        input->width = wav_w;
+                        input->height = wav_h;
+                        input->frame_count = fc;
+                        input->fps_num = 30;
+                        input->fps_den = 1;
+                        input->decode_bpp = 24;
+                        input->rgb_buffer = (PIXEL *)calloc((size_t)wav_w * (size_t)wav_h, sizeof(PIXEL));
+                        input->dib_size = (size_t)dib_stride * (size_t)wav_h;
+                        input->dib_buffer = (unsigned char *)calloc(1, input->dib_size);
+                    }
+                    opened = TRUE;
+                }
+            }
+            break;
+
+        case BUILTIN_INPUT_BMP:
+            if (want_video && _stricmp(ext, ".bmp") == 0)
+            {
+                opened = try_open_still_image(input, filepath);
+            }
+            break;
+
+        case BUILTIN_INPUT_JPG_PNG:
+            if (want_video &&
+                (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0 ||
+                 _stricmp(ext, ".png") == 0))
+            {
+                opened = try_open_still_image(input, filepath);
+            }
+            break;
+
+        default:
+            if (sum.bridged_x86 && sum.bridge_aui_idx >= 0)
+            {
+                opened = try_open_bridged_aui(input, sum.bridge_aui_idx, filepath,
+                                              open_flag, want_video, want_audio);
+            }
+            else if (!(sum.flag & INPUT_PLUGIN_FLAG_BUILTIN))
+            {
+                opened = try_open_native_aui(input, order[k], filepath,
+                                             want_video, want_audio);
+            }
+            break;
+        }
+
+        if (opened)
+        {
+            if (fi)
+                vfw_input_get_file_info(input, fi);
+            return input;
+        }
+    }
+
+    // fallback virtual exedit blank project canvas if exedit.aui is not installed
     if (parse_exedit_canvas_spec(filepath, &cw, &ch, &crate, &cscale, &chz))
     {
         int dib_stride = (cw * 3 + 3) & ~3;
@@ -1418,118 +1985,21 @@ VFWInput *vfw_input_open_ex(const char *filepath, FILE_INFO *fi, int open_flag)
         return input;
     }
 
-    // native WAV / MP3 audio reader (handles .mp3, .wav, RIFF-MP3, Float WAV, ADPCM WAV)
-    if (want_audio && try_open_wav_or_mp3_file(input, filepath))
+    // fallback MP3 / WAV audio reader (.mp3, .mp2, .mpa, header-probed WAV/MP3)
+    if (want_audio && try_open_wav_or_mp3_file(input, filepath, FALSE))
     {
         if (fi)
             vfw_input_get_file_info(input, fi);
         return input;
     }
 
-    // AVIFile (VFW) video/audio container
-    hr = AVIFileOpenA(&input->pavi_file, filepath, OF_READ | OF_SHARE_DENY_WRITE, NULL);
-    if (SUCCEEDED(hr) && input->pavi_file)
+    // fallback VFW container probe & GDI+ still image (.gif, .tif, etc.)
+    if (try_open_avi_vfw(input, filepath, want_video, want_audio))
     {
-        BOOL video_ok = FALSE;
-        BOOL audio_ok = FALSE;
-
-        if (want_video &&
-            SUCCEEDED(AVIFileGetStream(input->pavi_file, &input->pavi_stream, streamtypeVIDEO, 0)) &&
-            input->pavi_stream &&
-            SUCCEEDED(AVIStreamInfoA(input->pavi_stream, &asi, sizeof(asi))))
-        {
-            input->width = asi.rcFrame.right - asi.rcFrame.left;
-            input->height = asi.rcFrame.bottom - asi.rcFrame.top;
-            input->frame_count = (int)AVIStreamLength(input->pavi_stream);
-            input->fps_num = (int)(asi.dwRate ? asi.dwRate : 30);
-            input->fps_den = (int)(asi.dwScale ? asi.dwScale : 1);
-
-            memset(&req_bih, 0, sizeof(req_bih));
-            req_bih.biSize = sizeof(req_bih);
-            req_bih.biWidth = input->width;
-            req_bih.biHeight = input->height;
-            req_bih.biPlanes = 1;
-            req_bih.biBitCount = 24;
-            req_bih.biCompression = BI_RGB;
-
-            input->pgf = AVIStreamGetFrameOpen(input->pavi_stream, &req_bih);
-            if (!input->pgf)
-            {
-                input->pgf = AVIStreamGetFrameOpen(input->pavi_stream, NULL);
-            }
-            if (input->pgf && input->width > 0 && input->height > 0)
-            {
-                LPBITMAPINFOHEADER pbmi0 =
-                    (LPBITMAPINFOHEADER)AVIStreamGetFrame(input->pgf, 0);
-                input->decode_bpp = (pbmi0 && pbmi0->biBitCount == 32) ? 32 : 24;
-                input->rgb_buffer = (PIXEL *)calloc(
-                    (size_t)input->width * (size_t)input->height, sizeof(PIXEL));
-                if (input->rgb_buffer)
-                {
-                    video_ok = TRUE;
-                }
-            }
-        }
-
-        if (want_audio &&
-            SUCCEEDED(AVIFileGetStream(input->pavi_file, &input->pavi_audio, streamtypeAUDIO, 0)) &&
-            input->pavi_audio)
-        {
-            if (init_vfw_audio_stream(input, input->pavi_audio))
-            {
-                audio_ok = TRUE;
-            }
-            else
-            {
-                AVIStreamRelease(input->pavi_audio);
-                input->pavi_audio = NULL;
-            }
-        }
-
-        if (video_ok || audio_ok)
-        {
-            input->kind = video_ok ? INPUT_KIND_VFW : INPUT_KIND_AUDIO_FILE;
-            if (!video_ok)
-            {
-                if (input->pgf)
-                {
-                    AVIStreamGetFrameClose(input->pgf);
-                    input->pgf = NULL;
-                }
-                if (input->pavi_stream)
-                {
-                    AVIStreamRelease(input->pavi_stream);
-                    input->pavi_stream = NULL;
-                }
-                input->width = 0;
-                input->height = 0;
-                input->frame_count = 0;
-            }
-            if (fi)
-                vfw_input_get_file_info(input, fi);
-            return input;
-        }
-
-        if (input->pgf)
-        {
-            AVIStreamGetFrameClose(input->pgf);
-            input->pgf = NULL;
-        }
-        if (input->pavi_audio)
-        {
-            AVIStreamRelease(input->pavi_audio);
-            input->pavi_audio = NULL;
-        }
-        if (input->pavi_stream)
-        {
-            AVIStreamRelease(input->pavi_stream);
-            input->pavi_stream = NULL;
-        }
-        AVIFileRelease(input->pavi_file);
-        input->pavi_file = NULL;
+        if (fi)
+            vfw_input_get_file_info(input, fi);
+        return input;
     }
-
-    // still image fallback (.png / .jpg / .bmp / .gif via GDI+)
     if (want_video && try_open_still_image(input, filepath))
     {
         if (fi)
@@ -1552,6 +2022,22 @@ void vfw_input_close(VFWInput *input)
     {
         return;
     }
+    if (input->bridge_aui_slot >= 0)
+    {
+        plugin_bridge_aui_close(input->bridge_aui_slot);
+        input->bridge_aui_slot = -1;
+    }
+    if (input->aui_hic)
+    {
+        ICDecompressEnd(input->aui_hic);
+        ICClose(input->aui_hic);
+        input->aui_hic = NULL;
+    }
+    if (input->aui_inst)
+    {
+        input_plugin_close_native(input->aui_inst);
+        input->aui_inst = NULL;
+    }
     if (input->acm_stream)
     {
         if (input->acm_hdr_prepared)
@@ -1569,6 +2055,10 @@ void vfw_input_close(VFWInput *input)
         CloseHandle(input->hfile);
         input->hfile = INVALID_HANDLE_VALUE;
     }
+    free(input->aui_hic_out_buf);
+    free(input->aui_vid_bih);
+    free(input->aui_vid_buf);
+    free(input->aui_yc_tmp);
     free(input->mp3_frames);
     free(input->acm_src_buf);
     free(input->acm_dst_buf);
@@ -1633,6 +2123,192 @@ static BOOL decode_vfw_frame_to_buffers(VFWInput *input, int frame_num,
     return TRUE;
 }
 
+static BOOL decode_native_aui_frame(VFWInput *input, int frame_num, PIXEL_YC *ycp, int yc_stride)
+{
+    int w = input->width;
+    int h = input->height;
+    int got = 0;
+    int x, y;
+
+    if (!input->aui_inst || !input->aui_vid_buf || w <= 0 || h <= 0)
+    {
+        return FALSE;
+    }
+
+    if (frame_num < 0)
+        frame_num = 0;
+    if (frame_num >= input->frame_count)
+        frame_num = input->frame_count - 1;
+
+    if (!(input->aui_flags & INPUT_INFO_FLAG_VIDEO_RANDOM_ACCESS))
+    {
+        if (frame_num != input->aui_last_decoded_frame)
+        {
+            if (input->aui_last_decoded_frame < 0 ||
+                frame_num < input->aui_last_decoded_frame ||
+                frame_num > input->aui_last_decoded_frame + 1)
+            {
+                int kf = frame_num;
+                int start_f, p;
+                while (kf > 0 && !input_plugin_is_keyframe_native(input->aui_inst, kf))
+                {
+                    kf--;
+                }
+                start_f = kf;
+                if (input->aui_last_decoded_frame >= 0 &&
+                    input->aui_last_decoded_frame < frame_num &&
+                    kf <= input->aui_last_decoded_frame)
+                {
+                    start_f = input->aui_last_decoded_frame + 1;
+                }
+                for (p = start_f; p < frame_num; p++)
+                {
+                    int pgot = input_plugin_read_video_native(input->aui_inst, p, input->aui_vid_buf);
+                    if (input->aui_hic && pgot > 0)
+                    {
+                        input->aui_vid_bih->biSizeImage = (DWORD)pgot;
+                        ICDecompress(input->aui_hic, ICDECOMPRESS_PREROLL,
+                                     input->aui_vid_bih, input->aui_vid_buf,
+                                     &input->aui_hic_out_bih, input->aui_hic_out_buf);
+                    }
+                }
+            }
+            got = input_plugin_read_video_native(input->aui_inst, frame_num, input->aui_vid_buf);
+            if (input->aui_hic && got > 0)
+            {
+                DWORD ic_fl = input_plugin_is_keyframe_native(input->aui_inst, frame_num)
+                                  ? 0
+                                  : ICDECOMPRESS_NOTKEYFRAME;
+                input->aui_vid_bih->biSizeImage = (DWORD)got;
+                if (ICDecompress(input->aui_hic, ic_fl,
+                                 input->aui_vid_bih, input->aui_vid_buf,
+                                 &input->aui_hic_out_bih, input->aui_hic_out_buf) != ICERR_OK)
+                {
+                    return FALSE;
+                }
+            }
+            input->aui_last_decoded_frame = frame_num;
+        }
+    }
+    else
+    {
+        got = input_plugin_read_video_native(input->aui_inst, frame_num, input->aui_vid_buf);
+        if (input->aui_hic)
+        {
+            DWORD ic_fl;
+            if (got <= 0)
+                return FALSE;
+            ic_fl = input_plugin_is_keyframe_native(input->aui_inst, frame_num)
+                        ? 0
+                        : ICDECOMPRESS_NOTKEYFRAME;
+            input->aui_vid_bih->biSizeImage = (DWORD)got;
+            if (ICDecompress(input->aui_hic, ic_fl,
+                             input->aui_vid_bih, input->aui_vid_buf,
+                             &input->aui_hic_out_bih, input->aui_hic_out_buf) != ICERR_OK)
+            {
+                return FALSE;
+            }
+        }
+        input->aui_last_decoded_frame = frame_num;
+    }
+
+    if (input->aui_hic)
+    {
+        int stride = (w * 3 + 3) & ~3;
+        return rgb2yc_dib24(ycp, yc_stride, input->aui_hic_out_buf, stride, w, h, TRUE);
+    }
+
+    // tightly-packed YC48 ('YC48' = 0x38344359): w * 6 bytes per row
+    if (input->aui_vid_comp == 0x38344359u)
+    {
+        for (y = 0; y < h; y++)
+        {
+            const PIXEL_YC *src_row =
+                (const PIXEL_YC *)(input->aui_vid_buf + (size_t)y * (size_t)w * sizeof(PIXEL_YC));
+            memcpy(ycp + (size_t)y * (size_t)yc_stride,
+                   src_row,
+                   (size_t)w * sizeof(PIXEL_YC));
+        }
+        return TRUE;
+    }
+
+    if (input->aui_vid_comp == BI_RGB || input->aui_vid_comp == BI_BITFIELDS)
+    {
+        int bpp = input->aui_vid_bpp;
+        BOOL bottom_up = input->aui_vid_bottom_up;
+        if (bpp == 24)
+        {
+            int stride = (w * 3 + 3) & ~3;
+            return rgb2yc_dib24(ycp, yc_stride, input->aui_vid_buf, stride, w, h, bottom_up);
+        }
+        if (!input->rgb_buffer)
+        {
+            input->rgb_buffer = (PIXEL *)calloc((size_t)w * (size_t)h, sizeof(PIXEL));
+            if (!input->rgb_buffer)
+                return FALSE;
+        }
+        if (bpp == 32)
+        {
+            int stride = w * 4;
+            for (y = 0; y < h; y++)
+            {
+                int src_y = bottom_up ? (h - 1 - y) : y;
+                const unsigned char *src = input->aui_vid_buf + (size_t)src_y * (size_t)stride;
+                PIXEL *row = input->rgb_buffer + (size_t)y * (size_t)w;
+                for (x = 0; x < w; x++)
+                {
+                    row[x].b = src[x * 4 + 0];
+                    row[x].g = src[x * 4 + 1];
+                    row[x].r = src[x * 4 + 2];
+                }
+                rgb2yc(ycp + (size_t)y * (size_t)yc_stride, row, w);
+            }
+            return TRUE;
+        }
+        if (bpp == 16)
+        {
+            int stride = (w * 2 + 3) & ~3;
+            BOOL rgb565 = (input->aui_vid_comp == BI_BITFIELDS && input->aui_vid_gmask == 0x07E0u);
+            for (y = 0; y < h; y++)
+            {
+                int src_y = bottom_up ? (h - 1 - y) : y;
+                const uint16_t *src = (const uint16_t *)(input->aui_vid_buf + (size_t)src_y * (size_t)stride);
+                PIXEL *row = input->rgb_buffer + (size_t)y * (size_t)w;
+                for (x = 0; x < w; x++)
+                {
+                    uint16_t px = src[x];
+                    if (rgb565)
+                    {
+                        int r5 = (px >> 11) & 31;
+                        int g6 = (px >> 5) & 63;
+                        int b5 = px & 31;
+                        row[x].r = (unsigned char)((r5 << 3) | (r5 >> 2));
+                        row[x].g = (unsigned char)((g6 << 2) | (g6 >> 4));
+                        row[x].b = (unsigned char)((b5 << 3) | (b5 >> 2));
+                    }
+                    else
+                    {
+                        int r5 = (px >> 10) & 31;
+                        int g5 = (px >> 5) & 31;
+                        int b5 = px & 31;
+                        row[x].r = (unsigned char)((r5 << 3) | (r5 >> 2));
+                        row[x].g = (unsigned char)((g5 << 3) | (g5 >> 2));
+                        row[x].b = (unsigned char)((b5 << 3) | (b5 >> 2));
+                    }
+                }
+                rgb2yc(ycp + (size_t)y * (size_t)yc_stride, row, w);
+            }
+            return TRUE;
+        }
+    }
+
+    return color_plugin_pixel2yc(ycp, yc_stride,
+                                 input->aui_vid_buf,
+                                 input->aui_vid_comp,
+                                 w, h,
+                                 input->aui_vid_bottom_up);
+}
+
 BOOL vfw_input_read_frame_stride(VFWInput *input, int frame_num, PIXEL_YC *ycp, int yc_stride)
 {
     int x, y;
@@ -1644,6 +2320,17 @@ BOOL vfw_input_read_frame_stride(VFWInput *input, int frame_num, PIXEL_YC *ycp, 
     if (yc_stride <= 0)
     {
         yc_stride = input->width;
+    }
+
+    if (input->kind == INPUT_KIND_AUI_NATIVE)
+    {
+        return decode_native_aui_frame(input, frame_num, ycp, yc_stride);
+    }
+
+    if (input->kind == INPUT_KIND_AUI_BRIDGED)
+    {
+        return plugin_bridge_aui_read_video(input->bridge_aui_slot, frame_num,
+                                            ycp, yc_stride, input->width, input->height);
     }
 
     if (input->kind == INPUT_KIND_EXEDIT_CANVAS)
@@ -1669,9 +2356,24 @@ BOOL vfw_input_read_frame_stride(VFWInput *input, int frame_num, PIXEL_YC *ycp, 
 
     if (input->kind == INPUT_KIND_VFW && input->pgf && input->pavi_stream)
     {
+        LPBITMAPINFOHEADER pbmi;
         const unsigned char *dib = NULL;
         int bpp = 24, stride = 0;
         BOOL bottom_up = TRUE;
+        int f = frame_num;
+        if (f < 0)
+            f = 0;
+        if (f >= input->frame_count)
+            f = input->frame_count - 1;
+        pbmi = (LPBITMAPINFOHEADER)AVIStreamGetFrame(input->pgf,
+                                                     AVIStreamStart(input->pavi_stream) + f);
+        if (pbmi && pbmi->biCompression != BI_RGB && pbmi->biCompression != BI_BITFIELDS)
+        {
+            const unsigned char *fdata = (const unsigned char *)pbmi + pbmi->biSize +
+                                         pbmi->biClrUsed * sizeof(RGBQUAD);
+            return color_plugin_pixel2yc(ycp, yc_stride, fdata, pbmi->biCompression,
+                                         input->width, input->height, pbmi->biHeight >= 0);
+        }
         if (!decode_vfw_frame_to_buffers(input, frame_num, &dib, &bpp, &stride, &bottom_up))
         {
             return FALSE;
@@ -1718,11 +2420,17 @@ int vfw_input_set_audio_format(VFWInput *input, int audio_rate, int audio_ch)
     input->req_audio_ch = audio_ch;
     if (input->src_audio_samples > 0 && input->src_audio_rate > 0)
     {
-        return (int)(((int64_t)input->src_audio_samples * audio_rate) / input->src_audio_rate);
+        int64_t scaled = ((int64_t)input->src_audio_samples * audio_rate) / input->src_audio_rate;
+        if (scaled > 0x7FFFFFFFLL)
+            scaled = 0x7FFFFFFFLL;
+        return (int)scaled;
     }
     if (input->frame_count > 0 && input->fps_num > 0)
     {
-        return (int)(((int64_t)input->frame_count * audio_rate * input->fps_den) / input->fps_num);
+        int64_t scaled = ((int64_t)input->frame_count * audio_rate * input->fps_den) / input->fps_num;
+        if (scaled > 0x7FFFFFFFLL)
+            scaled = 0x7FFFFFFFLL;
+        return (int)scaled;
     }
     return 0;
 }
@@ -1749,12 +2457,121 @@ static int read_source_pcm16(VFWInput *input, int src_start, short *dst, int src
         src_count -= lead_zero;
         src_start = 0;
     }
-    if (src_start + src_count > input->src_audio_samples)
+    if (src_count > input->src_audio_samples - src_start)
     {
         src_count = input->src_audio_samples - src_start;
     }
     if (src_count <= 0)
         return 0;
+
+    if (input->audio_kind == AUDIO_SRC_AUI_PCM && input->aui_inst)
+    {
+        size_t raw_bytes = (size_t)src_count * (size_t)input->aui_aud_block_align;
+        unsigned char *raw = (unsigned char *)malloc(raw_bytes);
+        int got;
+        if (!raw)
+            return 0;
+        got = input_plugin_read_audio_native(input->aui_inst, src_start, src_count, raw);
+        if (got <= 0)
+        {
+            free(raw);
+            return 0;
+        }
+        if (got > src_count)
+            got = src_count;
+        convert_raw_frames_to_pcm16(raw, got,
+                                    input->aui_aud_raw_ch, input->aui_aud_block_align,
+                                    input->src_audio_bits, input->aui_aud_is_float,
+                                    dst, src_ch);
+        free(raw);
+        return got;
+    }
+
+    if (input->audio_kind == AUDIO_SRC_AUI_ACM && input->aui_inst)
+    {
+        int target_end = (src_count > 0x7FFFFFFF - src_start) ? 0x7FFFFFFF : (src_start + src_count);
+        int stall_guard = 0;
+        int ba = input->aui_aud_block_align > 0 ? input->aui_aud_block_align : 1;
+
+        if (input->pcm_cache_len == 0 ||
+            src_start < input->pcm_cache_start ||
+            src_start > input->pcm_decode_pos + input->src_audio_rate * 2)
+        {
+            int preroll_smp = (src_start > 4096) ? (src_start - 4096) : 0;
+            input->aui_aud_cur_pos = preroll_smp;
+            input->acm_src_len = 0;
+            input->acm_need_start = TRUE;
+            input->acm_eof_flushed = FALSE;
+            input->pcm_decode_pos = preroll_smp;
+            input->pcm_cache_start = preroll_smp;
+            input->pcm_cache_len = 0;
+        }
+
+        while (input->pcm_cache_start + input->pcm_cache_len < target_end)
+        {
+            int produced = 0;
+            if (input->aui_aud_cur_pos < input->src_audio_samples &&
+                input->acm_src_len + (DWORD)ba <= input->acm_src_cap)
+            {
+                DWORD space = input->acm_src_cap - input->acm_src_len;
+                int req_smp = (int)(space / (DWORD)ba);
+                int rem_smp = input->src_audio_samples - input->aui_aud_cur_pos;
+                int got_smp;
+                if (req_smp > 4096)
+                    req_smp = 4096;
+                if (req_smp > rem_smp)
+                    req_smp = rem_smp;
+                got_smp = (req_smp > 0)
+                              ? input_plugin_read_audio_native(input->aui_inst,
+                                                               input->aui_aud_cur_pos,
+                                                               req_smp,
+                                                               input->acm_src_buf + input->acm_src_len)
+                              : 0;
+                if (got_smp > 0)
+                {
+                    if (got_smp > req_smp)
+                        got_smp = req_smp;
+                    input->acm_src_len += (DWORD)got_smp * (DWORD)ba;
+                    input->aui_aud_cur_pos += got_smp;
+                }
+                else
+                {
+                    input->aui_aud_cur_pos = input->src_audio_samples;
+                }
+            }
+
+            if (input->acm_src_len > 0)
+            {
+                if (!acm_convert_step(input, FALSE, src_start, &produced))
+                    break;
+                if (produced == 0 && ++stall_guard > 32)
+                    break;
+            }
+            else if (!input->acm_eof_flushed)
+            {
+                input->acm_eof_flushed = TRUE;
+                acm_convert_step(input, TRUE, src_start, &produced);
+                break;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (src_start >= input->pcm_cache_start &&
+            src_start < input->pcm_cache_start + input->pcm_cache_len)
+        {
+            int off = src_start - input->pcm_cache_start;
+            int avail = input->pcm_cache_len - off;
+            if (avail > src_count)
+                avail = src_count;
+            memcpy(dst,
+                   input->pcm_cache + (size_t)off * (size_t)src_ch,
+                   (size_t)avail * (size_t)src_ch * sizeof(short));
+        }
+        return src_count;
+    }
 
     if (input->audio_kind == AUDIO_SRC_WAV_PCM)
     {
@@ -2104,16 +2921,27 @@ int vfw_input_read_audio(VFWInput *input, int sample_num, void *buf, int samples
     src_rate = input->src_audio_rate;
     out_rate = input->req_audio_rate > 0 ? input->req_audio_rate : src_rate;
     src_ch = input->src_audio_ch;
-    total_out = (int)(((int64_t)input->src_audio_samples * out_rate) / src_rate);
+    {
+        int64_t scaled = ((int64_t)input->src_audio_samples * out_rate) / src_rate;
+        if (scaled > 0x7FFFFFFFLL)
+            scaled = 0x7FFFFFFFLL;
+        total_out = (int)scaled;
+    }
 
     if (sample_num >= total_out)
     {
         return 0;
     }
     out_valid = samples;
-    if (sample_num + out_valid > total_out)
+    if (out_valid > total_out - sample_num)
     {
         out_valid = total_out - sample_num;
+    }
+
+    if (input->audio_kind == AUDIO_SRC_AUI_BRIDGED)
+    {
+        return plugin_bridge_aui_read_audio(input->bridge_aui_slot, sample_num,
+                                            dst, out_valid, out_rate, req_ch);
     }
 
     // fast path when sample rate and channel count already match
@@ -2216,6 +3044,35 @@ void *vfw_input_get_dib_pixelp(VFWInput *input, int frame_num)
     {
         return NULL;
     }
+    if (input->kind == INPUT_KIND_AUI_NATIVE || input->kind == INPUT_KIND_AUI_BRIDGED)
+    {
+        int w = input->width;
+        int h = input->height;
+        int dib_stride;
+        size_t dib_need;
+        if (w <= 0 || h <= 0)
+            return NULL;
+        dib_stride = (w * 3 + 3) & ~3;
+        dib_need = (size_t)dib_stride * (size_t)h;
+        if (!input->aui_yc_tmp)
+        {
+            input->aui_yc_tmp = (PIXEL_YC *)malloc((size_t)w * (size_t)h * sizeof(PIXEL_YC));
+            if (!input->aui_yc_tmp)
+                return NULL;
+        }
+        if (!input->dib_buffer || input->dib_size < dib_need)
+        {
+            unsigned char *nb = (unsigned char *)realloc(input->dib_buffer, dib_need);
+            if (!nb)
+                return NULL;
+            input->dib_buffer = nb;
+            input->dib_size = dib_need;
+        }
+        if (!vfw_input_read_frame_stride(input, frame_num, input->aui_yc_tmp, w))
+            return NULL;
+        yc2rgb_dib24(input->dib_buffer, dib_stride, input->aui_yc_tmp, w, w, h, TRUE);
+        return input->dib_buffer;
+    }
     if (input->kind == INPUT_KIND_EXEDIT_CANVAS || input->kind == INPUT_KIND_STILL_IMAGE)
     {
         return input->dib_buffer;
@@ -2237,7 +3094,39 @@ PIXEL *vfw_input_get_pixel_buffer(VFWInput *input, int frame_num)
     int bpp = 24, stride = 0, x, y;
     BOOL bottom_up = TRUE;
 
-    if (!input || !input->rgb_buffer)
+    if (!input)
+    {
+        return NULL;
+    }
+    if (input->kind == INPUT_KIND_AUI_NATIVE || input->kind == INPUT_KIND_AUI_BRIDGED)
+    {
+        int w = input->width;
+        int h = input->height;
+        if (w <= 0 || h <= 0)
+            return NULL;
+        if (!input->aui_yc_tmp)
+        {
+            input->aui_yc_tmp = (PIXEL_YC *)malloc((size_t)w * (size_t)h * sizeof(PIXEL_YC));
+            if (!input->aui_yc_tmp)
+                return NULL;
+        }
+        if (!input->rgb_buffer)
+        {
+            input->rgb_buffer = (PIXEL *)malloc((size_t)w * (size_t)h * sizeof(PIXEL));
+            if (!input->rgb_buffer)
+                return NULL;
+        }
+        if (!vfw_input_read_frame_stride(input, frame_num, input->aui_yc_tmp, w))
+            return NULL;
+        for (y = 0; y < h; y++)
+        {
+            yc2rgb(input->rgb_buffer + (size_t)y * (size_t)w,
+                   input->aui_yc_tmp + (size_t)y * (size_t)w,
+                   w);
+        }
+        return input->rgb_buffer;
+    }
+    if (!input->rgb_buffer)
     {
         return NULL;
     }
@@ -2285,6 +3174,14 @@ BOOL vfw_input_is_keyframe(VFWInput *input, int frame_num)
     if (!input || frame_num < 0)
     {
         return FALSE;
+    }
+    if (input->kind == INPUT_KIND_AUI_NATIVE)
+    {
+        return input_plugin_is_keyframe_native(input->aui_inst, frame_num);
+    }
+    if (input->kind == INPUT_KIND_AUI_BRIDGED)
+    {
+        return plugin_bridge_aui_is_keyframe(input->bridge_aui_slot, frame_num);
     }
     if (input->kind == INPUT_KIND_VFW && input->pavi_stream)
     {

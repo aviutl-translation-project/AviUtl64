@@ -964,6 +964,7 @@ BOOL video_export_get_auo_summary(int idx, AuoPluginSummary *out_summary)
         lstrcpynA(out_summary->name, e->name, sizeof(out_summary->name));
         memcpy(out_summary->filefilter, e->filefilter, sizeof(out_summary->filefilter));
         lstrcpynA(out_summary->information, e->information, sizeof(out_summary->information));
+        lstrcpynA(out_summary->path, e->path, sizeof(out_summary->path));
         out_summary->flag = e->flag;
         out_summary->has_config = e->has_config;
         out_summary->bridged_x86 = FALSE;
@@ -978,6 +979,7 @@ BOOL video_export_get_auo_summary(int idx, AuoPluginSummary *out_summary)
         lstrcpynA(out_summary->name, bi.name, sizeof(out_summary->name));
         memcpy(out_summary->filefilter, bi.filefilter, sizeof(out_summary->filefilter));
         lstrcpynA(out_summary->information, bi.information, sizeof(out_summary->information));
+        lstrcpynA(out_summary->path, bi.path, sizeof(out_summary->path));
         out_summary->flag = bi.flag;
         out_summary->has_config = (bi.has_config != 0);
         out_summary->bridged_x86 = TRUE;
@@ -1019,7 +1021,7 @@ int video_export_find_auo_by_name(const char *name)
     return -1;
 }
 
-void video_export_populate_menu(HMENU bar, BOOL is_ja)
+void video_export_populate_menu(HMENU bar, const wchar_t *none_label)
 {
     int i, count = video_export_get_auo_count();
     if (!bar)
@@ -1034,10 +1036,6 @@ void video_export_populate_menu(HMENU bar, BOOL is_ja)
             if (!video_export_get_auo_summary(i, &sum))
                 continue;
             sjis_to_wide_auo(sum.name, wlabel, 256);
-            if (sum.bridged_x86)
-            {
-                lstrcatW(wlabel, L" [x86 Bridge]");
-            }
             InsertMenuW(bar, AUO_MENU_PLACEHOLDER_ID, MF_BYCOMMAND | MF_STRING,
                         (UINT_PTR)(AUO_CMD_BASE + i), wlabel);
         }
@@ -1047,7 +1045,7 @@ void video_export_populate_menu(HMENU bar, BOOL is_ja)
     {
         ModifyMenuW(bar, AUO_MENU_PLACEHOLDER_ID, MF_BYCOMMAND | MF_STRING | MF_GRAYED,
                     AUO_MENU_PLACEHOLDER_ID,
-                    is_ja ? L"\x306a\x3057" : L"(None)");
+                    (none_label && none_label[0]) ? none_label : L"\x306a\x3057");
     }
 }
 
@@ -1894,14 +1892,30 @@ BOOL video_export_auo_dialog(HWND owner, EDITP *ep, int auo_idx)
                                  OUTPUT_INFO_FLAG_VIDEO | OUTPUT_INFO_FLAG_AUDIO);
 }
 
+int video_export_get_last_auo_index(void)
+{
+    int count = video_export_get_auo_count();
+    if (count <= 0)
+        return 0;
+    if (g_last_auo_idx < 0 || g_last_auo_idx >= count)
+        return 0;
+    return g_last_auo_idx;
+}
+
+void video_export_set_last_auo_index(int auo_idx)
+{
+    int count = video_export_get_auo_count();
+    if (auo_idx >= 0 && auo_idx < count)
+    {
+        g_last_auo_idx = auo_idx;
+    }
+}
+
 BOOL video_export_auo_config_dialog(HWND owner, int auo_idx)
 {
     int count = video_export_get_auo_count();
     if (count <= 0)
     {
-        MessageBoxW(owner,
-                    L"No output plugins (*.auo) are loaded.",
-                    L"AviUtl", MB_OK | MB_ICONINFORMATION);
         return FALSE;
     }
     if (auo_idx < 0 || auo_idx >= count)
@@ -1919,51 +1933,12 @@ BOOL video_export_auo_config_dialog(HWND owner, int auo_idx)
         LocalAuoEntry *e = &g_local_auos[auo_idx];
         if (!e->has_config)
         {
-            MessageBoxW(owner,
-                        L"Selected output plugin has no configuration dialog.",
-                        L"AviUtl", MB_OK | MB_ICONINFORMATION);
             return FALSE;
         }
         if (!ensure_local_auo_initialized(e))
             return FALSE;
         return safe_auo_config(e, owner ? owner : g_host_hwnd);
     }
-}
-
-void video_export_show_auo_info(HWND owner, BOOL is_ja)
-{
-    wchar_t buf[4096];
-    int i, count = video_export_get_auo_count();
-
-    buf[0] = L'\0';
-    if (count <= 0)
-    {
-        lstrcpyW(buf, is_ja ? L"\x51fa\x529b\x30d7\x30e9\x30b0\x30a4\x30f3\x306f\x3042\x308a\x307e\x305b\x3093\x3002"
-                            : L"No output plugins (*.auo) loaded.");
-    }
-    else
-    {
-        for (i = 0; i < count; i++)
-        {
-            AuoPluginSummary sum;
-            wchar_t winfo[300];
-            if (!video_export_get_auo_summary(i, &sum))
-                continue;
-            sjis_to_wide_auo(sum.information[0] ? sum.information : sum.name, winfo, 280);
-            if (lstrlenW(buf) + lstrlenW(winfo) + 32 < 4090)
-            {
-                if (buf[0])
-                    lstrcatW(buf, L"\r\n");
-                lstrcatW(buf, winfo);
-                if (sum.bridged_x86)
-                    lstrcatW(buf, L" [x86 Bridge]");
-            }
-        }
-    }
-    MessageBoxW(owner, buf,
-                is_ja ? L"\x51fa\x529b\x30d7\x30e9\x30b0\x30a4\x30f3\x60c5\x5831"
-                      : L"Output Plugin Information",
-                MB_OK | MB_ICONINFORMATION);
 }
 
 void video_export_request_abort(void)

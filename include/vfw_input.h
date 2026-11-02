@@ -12,6 +12,7 @@ typedef struct VFWInput VFWInput;
 
 VFWInput *vfw_input_open(const char *filepath, FILE_INFO *fi);
 VFWInput *vfw_input_open_ex(const char *filepath, FILE_INFO *fi, int open_flag);
+VFWInput *vfw_input_open_aui_index(int aui_idx, const char *filepath, FILE_INFO *fi, int open_flag);
 void vfw_input_close(VFWInput *input);
 
 BOOL vfw_input_read_frame(VFWInput *input, int frame_num, PIXEL_YC *ycp);

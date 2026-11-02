@@ -11,10 +11,13 @@
 #include "editp.h"
 
 #define BRIDGE_MAGIC 0x52415542u // "RAUB"
-#define BRIDGE_VERSION 4u
+#define BRIDGE_VERSION 6u
 #define BRIDGE_MAX_FILTERS 64
 #define BRIDGE_MAX_MENU_ITEMS 256
 #define BRIDGE_MAX_AUOS 32
+#define BRIDGE_MAX_AUIS 32
+#define BRIDGE_MAX_AUCS 32
+#define BRIDGE_MAX_OPEN_AUIS 32
 #define BRIDGE_MAX_AUDIO_SAMPLES 16384
 
 enum BridgeCmd
@@ -43,6 +46,16 @@ enum BridgeCmd
     BRIDGE_CMD_AUO_CONFIG = 22,
     BRIDGE_CMD_SCAN_AUO = 23,
     BRIDGE_CMD_LOAD_AUO = 24,
+    BRIDGE_CMD_SET_ACTIVE = 25,
+    BRIDGE_CMD_FILTER_IO = 26,
+    BRIDGE_CMD_SCAN_INPUT_COLOR = 27,
+    BRIDGE_CMD_AUI_CONFIG = 28,
+    BRIDGE_CMD_AUI_SET_PRIORITY = 29,
+    BRIDGE_CMD_AUI_OPEN = 30,
+    BRIDGE_CMD_AUI_CLOSE = 31,
+    BRIDGE_CMD_AUI_READ_VIDEO = 32,
+    BRIDGE_CMD_AUI_READ_AUDIO = 33,
+    BRIDGE_CMD_AUI_IS_KEYFRAME = 34,
     BRIDGE_CMD_SHUTDOWN = 99
 };
 
@@ -51,6 +64,8 @@ enum BridgeCmd
 typedef struct BridgeFilterInfo
 {
     char name[128];
+    char information[256];
+    char path[260];
     int32_t flag;
     int32_t has_window;
     int32_t window_visible;
@@ -71,9 +86,45 @@ typedef struct BridgeAuoInfo
     char name[128];
     char filefilter[512];
     char information[256];
+    char path[260];
     int32_t flag;
     int32_t has_config;
 } BridgeAuoInfo;
+
+typedef struct BridgeAuiInfo
+{
+    char name[128];
+    char filefilter[1024];
+    int32_t filefilter_len;
+    char information[256];
+    char path[260];
+    int32_t flag;
+    int32_t has_config;
+    int32_t priority;
+} BridgeAuiInfo;
+
+typedef struct BridgeAucInfo
+{
+    char name[128];
+    char information[256];
+    char path[260];
+    int32_t flag;
+} BridgeAucInfo;
+
+typedef struct BridgeAuiOpenInfo
+{
+    int32_t has_video;
+    int32_t has_audio;
+    int32_t w;
+    int32_t h;
+    int32_t frame_n;
+    int32_t video_rate;
+    int32_t video_scale;
+    int32_t decode_bpp;
+    int32_t audio_rate;
+    int32_t audio_ch;
+    int32_t audio_n;
+} BridgeAuiOpenInfo;
 
 typedef struct BridgeSharedMem
 {
@@ -113,6 +164,12 @@ typedef struct BridgeSharedMem
     volatile LONG encode_now;
     volatile LONG encode_total;
 
+    int32_t aui_count;
+    BridgeAuiInfo auis[BRIDGE_MAX_AUIS];
+    int32_t auc_count;
+    BridgeAucInfo aucs[BRIDGE_MAX_AUCS];
+    BridgeAuiOpenInfo aui_open_info;
+
     PIXEL_YC ycp_frame[REAVIUTL_VRAM_W * REAVIUTL_VRAM_H];
     int16_t pcm_audio[BRIDGE_MAX_AUDIO_SAMPLES * 2];
 } BridgeSharedMem;
@@ -146,6 +203,8 @@ void plugin_bridge_shutdown(void);
 
 int plugin_bridge_get_filter_count(void);
 const char *plugin_bridge_get_filter_name(int idx);
+const char *plugin_bridge_get_filter_info(int idx);
+const char *plugin_bridge_get_filter_path(int idx);
 int plugin_bridge_get_filter_flags(int idx);
 HWND plugin_bridge_get_filter_hwnd(int idx);
 
@@ -153,6 +212,8 @@ int plugin_bridge_get_menu_item_count(void);
 BOOL plugin_bridge_get_menu_item(int idx, BridgeMenuItemInfo *out_info);
 
 BOOL plugin_bridge_show_window(int idx, int mode);
+BOOL plugin_bridge_set_filter_active(int idx, int mode);
+BOOL plugin_bridge_filter_io(int filter_idx, BOOL is_export, EDITP *ep);
 BOOL plugin_bridge_exec_menu_item(int menu_idx);
 BOOL plugin_bridge_send_filter_command(int filter_idx, int filter_cmd_id);
 BOOL plugin_bridge_import_exo(int filter_idx, const char *exo_path, EDITP *ep);
@@ -183,5 +244,19 @@ BOOL plugin_bridge_auo_output(int auo_idx, const char *save_path, int out_flags,
                               BridgeEncodeProgressFn on_progress, void *user);
 BOOL plugin_bridge_auo_config(int auo_idx, HWND owner);
 void plugin_bridge_request_encode_abort(void);
+
+BOOL plugin_bridge_scan_input_color(const char *plugin_dir, HWND main_hwnd);
+int plugin_bridge_get_aui_count(void);
+BOOL plugin_bridge_get_aui_info(int idx, BridgeAuiInfo *out_info);
+BOOL plugin_bridge_aui_config(int idx, HWND owner);
+BOOL plugin_bridge_aui_set_priority(int idx, int priority);
+int plugin_bridge_aui_open(int idx, const char *filepath, int open_flag, BridgeAuiOpenInfo *out_info);
+BOOL plugin_bridge_aui_close(int handle_slot);
+BOOL plugin_bridge_aui_read_video(int handle_slot, int frame_num, PIXEL_YC *ycp, int yc_stride, int w, int h);
+int plugin_bridge_aui_read_audio(int handle_slot, int sample_num, short *buf, int samples, int req_rate, int req_ch);
+BOOL plugin_bridge_aui_is_keyframe(int handle_slot, int frame_num);
+
+int plugin_bridge_get_auc_count(void);
+BOOL plugin_bridge_get_auc_info(int idx, BridgeAucInfo *out_info);
 
 #endif

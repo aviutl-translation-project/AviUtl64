@@ -24,12 +24,20 @@ extern "C"
                       const PIXEL_YC *ycp, int yc_stride,
                       int w, int h, BOOL bottom_up);
 
-    // 0x00450090, yc48 to packed yuy2
+    // 0x0044fc30 & 0x00450090, packed yuy2 <-> yc48 (bt.601 and bt.709)
+    BOOL yuy2_to_yc48(PIXEL_YC *ycp, int yc_stride,
+                      const unsigned char *src_yuy2, int src_stride,
+                      int w, int h, BOOL bt709);
+
     BOOL yc48_to_yuy2(unsigned char *dst_yuy2, int dst_stride,
                       const PIXEL_YC *ycp, int yc_stride,
                       int w, int h);
 
-    // 0x00420e70, format helpers ('DIB ', 'YUY2', 'YC48')
+    BOOL yc48_to_yuy2_ex(unsigned char *dst_yuy2, int dst_stride,
+                         const PIXEL_YC *ycp, int yc_stride,
+                         int w, int h, BOOL bt709);
+
+    // 0x00420e70, format helpers ('DIB ', 'YUY2', 'YC48', and .auc fourccs)
     DWORD yc48_normalize_format(DWORD format);
     size_t yc48_format_frame_size(int w, int h, DWORD format);
     BOOL yc48_convert_to_format(void *dst, const PIXEL_YC *ycp, int yc_stride,

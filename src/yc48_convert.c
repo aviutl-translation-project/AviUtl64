@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "yc48_convert.h"
+#include "color_plugin.h"
 
 static __inline unsigned char clamp_u8(int v)
 {
@@ -38,20 +39,36 @@ static __inline void rgb_to_yc_pixel(int r, int g, int b, PIXEL_YC *out)
     out->cr = clamp_s16(cr);
 }
 
-static __inline void yc_to_bgr_bytes(const PIXEL_YC *in, unsigned char *b_out,
-                                     unsigned char *g_out, unsigned char *r_out)
+static __inline void yc_to_rgb_unclamped(const PIXEL_YC *in, int *r_out, int *g_out, int *b_out)
 {
     int y = in->y;
     int cb = in->cb;
     int cr = in->cr;
 
-    int r = (16320 * y + 22881 * cr + 131072) >> 18;
-    int g = (16320 * y - 5616 * cb - 11655 * cr + 131072) >> 18;
-    int b = (16320 * y + 28919 * cb + 131072) >> 18;
+    *r_out = (16320 * y + 22881 * cr + 131072) >> 18;
+    *g_out = (16320 * y - 5616 * cb - 11655 * cr + 131072) >> 18;
+    *b_out = (16320 * y + 28919 * cb + 131072) >> 18;
+}
 
+static __inline void yc_to_bgr_bytes(const PIXEL_YC *in, unsigned char *b_out,
+                                     unsigned char *g_out, unsigned char *r_out)
+{
+    int r, g, b;
+    yc_to_rgb_unclamped(in, &r, &g, &b);
     *b_out = clamp_u8(b);
     *g_out = clamp_u8(g);
     *r_out = clamp_u8(r);
+}
+
+static __inline void yuv709_to_yc_pixel(int y8, int u8, int v8, PIXEL_YC *out)
+{
+    int y_lin = (y8 - 16) * 1192;
+    int u_lin = u8 - 128;
+    int v_lin = v8 - 128;
+    int r = (y_lin + 1836 * v_lin + 512) >> 10;
+    int g = (y_lin - 218 * u_lin - 546 * v_lin + 512) >> 10;
+    int b = (y_lin + 2163 * u_lin + 512) >> 10;
+    rgb_to_yc_pixel(r, g, b, out);
 }
 
 BOOL __cdecl rgb2yc(PIXEL_YC *ycp, PIXEL *pixelp, int w)
@@ -142,10 +159,69 @@ BOOL yc2rgb_dib24(unsigned char *dib_bgr, int dib_stride,
     return TRUE;
 }
 
+// 0x0044fc30, packed yuy2 to yc48
+BOOL yuy2_to_yc48(PIXEL_YC *ycp, int yc_stride,
+                  const unsigned char *src_yuy2, int src_stride,
+                  int w, int h, BOOL bt709)
+{
+    int x, y;
+    if (!ycp || !src_yuy2 || w <= 0 || h <= 0)
+    {
+        return FALSE;
+    }
+    if (yc_stride <= 0)
+    {
+        yc_stride = w;
+    }
+    if (src_stride <= 0)
+    {
+        src_stride = ((w + 1) / 2) * 4;
+    }
+
+    for (y = 0; y < h; y++)
+    {
+        const unsigned char *src = src_yuy2 + (size_t)y * (size_t)src_stride;
+        PIXEL_YC *dst = ycp + (size_t)y * (size_t)yc_stride;
+
+        for (x = 0; x < w; x += 2)
+        {
+            int mp = (x / 2) * 4;
+            int y0 = src[mp + 0];
+            int u0 = src[mp + 1];
+            int y1 = src[mp + 2];
+            int v0 = src[mp + 3];
+            int u1 = (x + 2 < w) ? (((int)u0 + (int)src[mp + 5]) >> 1) : u0;
+            int v1 = (x + 2 < w) ? (((int)v0 + (int)src[mp + 7]) >> 1) : v0;
+
+            if (bt709)
+            {
+                yuv709_to_yc_pixel(y0, u0, v0, &dst[x]);
+                if (x + 1 < w)
+                {
+                    yuv709_to_yc_pixel(y1, u1, v1, &dst[x + 1]);
+                }
+            }
+            else
+            {
+                dst[x].y = clamp_s16((((y0 * 1197) >> 6) - 299));
+                dst[x].cb = clamp_s16(((u0 - 128) * 4682) >> 8);
+                dst[x].cr = clamp_s16(((v0 - 128) * 4682) >> 8);
+                if (x + 1 < w)
+                {
+                    dst[x + 1].y = clamp_s16((((y1 * 1197) >> 6) - 299));
+                    dst[x + 1].cb = clamp_s16(((u1 - 128) * 4682) >> 8);
+                    dst[x + 1].cr = clamp_s16(((v1 - 128) * 4682) >> 8);
+                }
+            }
+        }
+    }
+    return TRUE;
+}
+
 // 0x00450090, yc48 to packed yuy2
-BOOL yc48_to_yuy2(unsigned char *dst_yuy2, int dst_stride,
-                  const PIXEL_YC *ycp, int yc_stride,
-                  int w, int h)
+BOOL yc48_to_yuy2_ex(unsigned char *dst_yuy2, int dst_stride,
+                     const PIXEL_YC *ycp, int yc_stride,
+                     int w, int h, BOOL bt709)
 {
     int x, y;
     if (!dst_yuy2 || !ycp || w <= 0 || h <= 0)
@@ -160,6 +236,7 @@ BOOL yc48_to_yuy2(unsigned char *dst_yuy2, int dst_stride,
     {
         dst_stride = ((w + 1) / 2) * 4;
     }
+
     for (y = 0; y < h; y++)
     {
         unsigned char *dst = dst_yuy2 + (size_t)y * (size_t)dst_stride;
@@ -168,17 +245,42 @@ BOOL yc48_to_yuy2(unsigned char *dst_yuy2, int dst_stride,
         {
             const PIXEL_YC *p0 = &src[x];
             const PIXEL_YC *p1 = (x + 1 < w) ? &src[x + 1] : p0;
-            int y0 = (((int)clamp_s16((int)p0->y + 301) * 14016) >> 16) >> 2;
-            int u0 = (((int)clamp_s16((int)p0->cb + 2350) * 14336) >> 16) >> 2;
-            int y1 = (((int)clamp_s16((int)p1->y + 301) * 14016) >> 16) >> 2;
-            int v0 = (((int)clamp_s16((int)p0->cr + 2350) * 14336) >> 16) >> 2;
-            dst[(x / 2) * 4 + 0] = clamp_u8(y0);
-            dst[(x / 2) * 4 + 1] = clamp_u8(u0);
-            dst[(x / 2) * 4 + 2] = clamp_u8(y1);
-            dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+            if (bt709)
+            {
+                int r0, g0, b0, r1, g1, b1;
+                int y0, u0, y1, v0;
+                yc_to_rgb_unclamped(p0, &r0, &g0, &b0);
+                yc_to_rgb_unclamped(p1, &r1, &g1, &b1);
+                y0 = 16 + ((187 * r0 + 629 * g0 + 63 * b0 + 512) >> 10);
+                y1 = 16 + ((187 * r1 + 629 * g1 + 63 * b1 + 512) >> 10);
+                u0 = 128 + ((-103 * r0 - 347 * g0 + 450 * b0 + 512) >> 10);
+                v0 = 128 + ((450 * r0 - 409 * g0 - 41 * b0 + 512) >> 10);
+                dst[(x / 2) * 4 + 0] = clamp_u8(y0);
+                dst[(x / 2) * 4 + 1] = clamp_u8(u0);
+                dst[(x / 2) * 4 + 2] = clamp_u8(y1);
+                dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+            }
+            else
+            {
+                int y0 = (((int)clamp_s16((int)p0->y + 301) * 14016) >> 16) >> 2;
+                int u0 = (((int)clamp_s16((int)p0->cb + 2350) * 14336) >> 16) >> 2;
+                int y1 = (((int)clamp_s16((int)p1->y + 301) * 14016) >> 16) >> 2;
+                int v0 = (((int)clamp_s16((int)p0->cr + 2350) * 14336) >> 16) >> 2;
+                dst[(x / 2) * 4 + 0] = clamp_u8(y0);
+                dst[(x / 2) * 4 + 1] = clamp_u8(u0);
+                dst[(x / 2) * 4 + 2] = clamp_u8(y1);
+                dst[(x / 2) * 4 + 3] = clamp_u8(v0);
+            }
         }
     }
     return TRUE;
+}
+
+BOOL yc48_to_yuy2(unsigned char *dst_yuy2, int dst_stride,
+                  const PIXEL_YC *ycp, int yc_stride,
+                  int w, int h)
+{
+    return yc48_to_yuy2_ex(dst_yuy2, dst_stride, ycp, yc_stride, w, h, FALSE);
 }
 
 DWORD yc48_normalize_format(DWORD format)
@@ -223,7 +325,11 @@ size_t yc48_format_frame_size(int w, int h, DWORD format)
         return 0;
     }
     norm = yc48_normalize_format(format);
-    if (norm == 0x32595559u) // "YUY2"
+    if (norm == 0)
+    {
+        row_bytes = (size_t)((w * 3 + 3) & ~3);
+    }
+    else if (norm == 0x32595559u) // "YUY2"
     {
         row_bytes = (size_t)(((w + 1) / 2) * 4);
     }
@@ -233,7 +339,7 @@ size_t yc48_format_frame_size(int w, int h, DWORD format)
     }
     else
     {
-        row_bytes = (size_t)((w * 3 + 3) & ~3);
+        row_bytes = (size_t)((w * 4 + 3) & ~3);
     }
     return row_bytes * (size_t)h;
 }
@@ -252,11 +358,6 @@ BOOL yc48_convert_to_format(void *dst, const PIXEL_YC *ycp, int yc_stride,
     }
 
     norm = yc48_normalize_format(format);
-    if (norm == 0x32595559u) // "YUY2"
-    {
-        int stride = ((w + 1) / 2) * 4;
-        return yc48_to_yuy2((unsigned char *)dst, stride, ycp, yc_stride, w, h);
-    }
     if (norm == 0x38344359u) // "YC48"
     {
         int y;
@@ -272,6 +373,23 @@ BOOL yc48_convert_to_format(void *dst, const PIXEL_YC *ycp, int yc_stride,
             }
         }
         return TRUE;
+    }
+    if (norm == 0)
+    {
+        if (color_plugin_yc2pixel(dst, ycp, yc_stride, 0, w, h, TRUE))
+        {
+            return TRUE;
+        }
+        return yc2rgb_dib24((unsigned char *)dst, (w * 3 + 3) & ~3, ycp, yc_stride, w, h, TRUE);
+    }
+    if (color_plugin_yc2pixel(dst, ycp, yc_stride, norm, w, h, FALSE))
+    {
+        return TRUE;
+    }
+    if (norm == 0x32595559u) // "YUY2"
+    {
+        int stride = ((w + 1) / 2) * 4;
+        return yc48_to_yuy2((unsigned char *)dst, stride, ycp, yc_stride, w, h);
     }
     return yc2rgb_dib24((unsigned char *)dst, (w * 3 + 3) & ~3, ycp, yc_stride, w, h, TRUE);
 }

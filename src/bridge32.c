@@ -5,6 +5,9 @@
 #include "plugin_bridge.h"
 #include "plugin_manager.h"
 #include "video_export.h"
+#include "color_plugin.h"
+#include "input_plugin.h"
+#include "vfw_input.h"
 #include "exfunc.h"
 #include "editp.h"
 #include "debug_console.h"
@@ -21,6 +24,7 @@ static HANDLE g_write_ev = NULL;
 static HWND g_bridge_hwnd = NULL;
 static HWND g_host_main_hwnd = NULL;
 static EDITP *g_editp = NULL;
+static VFWInput *g_bridge_aui_handles[BRIDGE_MAX_OPEN_AUIS];
 static BOOL g_in_rpc = FALSE;
 static BOOL g_running = TRUE;
 
@@ -73,9 +77,14 @@ static void sync_shm_from_local(void)
     for (i = 0; i < fcount; i++)
     {
         const char *nm = plugin_manager_get_name(i);
+        const char *inf = plugin_manager_get_information(i);
+        const char *pth = plugin_manager_get_path(i);
         HWND hw = plugin_manager_get_window(i);
         int fl = plugin_manager_get_flags(i);
         lstrcpynA(g_shm->filters[i].name, nm ? nm : "", sizeof(g_shm->filters[i].name));
+        lstrcpynA(g_shm->filters[i].information, inf ? inf : "",
+                  sizeof(g_shm->filters[i].information));
+        lstrcpynA(g_shm->filters[i].path, pth ? pth : "", sizeof(g_shm->filters[i].path));
         g_shm->filters[i].flag = fl;
         g_shm->filters[i].has_window = (hw != NULL) ? 1 : 0;
         g_shm->filters[i].window_visible = ((fl & FILTER_FLAG_WINDOW_DISP) != 0) ? 1 : 0;
@@ -114,8 +123,58 @@ static void sync_shm_from_local(void)
                        sizeof(g_shm->auos[i].filefilter));
                 lstrcpynA(g_shm->auos[i].information, sum.information,
                           sizeof(g_shm->auos[i].information));
+                lstrcpynA(g_shm->auos[i].path, sum.path, sizeof(g_shm->auos[i].path));
                 g_shm->auos[i].flag = sum.flag;
                 g_shm->auos[i].has_config = sum.has_config ? 1 : 0;
+            }
+        }
+    }
+
+    {
+        int icount = input_plugin_get_ext_count();
+        if (icount > BRIDGE_MAX_AUIS)
+            icount = BRIDGE_MAX_AUIS;
+        g_shm->aui_count = icount;
+        for (i = 0; i < icount; i++)
+        {
+            InputPluginSummary isum;
+            if (input_plugin_get_ext_summary(i, &isum))
+            {
+                int flen = isum.filefilter_len;
+                lstrcpynA(g_shm->auis[i].name, isum.name, sizeof(g_shm->auis[i].name));
+                memset(g_shm->auis[i].filefilter, 0, sizeof(g_shm->auis[i].filefilter));
+                if (flen > 0)
+                {
+                    if (flen > (int)sizeof(g_shm->auis[i].filefilter))
+                        flen = (int)sizeof(g_shm->auis[i].filefilter);
+                    memcpy(g_shm->auis[i].filefilter, isum.filefilter, (size_t)flen);
+                }
+                g_shm->auis[i].filefilter_len = flen;
+                lstrcpynA(g_shm->auis[i].information, isum.information,
+                          sizeof(g_shm->auis[i].information));
+                lstrcpynA(g_shm->auis[i].path, isum.path, sizeof(g_shm->auis[i].path));
+                g_shm->auis[i].flag = isum.flag;
+                g_shm->auis[i].has_config = isum.has_config ? 1 : 0;
+                g_shm->auis[i].priority = isum.priority;
+            }
+        }
+    }
+
+    {
+        int ccount = color_plugin_get_ext_count();
+        if (ccount > BRIDGE_MAX_AUCS)
+            ccount = BRIDGE_MAX_AUCS;
+        g_shm->auc_count = ccount;
+        for (i = 0; i < ccount; i++)
+        {
+            ColorPluginSummary csum;
+            if (color_plugin_get_ext_summary(i, &csum))
+            {
+                lstrcpynA(g_shm->aucs[i].name, csum.name, sizeof(g_shm->aucs[i].name));
+                lstrcpynA(g_shm->aucs[i].information, csum.information,
+                          sizeof(g_shm->aucs[i].information));
+                lstrcpynA(g_shm->aucs[i].path, csum.path, sizeof(g_shm->aucs[i].path));
+                g_shm->aucs[i].flag = csum.flag;
             }
         }
     }
@@ -351,6 +410,140 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
             resp->ok = plugin_manager_toggle_window(req->arg0) ? 1 : 0;
         else
             resp->ok = plugin_manager_show_window(req->arg0, req->arg1 != 0) ? 1 : 0;
+        break;
+
+    case BRIDGE_CMD_SET_ACTIVE:
+        if (req->arg1 == 3)
+        {
+            plugin_manager_disable_all_filters();
+            resp->ok = 1;
+        }
+        else if (req->arg1 == 2)
+        {
+            resp->ok = plugin_manager_toggle_active(req->arg0) ? 1 : 0;
+        }
+        else
+        {
+            resp->ok = plugin_manager_set_active(req->arg0, req->arg1 != 0) ? 1 : 0;
+        }
+        break;
+
+    case BRIDGE_CMD_FILTER_IO:
+        resp->ok = plugin_manager_exec_import_export(req->arg0, req->arg1 != 0) ? 1 : 0;
+        break;
+
+    case BRIDGE_CMD_SCAN_INPUT_COLOR:
+        color_plugin_init(req->str, g_bridge_hwnd);
+        input_plugin_init(req->str, g_bridge_hwnd);
+        resp->val0 = input_plugin_get_ext_count();
+        resp->val1 = color_plugin_get_ext_count();
+        resp->ok = 1;
+        break;
+
+    case BRIDGE_CMD_AUI_CONFIG:
+    {
+        int idx = input_plugin_ext_to_index(req->arg0);
+        HWND owner = (g_host_main_hwnd && IsWindow(g_host_main_hwnd)) ? g_host_main_hwnd : g_bridge_hwnd;
+        resp->ok = (idx >= 0 && input_plugin_config(idx, owner)) ? 1 : 0;
+        break;
+    }
+
+    case BRIDGE_CMD_AUI_SET_PRIORITY:
+    {
+        int idx = input_plugin_ext_to_index(req->arg0);
+        if (idx >= 0)
+        {
+            input_plugin_set_single_priority(idx, req->arg1);
+            resp->ok = 1;
+        }
+        break;
+    }
+
+    case BRIDGE_CMD_AUI_OPEN:
+    {
+        int idx = input_plugin_ext_to_index(req->arg0);
+        int slot = -1, s;
+        resp->val0 = -1;
+        for (s = 0; s < BRIDGE_MAX_OPEN_AUIS; s++)
+        {
+            if (!g_bridge_aui_handles[s])
+            {
+                slot = s;
+                break;
+            }
+        }
+        if (idx >= 0 && slot >= 0 && g_shm)
+        {
+            FILE_INFO fi;
+            VFWInput *vin = vfw_input_open_aui_index(idx, req->str, &fi, req->arg1);
+            if (vin)
+            {
+                g_bridge_aui_handles[slot] = vin;
+                memset(&g_shm->aui_open_info, 0, sizeof(g_shm->aui_open_info));
+                g_shm->aui_open_info.has_video = (fi.flag & FILE_INFO_FLAG_VIDEO) ? 1 : 0;
+                g_shm->aui_open_info.has_audio = (fi.flag & FILE_INFO_FLAG_AUDIO) ? 1 : 0;
+                g_shm->aui_open_info.w = fi.w;
+                g_shm->aui_open_info.h = fi.h;
+                g_shm->aui_open_info.frame_n = fi.frame_n;
+                g_shm->aui_open_info.video_rate = fi.video_rate;
+                g_shm->aui_open_info.video_scale = fi.video_scale;
+                g_shm->aui_open_info.decode_bpp = fi.video_decode_bit ? fi.video_decode_bit : 24;
+                g_shm->aui_open_info.audio_rate = fi.audio_rate;
+                g_shm->aui_open_info.audio_ch = fi.audio_ch;
+                g_shm->aui_open_info.audio_n = fi.audio_n;
+                resp->val0 = slot;
+                resp->ok = 1;
+            }
+        }
+        break;
+    }
+
+    case BRIDGE_CMD_AUI_CLOSE:
+        if (req->arg0 >= 0 && req->arg0 < BRIDGE_MAX_OPEN_AUIS &&
+            g_bridge_aui_handles[req->arg0])
+        {
+            vfw_input_close(g_bridge_aui_handles[req->arg0]);
+            g_bridge_aui_handles[req->arg0] = NULL;
+            resp->ok = 1;
+        }
+        break;
+
+    case BRIDGE_CMD_AUI_READ_VIDEO:
+        if (req->arg0 >= 0 && req->arg0 < BRIDGE_MAX_OPEN_AUIS &&
+            g_bridge_aui_handles[req->arg0] && g_shm)
+        {
+            resp->ok = vfw_input_read_frame_stride(g_bridge_aui_handles[req->arg0],
+                                                   req->arg1,
+                                                   g_shm->ycp_frame,
+                                                   REAVIUTL_VRAM_W)
+                           ? 1
+                           : 0;
+        }
+        break;
+
+    case BRIDGE_CMD_AUI_READ_AUDIO:
+        if (req->arg0 >= 0 && req->arg0 < BRIDGE_MAX_OPEN_AUIS &&
+            g_bridge_aui_handles[req->arg0] && g_shm && req->arg2 > 0)
+        {
+            VFWInput *vin = g_bridge_aui_handles[req->arg0];
+            int smp = req->arg2;
+            int ch = (req->arg4 >= 2) ? 2 : 1;
+            if (smp > BRIDGE_MAX_AUDIO_SAMPLES)
+                smp = BRIDGE_MAX_AUDIO_SAMPLES;
+            if (req->arg3 > 0)
+                vfw_input_set_audio_format(vin, req->arg3, ch);
+            resp->val0 = vfw_input_read_audio(vin, req->arg1, g_shm->pcm_audio, smp);
+            resp->ok = 1;
+        }
+        break;
+
+    case BRIDGE_CMD_AUI_IS_KEYFRAME:
+        if (req->arg0 >= 0 && req->arg0 < BRIDGE_MAX_OPEN_AUIS &&
+            g_bridge_aui_handles[req->arg0])
+        {
+            resp->val0 = vfw_input_is_keyframe(g_bridge_aui_handles[req->arg0], req->arg1) ? 1 : 0;
+            resp->ok = 1;
+        }
         break;
 
     case BRIDGE_CMD_EXEC_MENU_ITEM:
@@ -646,8 +839,21 @@ int main(int argc, char **argv)
         CancelIo(g_pipe);
     }
 
+    {
+        int s;
+        for (s = 0; s < BRIDGE_MAX_OPEN_AUIS; s++)
+        {
+            if (g_bridge_aui_handles[s])
+            {
+                vfw_input_close(g_bridge_aui_handles[s]);
+                g_bridge_aui_handles[s] = NULL;
+            }
+        }
+    }
     video_export_shutdown();
     plugin_manager_shutdown();
+    input_plugin_shutdown();
+    color_plugin_shutdown();
     exfunc_shutdown();
     if (g_editp)
     {

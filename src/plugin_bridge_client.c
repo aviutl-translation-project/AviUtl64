@@ -428,8 +428,11 @@ BOOL plugin_bridge_load_file(const char *auf_path, HWND main_hwnd, EDITP *ep)
     return resp.val0 > 0;
 }
 
+static char g_scanned_ic_dir[MAX_PATH] = "";
+
 void plugin_bridge_shutdown(void)
 {
+    g_scanned_ic_dir[0] = '\0';
     if (g_active && g_pipe != INVALID_HANDLE_VALUE)
     {
         BridgeRpcReq req;
@@ -482,6 +485,20 @@ const char *plugin_bridge_get_filter_name(int idx)
     return g_shm->filters[idx].name;
 }
 
+const char *plugin_bridge_get_filter_info(int idx)
+{
+    if (!g_active || !g_shm || idx < 0 || idx >= g_shm->filter_count)
+        return NULL;
+    return g_shm->filters[idx].information;
+}
+
+const char *plugin_bridge_get_filter_path(int idx)
+{
+    if (!g_active || !g_shm || idx < 0 || idx >= g_shm->filter_count)
+        return NULL;
+    return g_shm->filters[idx].path;
+}
+
 int plugin_bridge_get_filter_flags(int idx)
 {
     if (!g_active || !g_shm || idx < 0 || idx >= g_shm->filter_count)
@@ -518,6 +535,34 @@ BOOL plugin_bridge_show_window(int idx, int mode)
     req.arg0 = idx;
     req.arg1 = mode;
     return bridge_rpc(&req, &resp, 5000);
+}
+
+BOOL plugin_bridge_set_filter_active(int idx, int mode)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_SET_ACTIVE;
+    req.arg0 = idx;
+    req.arg1 = mode;
+    return bridge_rpc(&req, &resp, 5000);
+}
+
+BOOL plugin_bridge_filter_io(int filter_idx, BOOL is_export, EDITP *ep)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (ep)
+        plugin_bridge_sync_to_bridge(ep);
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_FILTER_IO;
+    req.arg0 = filter_idx;
+    req.arg1 = is_export ? 1 : 0;
+    if (!bridge_rpc(&req, &resp, 120000))
+        return FALSE;
+    if (ep)
+        plugin_bridge_sync_from_bridge(ep);
+    return TRUE;
 }
 
 BOOL plugin_bridge_exec_menu_item(int menu_idx)
@@ -991,6 +1036,182 @@ void plugin_bridge_request_encode_abort(void)
     }
 }
 
+BOOL plugin_bridge_scan_input_color(const char *plugin_dir, HWND main_hwnd)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    const char *dir = plugin_dir ? plugin_dir : "";
+    if (!ensure_bridge_started(main_hwnd))
+        return FALSE;
+    if (g_active && g_scanned_ic_dir[0] && lstrcmpiA(g_scanned_ic_dir, dir) == 0)
+        return TRUE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_SCAN_INPUT_COLOR;
+    lstrcpynA(req.str, dir, sizeof(req.str));
+    if (!bridge_rpc(&req, &resp, 15000))
+        return FALSE;
+    lstrcpynA(g_scanned_ic_dir, dir, sizeof(g_scanned_ic_dir));
+    return TRUE;
+}
+
+int plugin_bridge_get_aui_count(void)
+{
+    return (g_active && g_shm) ? g_shm->aui_count : 0;
+}
+
+BOOL plugin_bridge_get_aui_info(int idx, BridgeAuiInfo *out_info)
+{
+    if (!g_active || !g_shm || !out_info || idx < 0 || idx >= g_shm->aui_count)
+        return FALSE;
+    *out_info = g_shm->auis[idx];
+    return TRUE;
+}
+
+BOOL plugin_bridge_aui_config(int idx, HWND owner)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active)
+        return FALSE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_CONFIG;
+    req.arg0 = idx;
+    return bridge_rpc_interactive(&req, &resp, owner, NULL, NULL);
+}
+
+BOOL plugin_bridge_aui_set_priority(int idx, int priority)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active)
+        return FALSE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_SET_PRIORITY;
+    req.arg0 = idx;
+    req.arg1 = priority;
+    return bridge_rpc(&req, &resp, 5000);
+}
+
+int plugin_bridge_aui_open(int idx, const char *filepath, int open_flag, BridgeAuiOpenInfo *out_info)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active || !g_shm || !filepath || !filepath[0])
+        return -1;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_OPEN;
+    req.arg0 = idx;
+    req.arg1 = open_flag;
+    lstrcpynA(req.str, filepath, sizeof(req.str));
+    if (!bridge_rpc(&req, &resp, 15000) || resp.val0 < 0)
+        return -1;
+    if (out_info)
+        *out_info = g_shm->aui_open_info;
+    return resp.val0;
+}
+
+BOOL plugin_bridge_aui_close(int handle_slot)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active || handle_slot < 0)
+        return FALSE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_CLOSE;
+    req.arg0 = handle_slot;
+    return bridge_rpc(&req, &resp, 5000);
+}
+
+BOOL plugin_bridge_aui_read_video(int handle_slot, int frame_num, PIXEL_YC *ycp, int yc_stride, int w, int h)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    int copy_w, copy_h, y;
+    if (!g_active || !g_shm || handle_slot < 0 || !ycp || w <= 0 || h <= 0)
+        return FALSE;
+    if (yc_stride <= 0)
+        yc_stride = w;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_READ_VIDEO;
+    req.arg0 = handle_slot;
+    req.arg1 = frame_num;
+    if (!bridge_rpc(&req, &resp, 10000))
+        return FALSE;
+    copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
+    copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
+    for (y = 0; y < copy_h; y++)
+    {
+        memcpy(ycp + (size_t)y * (size_t)yc_stride,
+               &g_shm->ycp_frame[(size_t)y * (size_t)REAVIUTL_VRAM_W],
+               (size_t)copy_w * sizeof(PIXEL_YC));
+    }
+    return TRUE;
+}
+
+int plugin_bridge_aui_read_audio(int handle_slot, int sample_num, short *buf, int samples, int req_rate, int req_ch)
+{
+    int copy_ch = (req_ch >= 2) ? 2 : 1;
+    int done = 0;
+    if (!g_active || !g_shm || handle_slot < 0 || !buf || samples <= 0)
+        return 0;
+    while (done < samples)
+    {
+        BridgeRpcReq req;
+        BridgeRpcResp resp;
+        int chunk = samples - done;
+        int got;
+        if (chunk > BRIDGE_MAX_AUDIO_SAMPLES)
+            chunk = BRIDGE_MAX_AUDIO_SAMPLES;
+        ZeroMemory(&req, sizeof(req));
+        req.cmd = BRIDGE_CMD_AUI_READ_AUDIO;
+        req.arg0 = handle_slot;
+        req.arg1 = sample_num + done;
+        req.arg2 = chunk;
+        req.arg3 = req_rate;
+        req.arg4 = copy_ch;
+        if (!bridge_rpc(&req, &resp, 10000) || resp.val0 <= 0)
+            break;
+        got = resp.val0;
+        if (got > chunk)
+            got = chunk;
+        memcpy(buf + (size_t)done * (size_t)copy_ch,
+               g_shm->pcm_audio,
+               (size_t)got * (size_t)copy_ch * sizeof(short));
+        done += got;
+        if (got < chunk)
+            break;
+    }
+    return done;
+}
+
+BOOL plugin_bridge_aui_is_keyframe(int handle_slot, int frame_num)
+{
+    BridgeRpcReq req;
+    BridgeRpcResp resp;
+    if (!g_active || handle_slot < 0)
+        return TRUE;
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = BRIDGE_CMD_AUI_IS_KEYFRAME;
+    req.arg0 = handle_slot;
+    req.arg1 = frame_num;
+    if (!bridge_rpc(&req, &resp, 5000))
+        return TRUE;
+    return resp.val0 != 0;
+}
+
+int plugin_bridge_get_auc_count(void)
+{
+    return (g_active && g_shm) ? g_shm->auc_count : 0;
+}
+
+BOOL plugin_bridge_get_auc_info(int idx, BridgeAucInfo *out_info)
+{
+    if (!g_active || !g_shm || !out_info || idx < 0 || idx >= g_shm->auc_count)
+        return FALSE;
+    *out_info = g_shm->aucs[idx];
+    return TRUE;
+}
+
 #else
 
 BOOL plugin_bridge_is_active(void)
@@ -1198,6 +1419,106 @@ BOOL plugin_bridge_auo_config(int i, HWND o)
 }
 void plugin_bridge_request_encode_abort(void)
 {
+}
+const char *plugin_bridge_get_filter_info(int index)
+{
+    (void)index;
+    return "";
+}
+const char *plugin_bridge_get_filter_path(int index)
+{
+    (void)index;
+    return "";
+}
+BOOL plugin_bridge_set_filter_active(int index, int mode)
+{
+    (void)index;
+    (void)mode;
+    return FALSE;
+}
+BOOL plugin_bridge_filter_io(int index, BOOL is_export, EDITP *ep)
+{
+    (void)index;
+    (void)is_export;
+    (void)ep;
+    return FALSE;
+}
+BOOL plugin_bridge_scan_input_color(const char *plugin_dir, HWND main_hwnd)
+{
+    (void)plugin_dir;
+    (void)main_hwnd;
+    return FALSE;
+}
+int plugin_bridge_get_aui_count(void)
+{
+    return 0;
+}
+BOOL plugin_bridge_get_aui_info(int idx, BridgeAuiInfo *out_info)
+{
+    (void)idx;
+    (void)out_info;
+    return FALSE;
+}
+BOOL plugin_bridge_aui_config(int idx, HWND owner)
+{
+    (void)idx;
+    (void)owner;
+    return FALSE;
+}
+BOOL plugin_bridge_aui_set_priority(int idx, int priority)
+{
+    (void)idx;
+    (void)priority;
+    return FALSE;
+}
+int plugin_bridge_aui_open(int idx, const char *filepath, int open_flag, BridgeAuiOpenInfo *out_info)
+{
+    (void)idx;
+    (void)filepath;
+    (void)open_flag;
+    (void)out_info;
+    return -1;
+}
+BOOL plugin_bridge_aui_close(int handle_slot)
+{
+    (void)handle_slot;
+    return FALSE;
+}
+BOOL plugin_bridge_aui_read_video(int handle_slot, int frame_num, PIXEL_YC *ycp, int yc_stride, int w, int h)
+{
+    (void)handle_slot;
+    (void)frame_num;
+    (void)ycp;
+    (void)yc_stride;
+    (void)w;
+    (void)h;
+    return FALSE;
+}
+int plugin_bridge_aui_read_audio(int handle_slot, int sample_num, short *buf, int samples, int req_rate, int req_ch)
+{
+    (void)handle_slot;
+    (void)sample_num;
+    (void)buf;
+    (void)samples;
+    (void)req_rate;
+    (void)req_ch;
+    return 0;
+}
+BOOL plugin_bridge_aui_is_keyframe(int handle_slot, int frame_num)
+{
+    (void)handle_slot;
+    (void)frame_num;
+    return TRUE;
+}
+int plugin_bridge_get_auc_count(void)
+{
+    return 0;
+}
+BOOL plugin_bridge_get_auc_info(int idx, BridgeAucInfo *out_info)
+{
+    (void)idx;
+    (void)out_info;
+    return FALSE;
 }
 
 #endif

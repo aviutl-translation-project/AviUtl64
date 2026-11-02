@@ -6,6 +6,7 @@
 #include "exfunc.h"
 #include "yc48_convert.h"
 #include "vfw_input.h"
+#include "input_plugin.h"
 #include "debug_console.h"
 
 static EDITP *g_current_editp = NULL;
@@ -1229,11 +1230,7 @@ static void *__cdecl impl_avi_file_get_video_pixelp(AVI_FILE_HANDLE afh, int n)
 // +0x0fc
 static LPSTR __cdecl impl_get_avi_file_filter(int type)
 {
-    static char s_vid_flt[] =
-        "Media Files (*.avi;*.mp3;*.wav;*.bmp;*.png;*.jpg)\0*.avi;*.mp3;*.wav;*.bmp;*.png;*.jpg\0All Files (*.*)\0*.*\0";
-    static char s_aud_flt[] =
-        "Audio / Video Files (*.mp3;*.wav;*.avi)\0*.mp3;*.wav;*.avi\0All Files (*.*)\0*.*\0";
-    return (type == 1) ? s_aud_flt : s_vid_flt;
+    return input_plugin_get_file_filter(type);
 }
 
 // +0x100

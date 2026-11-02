@@ -16,6 +16,7 @@ typedef struct AuoPluginSummary
     char name[128];
     char filefilter[512];
     char information[256];
+    char path[MAX_PATH];
     int flag;
     BOOL has_config;
     BOOL bridged_x86;
@@ -40,7 +41,7 @@ BOOL video_export_get_auo_summary(int idx, AuoPluginSummary *out_summary);
 const char *video_export_get_auo_name(int idx);
 int video_export_find_auo_by_name(const char *name);
 
-void video_export_populate_menu(HMENU bar, BOOL is_ja);
+void video_export_populate_menu(HMENU bar, const wchar_t *none_label);
 
 BOOL video_export_avi_dialog(HWND owner, EDITP *ep);
 BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out_flags);
@@ -54,8 +55,9 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
 
 BOOL video_export_choose_video_codec(HWND owner, EDITP *ep);
 BOOL video_export_choose_audio_codec(HWND owner, EDITP *ep);
+int video_export_get_last_auo_index(void);
+void video_export_set_last_auo_index(int auo_idx);
 BOOL video_export_auo_config_dialog(HWND owner, int auo_idx);
-void video_export_show_auo_info(HWND owner, BOOL is_ja);
 
 void video_export_request_abort(void);
 BOOL video_export_is_encoding(void);

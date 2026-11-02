@@ -1,0 +1,1906 @@
+#include <windows.h>
+#include <commctrl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "plugin_manager.h"
+#include "plugin_loader.h"
+#include "plugin_bridge.h"
+#include "aup_project.h"
+#include "editp.h"
+#include "exfunc.h"
+#include "debug_console.h"
+
+#define MAX_PLUGINS 128
+#define MAX_PLUGIN_MENU_ITEMS 512
+#define MAX_TRACK_CTRLS 64
+#define MAX_CHECK_CTRLS 48
+
+// internal child control IDs inside standard SDK filter windows
+#define IDC_FLT_ACTIVE 45000
+#define IDC_FLT_CHECK_BASE 45100
+
+#define FILTER_CONTAINER_CLASS "AviUtlFilterClass"
+#define HOST_DUMMY_OWNER_CLASS "AviUtlHostDummyOwner"
+
+typedef struct
+{
+    char path[MAX_PATH];
+    char name[256];
+    HMODULE module;
+    FILTER_DLL *src_dll;
+    FILTER runtime; // persistent exedit caches &e->runtime in g_fp_main
+    HWND hwnd;
+    int index;
+    int cmd_id;
+    BOOL stage1_initialized;
+    BOOL stage2_initialized;
+    BOOL faulted;
+    BOOL teardown;
+
+    // standard SDK trackbar/checkbox controls (for non-custom filters)
+    HWND hwnd_active_chk;
+    HWND hwnd_track_bar[MAX_TRACK_CTRLS];
+    HWND hwnd_track_val[MAX_TRACK_CTRLS];
+    HWND hwnd_check_btn[MAX_CHECK_CTRLS];
+} PluginEntry;
+
+static PluginEntry g_plugins[MAX_PLUGINS];
+static int g_plugin_count = 0;
+
+static PluginMenuItem g_menu_items[MAX_PLUGIN_MENU_ITEMS];
+static int g_menu_item_count = 0;
+
+static HWND g_main_hwnd = NULL;
+static HWND g_dummy_owner_hwnd = NULL;
+static BOOL g_classes_registered = FALSE;
+
+// shift-jis (CP932) to UTF-16 helper so Japanese plugin labels render on all locales
+static void sjis_to_wide(const char *src, wchar_t *dst, int dst_cch)
+{
+    if (!dst || dst_cch <= 0)
+        return;
+    dst[0] = L'\0';
+    if (!src || !src[0])
+        return;
+    if (MultiByteToWideChar(932, 0, src, -1, dst, dst_cch) > 0)
+        return;
+    MultiByteToWideChar(CP_ACP, 0, src, -1, dst, dst_cch);
+}
+
+static void post_host_redraw(WPARAM kind)
+{
+    if (g_main_hwnd && IsWindow(g_main_hwnd))
+    {
+        PostMessageA(g_main_hwnd, WM_REAVIUTL_PLUGIN_REDRAW, kind, 0);
+    }
+}
+
+static BOOL safe_call_func_init(PluginEntry *e)
+{
+    BOOL ok = FALSE;
+    __try
+    {
+        ok = e->runtime.func_init(&e->runtime);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, "Stage 1 func_init"))
+    {
+        e->faulted = TRUE;
+        ok = FALSE;
+    }
+    return ok;
+}
+
+static BOOL safe_call_wndproc(PluginEntry *e, HWND hwnd, UINT msg,
+                              WPARAM wp, LPARAM lp, void *editp, const char *stage)
+{
+    BOOL res = FALSE;
+    if (!e || e->faulted || !e->runtime.func_WndProc)
+        return FALSE;
+    __try
+    {
+        res = e->runtime.func_WndProc(hwnd, msg, wp, lp, editp, &e->runtime);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, stage))
+    {
+        e->faulted = TRUE;
+        e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+        res = FALSE;
+    }
+    return res;
+}
+
+static BOOL safe_call_func_proc(PluginEntry *e, FILTER_PROC_INFO *fpip)
+{
+    BOOL res = FALSE;
+    if (!e || e->faulted || !e->runtime.func_proc)
+        return FALSE;
+    __try
+    {
+        res = e->runtime.func_proc(&e->runtime, fpip);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, "func_proc"))
+    {
+        e->faulted = TRUE;
+        e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+        res = FALSE;
+    }
+    return res;
+}
+
+static void safe_call_func_exit(PluginEntry *e)
+{
+    if (!e || e->faulted || !e->runtime.func_exit)
+        return;
+    __try
+    {
+        e->runtime.func_exit(&e->runtime);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, "func_exit"))
+    {
+        e->faulted = TRUE;
+    }
+}
+
+static void safe_call_save_start(PluginEntry *e, int s, int end_f, void *editp)
+{
+    if (!e || e->faulted || !e->runtime.func_save_start)
+        return;
+    __try
+    {
+        e->runtime.func_save_start(&e->runtime, s, end_f, editp);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, "func_save_start"))
+    {
+        e->faulted = TRUE;
+    }
+}
+
+static void safe_call_save_end(PluginEntry *e, void *editp)
+{
+    if (!e || e->faulted || !e->runtime.func_save_end)
+        return;
+    __try
+    {
+        e->runtime.func_save_end(&e->runtime, editp);
+    }
+    __except (debug_console_seh_filter(GetExceptionInformation(), e->name, "func_save_end"))
+    {
+        e->faulted = TRUE;
+    }
+}
+
+static FILTER *cb_filter_lookup(int filter_id)
+{
+    if (filter_id < 0 || filter_id >= g_plugin_count)
+        return NULL;
+    return &g_plugins[filter_id].runtime;
+}
+
+static int find_entry_index_by_fp(const FILTER *fp)
+{
+    int i;
+    if (!fp)
+        return -1;
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        if (&g_plugins[i].runtime == fp || (const FILTER *)g_plugins[i].src_dll == fp)
+            return i;
+        if (fp->name && g_plugins[i].runtime.name &&
+            lstrcmpA(fp->name, g_plugins[i].runtime.name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static BOOL cb_add_menu_item(FILTER *fp, LPSTR name, HWND hwnd,
+                             int id, int def_key, int flag)
+{
+    PluginMenuItem *it;
+    if (!name || !name[0] || g_menu_item_count >= MAX_PLUGIN_MENU_ITEMS)
+        return FALSE;
+
+    it = &g_menu_items[g_menu_item_count++];
+    it->filter_index = find_entry_index_by_fp(fp);
+    lstrcpynA(it->name, name, sizeof(it->name));
+    it->hwnd = hwnd;
+    it->cmd_id = id;
+    it->def_key = def_key;
+    it->flag = flag;
+    return TRUE;
+}
+
+static void cb_host_state_changed(EDITP *ep)
+{
+    (void)ep;
+    post_host_redraw(1);
+}
+
+static BOOL cb_host_edit_open(EDITP *ep, const char *file, int flag)
+{
+    if (!ep || !file || !file[0])
+        return FALSE;
+    if ((flag & EDIT_OPEN_FLAG_AUDIO) != 0 && editp_is_editing(ep))
+    {
+        if (!editp_open_audio(ep, file))
+            return FALSE;
+        plugin_manager_notify_update(ep);
+        post_host_redraw(2);
+        return TRUE;
+    }
+    if (!editp_open_video(ep, file))
+        return FALSE;
+    // broadcast WM_FILTER_FILE_OPEN before returning so exedit's 0x1003ac30 immediately initializes timeline length & canvas state
+    plugin_manager_notify_file_open(ep);
+    post_host_redraw(2);
+    return TRUE;
+}
+
+static BOOL cb_host_edit_close(EDITP *ep)
+{
+    if (!ep)
+        return FALSE;
+    plugin_manager_notify_file_close(ep);
+    editp_close_video(ep);
+    post_host_redraw(2);
+    return TRUE;
+}
+
+static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_before_fp)
+{
+    int i;
+    FILTER_PROC_INFO fpip;
+
+    if (!ep || !editp_is_editing(ep))
+        return FALSE;
+    editp_load_frame(ep, frame_num);
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+
+        if (stop_before_fp && (fp == stop_before_fp ||
+                               (const FILTER *)e->src_dll == stop_before_fp))
+        {
+            break;
+        }
+        if (!e->stage1_initialized || e->faulted)
+            continue;
+        if (!(fp->flag & FILTER_FLAG_ACTIVE))
+            continue;
+        if (fp->flag & FILTER_FLAG_AUDIO_FILTER)
+            continue;
+        if (!fp->func_proc)
+            continue;
+
+        ZeroMemory(&fpip, sizeof(fpip));
+        fpip.flag = 0;
+        fpip.ycp_edit = editp_get_ycp_edit(ep);
+        fpip.ycp_temp = editp_get_ycp_temp(ep);
+        editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
+        fpip.frame = editp_get_frame(ep);
+        fpip.frame_n = editp_get_frame_n(ep);
+        fpip.org_w = fpip.w;
+        fpip.org_h = fpip.h;
+        fpip.audiop = NULL;
+        fpip.audio_n = 0;
+        fpip.audio_ch = editp_get_audio_ch(ep);
+        fpip.pixelp = NULL;
+        fpip.editp = ep;
+        fpip.yc_size = (int)sizeof(PIXEL_YC);
+        fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+
+        safe_call_func_proc(e, &fpip);
+
+        // plugins such as exedit may swap fpip.ycp_edit and fpip.ycp_temp
+        if (fpip.ycp_edit == editp_get_ycp_temp(ep))
+        {
+            editp_swap_ycp(ep, fpip.ycp_edit, fpip.ycp_temp);
+        }
+        if (fpip.w > 0 && fpip.h > 0 &&
+            fpip.w <= fpip.max_w && fpip.h <= fpip.max_h)
+        {
+            editp_set_dimensions(ep, fpip.w, fpip.h);
+        }
+    }
+    return TRUE;
+}
+
+static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
+                                 int frame_num, PIXEL_YC *out_ycp)
+{
+    int saved_frame;
+    int w = 0, h = 0, max_w = 0, max_h = 0;
+
+    if (!ep || !out_ycp || !editp_is_editing(ep))
+        return FALSE;
+    saved_frame = editp_get_frame(ep);
+    if (stop_before_fp == NULL)
+    {
+        plugin_manager_render_video_frame(ep, frame_num);
+    }
+    else
+    {
+        render_pipeline_range(ep, frame_num, stop_before_fp);
+    }
+    editp_get_dimensions(ep, &w, &h, &max_w, &max_h);
+    memcpy(out_ycp, editp_get_ycp_edit(ep),
+           (size_t)max_w * (size_t)max_h * sizeof(PIXEL_YC));
+    if (saved_frame != frame_num)
+    {
+        editp_set_frame(ep, saved_frame);
+    }
+    return TRUE;
+}
+
+static int cb_host_render_audio_up_to(FILTER *stop_before_fp, EDITP *ep,
+                                      int frame_num, short *out_pcm)
+{
+    int samples;
+    if (!ep || !editp_is_editing(ep))
+        return 0;
+    samples = editp_read_audio_frame(ep, frame_num, out_pcm);
+    if (!out_pcm || samples <= 0)
+        return samples;
+    return plugin_manager_apply_audio_filters(ep, frame_num, out_pcm, samples, stop_before_fp);
+}
+
+// 0x0042f870, filter container wndproc
+static LRESULT CALLBACK AviUtlFilterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    PluginEntry *e;
+
+    if (msg == WM_NCCREATE)
+    {
+        CREATESTRUCTA *cs = (CREATESTRUCTA *)lp;
+        e = cs ? (PluginEntry *)cs->lpCreateParams : NULL;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)e);
+        return DefWindowProcA(hwnd, msg, wp, lp);
+    }
+
+    e = (PluginEntry *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    if (msg == WM_SETTEXT && lp != 0)
+    {
+        // convert cp932 SetWindowTextA titles to utf-16 for non-japanese locales
+        wchar_t wtitle[512];
+        sjis_to_wide((const char *)lp, wtitle, 512);
+        return DefWindowProcW(hwnd, WM_SETTEXT, wp, (LPARAM)wtitle);
+    }
+
+    if (msg == WM_GETMINMAXINFO)
+    {
+        LRESULT lr = DefWindowProcA(hwnd, msg, wp, lp);
+        if (lp && (GetWindowLongA(hwnd, GWL_STYLE) & WS_THICKFRAME))
+        {
+            MINMAXINFO *mmi = (MINMAXINFO *)lp;
+            if (mmi->ptMinTrackSize.x < 128)
+                mmi->ptMinTrackSize.x = 128;
+            if (mmi->ptMinTrackSize.y < 96)
+                mmi->ptMinTrackSize.y = 96;
+        }
+        return lr;
+    }
+
+    if (msg == WM_CLOSE && e && !e->teardown)
+    {
+        // aviutl hides filter windows on [X] instead of destroying them
+        plugin_manager_show_window(e->index, FALSE);
+        return 0;
+    }
+
+    // standard SDK trackbar/checkbox handling when filter uses host controls
+    if (e && e->stage1_initialized && !e->teardown)
+    {
+        if (msg == WM_HSCROLL && lp != 0 && e->runtime.track)
+        {
+            int t;
+            HWND hBar = (HWND)lp;
+            for (t = 0; t < e->runtime.track_n && t < MAX_TRACK_CTRLS; t++)
+            {
+                if (e->hwnd_track_bar[t] == hBar)
+                {
+                    int val = (int)SendMessageA(hBar, TBM_GETPOS, 0, 0);
+                    char buf[32];
+                    e->runtime.track[t] = val;
+                    wsprintfA(buf, "%d", val);
+                    if (e->hwnd_track_val[t])
+                        SetWindowTextA(e->hwnd_track_val[t], buf);
+                    if (e->runtime.func_update)
+                    {
+                        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_TRACK + t);
+                    }
+                    if (e->runtime.func_WndProc)
+                    {
+                        e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                                                exfunc_get_editp(), &e->runtime);
+                    }
+                    post_host_redraw(1);
+                    return 0;
+                }
+            }
+        }
+        else if (msg == WM_COMMAND)
+        {
+            int id = LOWORD(wp);
+            if (id == IDC_FLT_ACTIVE && e->hwnd_active_chk)
+            {
+                if (SendMessageA(e->hwnd_active_chk, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                    e->runtime.flag |= FILTER_FLAG_ACTIVE;
+                else
+                    e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+                if (e->src_dll)
+                    e->src_dll->flag = e->runtime.flag;
+                if (e->runtime.func_update)
+                {
+                    e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
+                }
+                if (e->runtime.func_WndProc)
+                {
+                    e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
+                                            exfunc_get_editp(), &e->runtime);
+                }
+                post_host_redraw(1);
+                return 0;
+            }
+            if (id >= IDC_FLT_CHECK_BASE &&
+                id < IDC_FLT_CHECK_BASE + e->runtime.check_n &&
+                id - IDC_FLT_CHECK_BASE < MAX_CHECK_CTRLS)
+            {
+                int c = id - IDC_FLT_CHECK_BASE;
+                if (e->runtime.check_default && e->runtime.check_default[c] >= 0 &&
+                    e->runtime.check && e->hwnd_check_btn[c])
+                {
+                    e->runtime.check[c] =
+                        (SendMessageA(e->hwnd_check_btn[c], BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                    if (e->runtime.func_update)
+                    {
+                        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_CHECK + c);
+                    }
+                    if (e->runtime.func_WndProc)
+                    {
+                        e->runtime.func_WndProc(hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                                                exfunc_get_editp(), &e->runtime);
+                    }
+                    post_host_redraw(1);
+                    return 0;
+                }
+                // pushbutton check item (check_default < 0): fall through so plugin's func_WndProc also sees WM_COMMAND if desired
+            }
+        }
+    }
+
+    if (e && e->stage1_initialized && !e->teardown && e->runtime.func_WndProc)
+    {
+        BOOL need_redraw = e->runtime.func_WndProc(
+            hwnd, msg, wp, lp, exfunc_get_editp(), &e->runtime);
+        if (need_redraw)
+        {
+            post_host_redraw(1);
+        }
+        // custom WM_FILTER_* messages (0x0464) do not go to DefWindowProc
+        if (msg >= WM_FILTER_UPDATE && msg <= 0x0490)
+        {
+            return (LRESULT)need_redraw;
+        }
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void ensure_window_classes(void)
+{
+    WNDCLASSA wc;
+    HINSTANCE hInst;
+    if (g_classes_registered)
+        return;
+
+    InitCommonControls();
+    hInst = GetModuleHandleA(NULL);
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.style = CS_VREDRAW | CS_HREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = AviUtlFilterWndProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = FILTER_CONTAINER_CLASS;
+    RegisterClassA(&wc);
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = hInst;
+    wc.lpszClassName = HOST_DUMMY_OWNER_CLASS;
+    RegisterClassA(&wc);
+
+    g_classes_registered = TRUE;
+}
+
+static HWND ensure_owner_hwnd(HWND main_hwnd)
+{
+    if (main_hwnd && IsWindow(main_hwnd))
+    {
+        return main_hwnd;
+    }
+    if (!g_dummy_owner_hwnd || !IsWindow(g_dummy_owner_hwnd))
+    {
+        g_dummy_owner_hwnd = CreateWindowExA(
+            0, HOST_DUMMY_OWNER_CLASS, "AviUtl", WS_OVERLAPPEDWINDOW,
+            0, 0, 320, 240, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    }
+    return g_dummy_owner_hwnd;
+}
+
+static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
+{
+    const FILTER_DLL *f = e->src_dll;
+    DWORD style;
+    DWORD ex_style = WS_EX_TOOLWINDOW;
+    int w, h, raw_x, raw_y, t, c, y_pos;
+    RECT rc;
+    HWND hwnd;
+    HMENU sysm;
+    HINSTANCE hInst = GetModuleHandleA(NULL);
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    if (!f)
+        return NULL;
+    // match aviutl 0042c930: skip window when NO_CONFIG or popup/check/radio menu item
+    if (f->flag & (FILTER_FLAG_NO_CONFIG | FILTER_FLAG_CONFIG_POPUP |
+                   FILTER_FLAG_CONFIG_CHECK | FILTER_FLAG_CONFIG_RADIO))
+    {
+        return NULL;
+    }
+
+    style = WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    if (f->flag & FILTER_FLAG_WINDOW_THICKFRAME)
+        style |= WS_THICKFRAME;
+    if (f->flag & FILTER_FLAG_WINDOW_HSCROLL)
+        style |= WS_HSCROLL;
+    if (f->flag & FILTER_FLAG_WINDOW_VSCROLL)
+        style |= WS_VSCROLL;
+
+    w = 314;
+    h = ((f->flag & FILTER_FLAG_ALWAYS_ACTIVE) ? 0 : 20) + 14 +
+        f->check_n * 20 + f->track_n * 24;
+
+    raw_x = (f->flag & FILTER_FLAG_WINDOW_SIZE) ? f->x : FILTER_WINDOW_SIZE_CLIENT;
+    raw_y = (f->flag & FILTER_FLAG_WINDOW_SIZE) ? f->y : FILTER_WINDOW_SIZE_CLIENT;
+
+    if (f->flag & FILTER_FLAG_WINDOW_SIZE)
+    {
+        int vx = raw_x & 0x0fffffff;
+        int vy = raw_y & 0x0fffffff;
+        w = (raw_x & 0x20000000) ? (w + vx) : vx;
+        h = (raw_y & 0x20000000) ? (h + vy) : vy;
+    }
+    if (w < 160)
+        w = 560; // default initial width before plugin's WM_FILTER_INIT SetWindowPos
+    if (h < 48)
+        h = 200;
+
+    SetRect(&rc, 0, 0, w, h);
+    AdjustWindowRectEx(&rc, style, FALSE, ex_style);
+    if (raw_x & FILTER_WINDOW_SIZE_CLIENT)
+        w = rc.right - rc.left;
+    if (raw_y & FILTER_WINDOW_SIZE_CLIENT)
+        h = rc.bottom - rc.top;
+
+    // create owned top-level tool window (hWndParent = owner_hwnd without WS_CHILD sets GW_OWNER == owner_hwnd, required by exedit's func_init)
+    hwnd = CreateWindowExA(
+        ex_style,
+        FILTER_CONTAINER_CLASS,
+        f->name ? f->name : "Filter",
+        style,
+        CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+        owner_hwnd, NULL, hInst, e);
+    if (!hwnd)
+        return NULL;
+
+    // trigger WM_SETTEXT handler so CP932 caption renders as UTF-16 on all locales
+    if (f->name && f->name[0])
+    {
+        SetWindowTextA(hwnd, f->name);
+    }
+
+    sysm = GetSystemMenu(hwnd, FALSE);
+    if (sysm)
+    {
+        DeleteMenu(sysm, SC_MAXIMIZE, MF_BYCOMMAND);
+        DeleteMenu(sysm, SC_MINIMIZE, MF_BYCOMMAND);
+    }
+
+    // populate standard SDK controls if the filter declares trackbars or checkboxes
+    y_pos = 6;
+    if ((f->track_n > 0 || f->check_n > 0) && !(f->flag & FILTER_FLAG_ALWAYS_ACTIVE))
+    {
+        e->hwnd_active_chk = CreateWindowExA(
+            0, "BUTTON", "Active", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            8, y_pos, 100, 18, hwnd, (HMENU)(UINT_PTR)IDC_FLT_ACTIVE, hInst, NULL);
+        if (e->hwnd_active_chk)
+            SendMessageA(e->hwnd_active_chk, WM_SETFONT, (WPARAM)hFont, 0);
+        y_pos += 20;
+    }
+
+    for (t = 0; t < f->track_n && t < MAX_TRACK_CTRLS; t++)
+    {
+        const char *tname = (f->track_name && f->track_name[t]) ? f->track_name[t] : "";
+        int s_val = f->track_s ? f->track_s[t] : 0;
+        int e_val = f->track_e ? f->track_e[t] : 256;
+        int d_val = f->track_default ? f->track_default[t] : 0;
+        char vbuf[32];
+        HWND hLbl;
+
+        hLbl = CreateWindowExA(0, "STATIC", tname, WS_CHILD | WS_VISIBLE,
+                               6, y_pos + 3, 68, 16, hwnd, NULL, hInst, NULL);
+        if (hLbl)
+            SendMessageA(hLbl, WM_SETFONT, (WPARAM)hFont, 0);
+
+        e->hwnd_track_bar[t] = CreateWindowExA(
+            0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_NOTICKS,
+            76, y_pos, 184, 22, hwnd, NULL, hInst, NULL);
+        if (e->hwnd_track_bar[t])
+        {
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETRANGEMIN, FALSE, s_val);
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETRANGEMAX, TRUE, e_val);
+            SendMessageA(e->hwnd_track_bar[t], TBM_SETPOS, TRUE, d_val);
+        }
+
+        wsprintfA(vbuf, "%d", d_val);
+        e->hwnd_track_val[t] = CreateWindowExA(
+            0, "STATIC", vbuf, WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            262, y_pos + 3, 42, 16, hwnd, NULL, hInst, NULL);
+        if (e->hwnd_track_val[t])
+            SendMessageA(e->hwnd_track_val[t], WM_SETFONT, (WPARAM)hFont, 0);
+
+        y_pos += 24;
+    }
+
+    for (c = 0; c < f->check_n && c < MAX_CHECK_CTRLS; c++)
+    {
+        const char *cname = (f->check_name && f->check_name[c]) ? f->check_name[c] : "";
+        int cdef = f->check_default ? f->check_default[c] : 0;
+        DWORD bstyle = WS_CHILD | WS_VISIBLE |
+                       ((cdef < 0) ? BS_PUSHBUTTON : BS_AUTOCHECKBOX);
+        e->hwnd_check_btn[c] = CreateWindowExA(
+            0, "BUTTON", cname, bstyle,
+            8, y_pos, 290, 18, hwnd,
+            (HMENU)(UINT_PTR)(IDC_FLT_CHECK_BASE + c), hInst, NULL);
+        if (e->hwnd_check_btn[c])
+        {
+            SendMessageA(e->hwnd_check_btn[c], WM_SETFONT, (WPARAM)hFont, 0);
+            if (cdef > 0)
+            {
+                SendMessageA(e->hwnd_check_btn[c], BM_SETCHECK, BST_CHECKED, 0);
+            }
+        }
+        y_pos += 20;
+    }
+
+    return hwnd;
+}
+
+static void bind_host_exfunc_callbacks(HWND owner_hwnd, EDITP *editp)
+{
+    exfunc_set_filter_lookup(cb_filter_lookup);
+    exfunc_set_add_menu_item_handler(cb_add_menu_item);
+    exfunc_set_host_callbacks(cb_host_state_changed, cb_host_edit_open,
+                              cb_host_edit_close, cb_host_render_up_to);
+    exfunc_set_audio_render_callback(cb_host_render_audio_up_to);
+    if (editp)
+    {
+        exfunc_set_editp(editp);
+        editp_set_main_hwnd(editp, owner_hwnd);
+    }
+}
+
+static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
+{
+    int i;
+
+    editp_set_registered_filter_count(g_plugin_count);
+    bind_host_exfunc_callbacks(owner_hwnd, editp);
+
+    // create owned tool windows & populate runtime FILTER structs for ALL plugins before calling func_init on any of them (so get_filterp(0..N-1) works)
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        e->hwnd = create_filter_window(e, owner_hwnd);
+        plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
+        dbg_plugin("Filter[%d] '%s' | HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X",
+                   i, e->name, (void *)e->module, (void *)&e->runtime,
+                   (void *)e->hwnd, (unsigned)e->runtime.flag);
+    }
+
+    // run func_init(fp) on each filter in order
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        DWORD t0 = GetTickCount();
+        if (e->runtime.func_init)
+        {
+            if (!safe_call_func_init(e))
+            {
+                dbg_warn("Filter[%d] '%s' Stage 1 func_init() %s (%lu ms) -> disabled",
+                         i, e->name, e->faulted ? "FAULTED" : "returned FALSE",
+                         (unsigned long)(GetTickCount() - t0));
+                e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+                if (e->hwnd && IsWindow(e->hwnd))
+                {
+                    ShowWindow(e->hwnd, SW_HIDE);
+                }
+                continue;
+            }
+            dbg_plugin("Filter[%d] '%s' Stage 1 func_init() OK (%lu ms)",
+                       i, e->name, (unsigned long)(GetTickCount() - t0));
+        }
+        e->stage1_initialized = TRUE;
+    }
+
+    // stage 2: send WM_FILTER_INIT (0x0467) to each initialized filter
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        int menus_before = g_menu_item_count;
+        DWORD t0 = GetTickCount();
+        if (!e->stage1_initialized || e->faulted)
+            continue;
+        if (e->runtime.func_WndProc)
+        {
+            safe_call_wndproc(e, e->runtime.hwnd, WM_FILTER_INIT, 0, 0,
+                              exfunc_get_editp(), "Stage 2 WM_FILTER_INIT");
+            if (e->faulted)
+            {
+                dbg_warn("Filter[%d] '%s' Stage 2 WM_FILTER_INIT FAULTED -> disabled",
+                         i, e->name);
+                e->stage1_initialized = FALSE;
+                continue;
+            }
+            dbg_plugin("Filter[%d] '%s' Stage 2 WM_FILTER_INIT OK (%lu ms, +%d menu items)",
+                       i, e->name, (unsigned long)(GetTickCount() - t0),
+                       g_menu_item_count - menus_before);
+        }
+        e->stage2_initialized = TRUE;
+    }
+
+    // if a project/video is already open in editp, notify newly initialized filters
+    if (editp && editp_is_editing(editp))
+    {
+        plugin_manager_notify_file_open(editp);
+    }
+}
+
+static void scan_auf_directory(const char *dir, BOOL *saw_32bit_plugin_on_x64)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind;
+    char search_path[MAX_PATH];
+
+    if (!dir || !dir[0])
+        return;
+    wsprintfA(search_path, "%s\\*.auf", dir);
+    hFind = FindFirstFileA(search_path, &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    do
+    {
+        char full_path[MAX_PATH];
+        PluginReport rep;
+        int rc, i, k;
+        BOOL duplicate = FALSE;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (g_plugin_count >= MAX_PLUGINS)
+            break;
+
+        // skip if a .auf with the same filename was already loaded from <exe_dir>
+        for (k = 0; k < g_plugin_count; k++)
+        {
+            const char *existing = strrchr(g_plugins[k].path, '\\');
+            existing = existing ? (existing + 1) : g_plugins[k].path;
+            if (lstrcmpiA(existing, fd.cFileName) == 0)
+            {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+
+        wsprintfA(full_path, "%s\\%s", dir, fd.cFileName);
+        rc = plugin_inspect_auf(full_path, &rep);
+        if (rc < 0)
+        {
+            if (rep.last_error == ERROR_BAD_EXE_FORMAT && saw_32bit_plugin_on_x64)
+            {
+                *saw_32bit_plugin_on_x64 = TRUE;
+                dbg_plugin("Detected 32-bit plugin '%s' in 64-bit host -> will bridge via reaviutl_bridge32.exe",
+                           fd.cFileName);
+            }
+            else
+            {
+                dbg_warn("Failed to load plugin '%s': %s", full_path, rep.err);
+            }
+            continue;
+        }
+        dbg_plugin("Loaded '%s' @ HMODULE=0x%p (%d filter%s)",
+                   fd.cFileName, rep.module, rep.count, (rep.count == 1) ? "" : "s");
+
+        for (i = 0; i < rep.count && g_plugin_count < MAX_PLUGINS; i++)
+        {
+            PluginEntry *e = &g_plugins[g_plugin_count];
+            ZeroMemory(e, sizeof(*e));
+            e->index = g_plugin_count;
+            lstrcpynA(e->path, full_path, MAX_PATH);
+            lstrcpynA(e->name,
+                      rep.filters[i]->name ? rep.filters[i]->name : fd.cFileName,
+                      sizeof(e->name));
+            e->module = (HMODULE)rep.module;
+            e->src_dll = rep.filters[i];
+            e->cmd_id = PLUGIN_CMD_WINDOW_BASE + g_plugin_count;
+            g_plugin_count++;
+        }
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp)
+{
+    char parent_dir[MAX_PATH] = {0};
+    BOOL has_parent_dir = FALSE;
+    HWND owner_hwnd;
+    BOOL saw_32bit_plugin_on_x64 = FALSE;
+
+    plugin_manager_shutdown();
+    ensure_window_classes();
+
+    g_main_hwnd = main_hwnd;
+    owner_hwnd = ensure_owner_hwnd(main_hwnd);
+
+    if (!plugin_dir || !plugin_dir[0])
+        return FALSE;
+
+    // match aviutl 1.10 0x0042c930: scan both <exe_dir>\*.auf and <exe_dir>\plugins\*.auf
+    {
+        const char *slash = strrchr(plugin_dir, '\\');
+        if (slash && lstrcmpiA(slash + 1, "plugins") == 0 && (slash - plugin_dir) > 0)
+        {
+            int plen = (int)(slash - plugin_dir);
+            if (plen < MAX_PATH)
+            {
+                memcpy(parent_dir, plugin_dir, (size_t)plen);
+                parent_dir[plen] = '\0';
+                has_parent_dir = TRUE;
+            }
+        }
+    }
+
+    if (has_parent_dir)
+    {
+        scan_auf_directory(parent_dir, &saw_32bit_plugin_on_x64);
+    }
+    scan_auf_directory(plugin_dir, &saw_32bit_plugin_on_x64);
+
+    if (g_plugin_count > 0)
+    {
+        initialize_registered_plugins(owner_hwnd, editp);
+        return TRUE;
+    }
+
+#if REAVIUTL_X64
+    // on 64-bit host, delegate 32-bit .auf plugins to reaviutl_bridge32.exe
+    if (saw_32bit_plugin_on_x64)
+    {
+        bind_host_exfunc_callbacks(owner_hwnd, editp);
+        if (plugin_bridge_load_dir(plugin_dir, owner_hwnd, editp) ||
+            (has_parent_dir && plugin_bridge_load_dir(parent_dir, owner_hwnd, editp)))
+        {
+            editp_set_registered_filter_count(plugin_bridge_get_filter_count());
+            return TRUE;
+        }
+    }
+#else
+    (void)saw_32bit_plugin_on_x64;
+#endif
+
+    return FALSE;
+}
+
+BOOL plugin_manager_init(const char *plugin_dir)
+{
+    return plugin_manager_init_ex(plugin_dir, g_main_hwnd, exfunc_get_editp());
+}
+
+BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP *editp)
+{
+    PluginReport rep;
+    HWND owner_hwnd;
+    int rc, i;
+
+    plugin_manager_shutdown();
+    ensure_window_classes();
+
+    g_main_hwnd = main_hwnd;
+    owner_hwnd = ensure_owner_hwnd(main_hwnd);
+
+    if (!auf_path || !auf_path[0])
+        return FALSE;
+
+    rc = plugin_inspect_auf(auf_path, &rep);
+    if (rc < 0)
+    {
+#if REAVIUTL_X64
+        if (rep.last_error == ERROR_BAD_EXE_FORMAT)
+        {
+            dbg_plugin("32-bit plugin '%s' in 64-bit host -> bridging via reaviutl_bridge32.exe",
+                       auf_path);
+            bind_host_exfunc_callbacks(owner_hwnd, editp);
+            if (plugin_bridge_load_file(auf_path, owner_hwnd, editp))
+            {
+                editp_set_registered_filter_count(plugin_bridge_get_filter_count());
+                return TRUE;
+            }
+        }
+#endif
+        dbg_warn("Failed to load plugin '%s': %s", auf_path, rep.err);
+        return FALSE;
+    }
+    dbg_plugin("Loaded '%s' @ HMODULE=0x%p (%d filter%s)",
+               auf_path, rep.module, rep.count, (rep.count == 1) ? "" : "s");
+
+    for (i = 0; i < rep.count && g_plugin_count < MAX_PLUGINS; i++)
+    {
+        PluginEntry *e = &g_plugins[g_plugin_count];
+        ZeroMemory(e, sizeof(*e));
+        e->index = g_plugin_count;
+        lstrcpynA(e->path, auf_path, MAX_PATH);
+        lstrcpynA(e->name,
+                  rep.filters[i]->name ? rep.filters[i]->name : auf_path,
+                  sizeof(e->name));
+        e->module = (HMODULE)rep.module;
+        e->src_dll = rep.filters[i];
+        e->cmd_id = PLUGIN_CMD_WINDOW_BASE + g_plugin_count;
+        g_plugin_count++;
+    }
+
+    if (g_plugin_count > 0)
+    {
+        initialize_registered_plugins(owner_hwnd, editp);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void plugin_manager_shutdown(void)
+{
+    int i, j;
+    HMODULE unloaded[MAX_PLUGINS];
+    int unloaded_count = 0;
+
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_shutdown();
+    }
+
+    // stage 2 teardown, send WM_FILTER_EXIT (0x0468) while HWNDs & EDITP live
+    for (i = g_plugin_count - 1; i >= 0; i--)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (e->stage2_initialized && !e->faulted && e->runtime.func_WndProc)
+        {
+            safe_call_wndproc(e, e->runtime.hwnd, WM_FILTER_EXIT, 0, 0,
+                              exfunc_get_editp(), "WM_FILTER_EXIT");
+        }
+        e->stage2_initialized = FALSE;
+    }
+
+    // destroy host-owned filter container windows
+    for (i = g_plugin_count - 1; i >= 0; i--)
+    {
+        PluginEntry *e = &g_plugins[i];
+        e->teardown = TRUE;
+        if (e->hwnd && IsWindow(e->hwnd))
+        {
+            DestroyWindow(e->hwnd);
+        }
+        e->hwnd = NULL;
+    }
+
+    // stage 1 teardown, call func_exit(fp)
+    for (i = g_plugin_count - 1; i >= 0; i--)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (e->stage1_initialized && !e->faulted && e->runtime.func_exit)
+        {
+            safe_call_func_exit(e);
+        }
+        e->stage1_initialized = FALSE;
+        plugin_free_runtime_filter(&e->runtime);
+    }
+
+    // free each unique HMODULE once (multi-filter .auf shares one HMODULE)
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        HMODULE mod = g_plugins[i].module;
+        BOOL seen = FALSE;
+        if (!mod)
+            continue;
+        for (j = 0; j < unloaded_count; j++)
+        {
+            if (unloaded[j] == mod)
+            {
+                seen = TRUE;
+                break;
+            }
+        }
+        if (!seen)
+        {
+            unloaded[unloaded_count++] = mod;
+            FreeLibrary(mod);
+        }
+        g_plugins[i].module = NULL;
+    }
+
+    g_plugin_count = 0;
+    g_menu_item_count = 0;
+    aup_clear_preserved_chunks();
+    editp_set_registered_filter_count(0);
+
+    if (g_dummy_owner_hwnd && IsWindow(g_dummy_owner_hwnd))
+    {
+        DestroyWindow(g_dummy_owner_hwnd);
+    }
+    g_dummy_owner_hwnd = NULL;
+}
+
+BOOL plugin_manager_is_bridged(void)
+{
+    return plugin_bridge_is_active();
+}
+
+int plugin_manager_get_count(void)
+{
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_count();
+    return g_plugin_count;
+}
+
+const char *plugin_manager_get_name(int index)
+{
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_name(index);
+    if (index < 0 || index >= g_plugin_count)
+        return NULL;
+    return g_plugins[index].name;
+}
+
+int plugin_manager_get_flags(int index)
+{
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_flags(index);
+    if (index < 0 || index >= g_plugin_count)
+        return 0;
+    return g_plugins[index].runtime.flag;
+}
+
+FILTER *plugin_manager_get_filter(int index)
+{
+    if (plugin_bridge_is_active())
+        return NULL;
+    if (index < 0 || index >= g_plugin_count)
+        return NULL;
+    if (!g_plugins[index].stage1_initialized)
+        return NULL;
+    return &g_plugins[index].runtime;
+}
+
+HWND plugin_manager_get_window(int index)
+{
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_filter_hwnd(index);
+    if (index < 0 || index >= g_plugin_count)
+        return NULL;
+    return g_plugins[index].hwnd;
+}
+
+int plugin_manager_find_by_name(const char *name)
+{
+    int i, n = plugin_manager_get_count();
+    if (!name)
+        return -1;
+    for (i = 0; i < n; i++)
+    {
+        const char *nm = plugin_manager_get_name(i);
+        if (nm && lstrcmpA(nm, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+int plugin_manager_get_menu_item_count(void)
+{
+    if (plugin_bridge_is_active())
+        return plugin_bridge_get_menu_item_count();
+    return g_menu_item_count;
+}
+
+BOOL plugin_manager_get_menu_item(int index, PluginMenuItem *out_item)
+{
+    if (!out_item)
+        return FALSE;
+    if (plugin_bridge_is_active())
+    {
+        BridgeMenuItemInfo bi;
+        if (!plugin_bridge_get_menu_item(index, &bi))
+            return FALSE;
+        ZeroMemory(out_item, sizeof(*out_item));
+        out_item->filter_index = bi.filter_index;
+        lstrcpynA(out_item->name, bi.name, sizeof(out_item->name));
+        out_item->cmd_id = bi.cmd_id;
+        out_item->def_key = bi.def_key;
+        out_item->flag = bi.flag;
+        return TRUE;
+    }
+    if (index < 0 || index >= g_menu_item_count)
+        return FALSE;
+    *out_item = g_menu_items[index];
+    return TRUE;
+}
+
+BOOL plugin_manager_show_window(int index, BOOL show)
+{
+    PluginEntry *e;
+    BOOL changed;
+
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_show_window(index, show ? 1 : 0);
+    }
+    if (index < 0 || index >= g_plugin_count)
+        return FALSE;
+
+    e = &g_plugins[index];
+    if (!e->hwnd || !IsWindow(e->hwnd))
+        return FALSE;
+
+    changed = (((e->runtime.flag & FILTER_FLAG_WINDOW_DISP) != 0) != (show != 0));
+    if (show)
+    {
+        e->runtime.flag |= FILTER_FLAG_WINDOW_DISP;
+        if (e->src_dll)
+            e->src_dll->flag = e->runtime.flag;
+        ShowWindow(e->hwnd, SW_SHOWNA);
+    }
+    else
+    {
+        e->runtime.flag &= ~FILTER_FLAG_WINDOW_DISP;
+        if (e->src_dll)
+            e->src_dll->flag = e->runtime.flag;
+        ShowWindow(e->hwnd, SW_HIDE);
+    }
+
+    if (changed && e->stage2_initialized && e->runtime.func_WndProc)
+    {
+        e->runtime.func_WndProc(e->hwnd, WM_FILTER_CHANGE_WINDOW, 0, 0,
+                                exfunc_get_editp(), &e->runtime);
+    }
+    post_host_redraw(3);
+    return TRUE;
+}
+
+BOOL plugin_manager_toggle_window(int index)
+{
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_show_window(index, 2);
+    }
+    if (index < 0 || index >= g_plugin_count)
+        return FALSE;
+    return plugin_manager_show_window(
+        index, (g_plugins[index].runtime.flag & FILTER_FLAG_WINDOW_DISP) == 0);
+}
+
+HMENU plugin_manager_build_menu(void)
+{
+    HMENU menu = CreatePopupMenu();
+    int i, count = plugin_manager_get_count();
+    int mcount = plugin_manager_get_menu_item_count();
+
+    if (count == 0)
+    {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"(no plugins loaded)");
+        return menu;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        const char *name = plugin_manager_get_name(i);
+        int flags = plugin_manager_get_flags(i);
+        HWND hwnd = plugin_manager_get_window(i);
+        wchar_t wlabel[300];
+        UINT uFlags = MF_STRING;
+
+        if (flags & FILTER_FLAG_NO_CONFIG)
+            continue;
+        sjis_to_wide(name ? name : "(unnamed)", wlabel, 256);
+        if (plugin_bridge_is_active())
+        {
+            lstrcatW(wlabel, L" [x86 Bridge]");
+        }
+        if ((flags & FILTER_FLAG_WINDOW_DISP) || (hwnd && IsWindowVisible(hwnd)))
+        {
+            uFlags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, uFlags, (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), wlabel);
+    }
+
+    if (mcount > 0)
+    {
+        HMENU sub = CreatePopupMenu();
+        for (i = 0; i < mcount; i++)
+        {
+            PluginMenuItem it;
+            wchar_t wname[256];
+            if (!plugin_manager_get_menu_item(i, &it))
+                continue;
+            sjis_to_wide(it.name, wname, 256);
+            AppendMenuW(sub, MF_STRING, (UINT_PTR)(PLUGIN_CMD_MENU_ITEM_BASE + i), wname);
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, L"Plugin Commands / \x62e1\x5f35\x7de8\x96c6");
+    }
+
+    return menu;
+}
+
+BOOL plugin_manager_exec_menu_item_index(int menu_index)
+{
+    PluginMenuItem *it;
+    PluginEntry *e;
+
+    if (plugin_bridge_is_active())
+    {
+        BOOL ok = plugin_bridge_exec_menu_item(menu_index);
+        if (ok)
+            post_host_redraw(1);
+        return ok;
+    }
+
+    if (menu_index < 0 || menu_index >= g_menu_item_count)
+        return FALSE;
+    it = &g_menu_items[menu_index];
+    if (it->filter_index >= 0 && it->filter_index < g_plugin_count)
+    {
+        e = &g_plugins[it->filter_index];
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            if (e->runtime.func_WndProc(it->hwnd ? it->hwnd : e->hwnd,
+                                        WM_FILTER_COMMAND, (WPARAM)it->cmd_id, 0,
+                                        exfunc_get_editp(), &e->runtime))
+            {
+                post_host_redraw(1);
+            }
+            return TRUE;
+        }
+    }
+    if (it->hwnd && IsWindow(it->hwnd))
+    {
+        SendMessageA(it->hwnd, WM_FILTER_COMMAND, (WPARAM)it->cmd_id, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL plugin_manager_handle_command(HWND hwnd, int cmd_id)
+{
+    (void)hwnd;
+    if (cmd_id >= PLUGIN_CMD_WINDOW_BASE &&
+        cmd_id < PLUGIN_CMD_WINDOW_BASE + plugin_manager_get_count())
+    {
+        return plugin_manager_toggle_window(cmd_id - PLUGIN_CMD_WINDOW_BASE);
+    }
+    if (cmd_id >= PLUGIN_CMD_MENU_ITEM_BASE &&
+        cmd_id < PLUGIN_CMD_MENU_ITEM_BASE + plugin_manager_get_menu_item_count())
+    {
+        return plugin_manager_exec_menu_item_index(cmd_id - PLUGIN_CMD_MENU_ITEM_BASE);
+    }
+    return FALSE;
+}
+
+BOOL plugin_manager_handle_key(HWND hwnd, UINT vk, BOOL is_down, LPARAM key_lparam)
+{
+    int i;
+    BOOL handled = FALSE;
+    (void)hwnd;
+
+    if (plugin_bridge_is_active())
+    {
+        if (plugin_bridge_forward_key(vk, is_down, key_lparam))
+        {
+            post_host_redraw(1);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    // check registered add_menu_item default shortcuts on key down
+    if (is_down)
+    {
+        BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        BOOL alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+
+        for (i = 0; i < g_menu_item_count; i++)
+        {
+            const PluginMenuItem *it = &g_menu_items[i];
+            BOOL req_shift, req_ctrl, req_alt, req_vk;
+            if (it->def_key == 0)
+                continue;
+            req_shift = (it->flag & ADD_MENU_ITEM_FLAG_KEY_SHIFT) != 0;
+            req_ctrl = (it->flag & ADD_MENU_ITEM_FLAG_KEY_CTRL) != 0;
+            req_alt = (it->flag & ADD_MENU_ITEM_FLAG_KEY_ALT) != 0;
+            req_vk = (it->flag & ADD_MENU_ITEM_FLAG_KEY_VIEW) != 0;
+            if (!req_vk)
+                continue;
+            if ((UINT)it->def_key == vk &&
+                shift == req_shift && ctrl == req_ctrl && alt == req_alt)
+            {
+                return plugin_manager_exec_menu_item_index(i);
+            }
+        }
+    }
+
+    // forward WM_FILTER_MAIN_KEY_DOWN / UP to MAIN_MESSAGE filters
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        UINT fmsg = is_down ? WM_FILTER_MAIN_KEY_DOWN : WM_FILTER_MAIN_KEY_UP;
+        if (!e->stage2_initialized || !e->runtime.func_WndProc)
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_MAIN_MESSAGE))
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_WINDOW_DISP))
+            continue;
+        if (e->runtime.func_WndProc(e->hwnd, fmsg, (WPARAM)vk, key_lparam,
+                                    exfunc_get_editp(), &e->runtime))
+        {
+            handled = TRUE;
+        }
+    }
+    if (handled)
+        post_host_redraw(1);
+    return handled;
+}
+
+BOOL plugin_manager_forward_main_mouse(UINT filter_mouse_msg, WPARAM mk_flags,
+                                       int img_x, int img_y)
+{
+    int i;
+    BOOL need_redraw = FALSE;
+    LPARAM lp = MAKELPARAM((short)img_x, (short)img_y);
+
+    if (plugin_bridge_is_active())
+    {
+        if (plugin_bridge_forward_mouse(filter_mouse_msg, mk_flags, img_x, img_y))
+        {
+            post_host_redraw(1);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (!e->stage2_initialized || !e->runtime.func_WndProc)
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_MAIN_MESSAGE))
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_WINDOW_DISP))
+            continue;
+        if (e->runtime.func_WndProc(e->hwnd, filter_mouse_msg, mk_flags, lp,
+                                    exfunc_get_editp(), &e->runtime))
+        {
+            need_redraw = TRUE;
+        }
+    }
+    if (need_redraw)
+        post_host_redraw(1);
+    return need_redraw;
+}
+
+BOOL plugin_manager_forward_main_misc(UINT filter_msg, WPARAM wp, LPARAM lp)
+{
+    int i;
+    BOOL need_redraw = FALSE;
+
+    if (plugin_bridge_is_active())
+    {
+        return FALSE;
+    }
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (!e->stage2_initialized || !e->runtime.func_WndProc)
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_MAIN_MESSAGE))
+            continue;
+        if (!(e->runtime.flag & FILTER_FLAG_WINDOW_DISP))
+            continue;
+        if (e->runtime.func_WndProc(e->hwnd, filter_msg, wp, lp,
+                                    exfunc_get_editp(), &e->runtime))
+        {
+            // match aviutl 0x004305a0: WM_FILTER_MAIN_CONTEXTMENU stops on first 1
+            if (filter_msg == WM_FILTER_MAIN_CONTEXTMENU)
+            {
+                post_host_redraw(1);
+                return TRUE;
+            }
+            need_redraw = TRUE;
+        }
+    }
+    if (need_redraw)
+        post_host_redraw(1);
+    return need_redraw;
+}
+
+void plugin_manager_modify_title(EDITP *ep, int frame, char *title, int max_title)
+{
+    int i;
+    if (!title || max_title <= 0 || plugin_bridge_is_active())
+        return;
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+        if (!e->stage1_initialized)
+            continue;
+        if (!(fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
+            continue;
+        if (!fp->func_modify_title)
+            continue;
+        fp->func_modify_title(fp, ep ? ep : exfunc_get_editp(), frame, title, max_title);
+    }
+}
+
+int plugin_manager_apply_audio_filters(EDITP *ep, int frame_num, short *buf,
+                                       int samples, const FILTER *stop_before_fp)
+{
+    int i;
+    FILTER_PROC_INFO fpip;
+
+    if (!ep || !buf || samples <= 0 || !editp_is_editing(ep))
+    {
+        return samples;
+    }
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+
+        if (stop_before_fp && (fp == stop_before_fp ||
+                               (const FILTER *)e->src_dll == stop_before_fp))
+        {
+            break;
+        }
+        if (!e->stage1_initialized || e->faulted || !fp->func_proc)
+            continue;
+        if (!(fp->flag & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
+            continue;
+        if (!(fp->flag & FILTER_FLAG_AUDIO_FILTER))
+            continue;
+
+        ZeroMemory(&fpip, sizeof(fpip));
+        fpip.ycp_edit = editp_get_ycp_edit(ep);
+        fpip.ycp_temp = editp_get_ycp_temp(ep);
+        editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
+        fpip.frame = frame_num;
+        fpip.frame_n = editp_get_frame_n(ep);
+        fpip.org_w = fpip.w;
+        fpip.org_h = fpip.h;
+        fpip.audiop = buf;
+        fpip.audio_n = samples;
+        fpip.audio_ch = editp_get_audio_ch(ep);
+        fpip.editp = ep;
+        fpip.yc_size = (int)sizeof(PIXEL_YC);
+        fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+
+        safe_call_func_proc(e, &fpip);
+        if (fpip.audio_n > 0)
+        {
+            samples = fpip.audio_n;
+        }
+    }
+    return samples;
+}
+
+int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL nofilter)
+{
+    int samples;
+
+    if (!ep || !editp_is_editing(ep))
+        return 0;
+    samples = editp_read_audio_frame(ep, frame_num, buf);
+    if (!buf || samples <= 0 || nofilter)
+    {
+        return samples;
+    }
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_render_audio(ep, frame_num, buf, samples, editp_get_audio_ch(ep));
+    }
+    return plugin_manager_apply_audio_filters(ep, frame_num, buf, samples, NULL);
+}
+
+BOOL plugin_manager_send_filter_command(int filter_index, int filter_cmd_id)
+{
+    PluginEntry *e;
+    if (plugin_bridge_is_active())
+    {
+        BOOL ok = plugin_bridge_send_filter_command(filter_index, filter_cmd_id);
+        if (ok)
+            post_host_redraw(1);
+        return ok;
+    }
+    if (filter_index < 0 || filter_index >= g_plugin_count)
+        return FALSE;
+    e = &g_plugins[filter_index];
+    if (!e->stage2_initialized || !e->runtime.func_WndProc)
+        return FALSE;
+    if (e->runtime.func_WndProc(e->hwnd, WM_FILTER_COMMAND, (WPARAM)filter_cmd_id, 0,
+                                exfunc_get_editp(), &e->runtime))
+    {
+        post_host_redraw(1);
+    }
+    return TRUE;
+}
+
+BOOL plugin_manager_import_exo(int filter_index, const char *exo_path, EDITP *ep)
+{
+    char abs_exo[MAX_PATH];
+    PluginEntry *e;
+
+    if (!exo_path || !exo_path[0])
+        return FALSE;
+    if (GetFullPathNameA(exo_path, MAX_PATH, abs_exo, NULL) == 0)
+    {
+        lstrcpynA(abs_exo, exo_path, MAX_PATH);
+    }
+
+    if (plugin_bridge_is_active())
+    {
+        BOOL ok = plugin_bridge_import_exo(filter_index, abs_exo, ep);
+        if (ok)
+            post_host_redraw(2);
+        return ok;
+    }
+
+    if (filter_index < 0 || filter_index >= g_plugin_count)
+        return FALSE;
+    e = &g_plugins[filter_index];
+    if (!e->stage2_initialized || e->faulted || !e->runtime.func_WndProc)
+        return FALSE;
+
+    // exedit's func_WndProc handles (WM_COMMAND, 0x423, (LPARAM)exo_path) directly
+    safe_call_wndproc(e, e->hwnd, WM_COMMAND, 0x423, (LPARAM)abs_exo,
+                      ep ? ep : exfunc_get_editp(), "import_exo");
+    if (e->faulted)
+        return FALSE;
+    post_host_redraw(2);
+    return TRUE;
+}
+
+BOOL plugin_manager_load_aup(const char *aup_path, EDITP *ep)
+{
+    char abs_aup[MAX_PATH];
+    EDITP *target_ep = ep ? ep : exfunc_get_editp();
+    BOOL ok;
+
+    if (!aup_path || !aup_path[0] || !target_ep)
+        return FALSE;
+    if (GetFullPathNameA(aup_path, MAX_PATH, abs_aup, NULL) == 0)
+    {
+        lstrcpynA(abs_aup, aup_path, MAX_PATH);
+    }
+
+    if (plugin_bridge_is_active())
+    {
+        ok = plugin_bridge_load_aup(abs_aup, target_ep);
+    }
+    else
+    {
+        ok = aup_load_local(abs_aup, target_ep);
+    }
+    if (ok)
+    {
+        post_host_redraw(2);
+    }
+    return ok;
+}
+
+BOOL plugin_manager_save_aup(const char *aup_path, EDITP *ep)
+{
+    char abs_aup[MAX_PATH];
+    EDITP *target_ep = ep ? ep : exfunc_get_editp();
+
+    if (!aup_path || !aup_path[0] || !target_ep || !editp_is_editing(target_ep))
+    {
+        return FALSE;
+    }
+    if (GetFullPathNameA(aup_path, MAX_PATH, abs_aup, NULL) == 0)
+    {
+        lstrcpynA(abs_aup, aup_path, MAX_PATH);
+    }
+
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_save_aup(abs_aup, target_ep);
+    }
+    return aup_save_local(abs_aup, target_ep);
+}
+
+void plugin_manager_notify_file_open(EDITP *ep)
+{
+    int i;
+    if (plugin_bridge_is_active())
+    {
+        if (ep && editp_get_edit_path(ep)[0])
+        {
+            plugin_bridge_open_video(editp_get_edit_path(ep), ep);
+        }
+        return;
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            e->runtime.func_WndProc(e->hwnd, WM_FILTER_FILE_OPEN, 0, 0,
+                                    ep ? ep : exfunc_get_editp(), &e->runtime);
+        }
+    }
+}
+
+void plugin_manager_notify_file_close(EDITP *ep)
+{
+    int i;
+    aup_clear_preserved_chunks();
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_close_video(ep);
+        return;
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            e->runtime.func_WndProc(e->hwnd, WM_FILTER_FILE_CLOSE, 0, 0,
+                                    ep ? ep : exfunc_get_editp(), &e->runtime);
+        }
+    }
+}
+
+void plugin_manager_notify_update(EDITP *ep)
+{
+    int i;
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_sync_to_bridge(ep);
+        return;
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            e->runtime.func_WndProc(e->hwnd, WM_FILTER_UPDATE, 0, 0,
+                                    ep ? ep : exfunc_get_editp(), &e->runtime);
+        }
+    }
+}
+
+// 0x00430dc0, notify filters before export starts
+void plugin_manager_notify_save_start(EDITP *ep, int s, int e, int out_flags)
+{
+    int i;
+    EDITP *target_ep = ep ? ep : exfunc_get_editp();
+
+    if (target_ep)
+    {
+        editp_set_saving(target_ep, TRUE);
+    }
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_notify_save_start(target_ep, s, e, out_flags);
+        return;
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *pe = &g_plugins[i];
+        FILTER *fp = &pe->runtime;
+        BOOL is_aud = (fp->flag & FILTER_FLAG_AUDIO_FILTER) != 0;
+        if (!pe->stage1_initialized || pe->faulted || !fp->func_save_start)
+            continue;
+        if (((out_flags & 1) != 0 && !is_aud) || ((out_flags & 2) != 0 && is_aud))
+        {
+            safe_call_save_start(pe, s, e, target_ep);
+        }
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *pe = &g_plugins[i];
+        if (!pe->stage2_initialized || pe->faulted || !pe->runtime.func_WndProc)
+            continue;
+        if (pe->hwnd && IsWindow(pe->hwnd))
+        {
+            SendMessageA(pe->hwnd, WM_FILTER_SAVE_START, 0, 0);
+        }
+        else
+        {
+            safe_call_wndproc(pe, pe->hwnd, WM_FILTER_SAVE_START, 0, 0,
+                              target_ep, "WM_FILTER_SAVE_START");
+        }
+    }
+}
+
+// 0x00430ed0, notify filters after export ends
+void plugin_manager_notify_save_end(EDITP *ep, int out_flags)
+{
+    int i;
+    EDITP *target_ep = ep ? ep : exfunc_get_editp();
+
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_notify_save_end(target_ep, out_flags);
+        if (target_ep)
+            editp_set_saving(target_ep, FALSE);
+        return;
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *pe = &g_plugins[i];
+        if (!pe->stage2_initialized || pe->faulted || !pe->runtime.func_WndProc)
+            continue;
+        if (pe->hwnd && IsWindow(pe->hwnd))
+        {
+            SendMessageA(pe->hwnd, WM_FILTER_SAVE_END, 0, 0);
+        }
+        else
+        {
+            safe_call_wndproc(pe, pe->hwnd, WM_FILTER_SAVE_END, 0, 0,
+                              target_ep, "WM_FILTER_SAVE_END");
+        }
+    }
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *pe = &g_plugins[i];
+        FILTER *fp = &pe->runtime;
+        BOOL is_aud = (fp->flag & FILTER_FLAG_AUDIO_FILTER) != 0;
+        if (!pe->stage1_initialized || pe->faulted || !fp->func_save_end)
+            continue;
+        if (((out_flags & 1) != 0 && !is_aud) || ((out_flags & 2) != 0 && is_aud))
+        {
+            safe_call_save_end(pe, target_ep);
+        }
+    }
+    if (target_ep)
+    {
+        editp_set_saving(target_ep, FALSE);
+    }
+}
+
+BOOL plugin_manager_has_active_audio_filter(void)
+{
+    int i, n = plugin_manager_get_count();
+    for (i = 0; i < n; i++)
+    {
+        int fl = plugin_manager_get_flags(i);
+        if ((fl & FILTER_FLAG_AUDIO_FILTER) &&
+            (fl & (FILTER_FLAG_ACTIVE | FILTER_FLAG_ALWAYS_ACTIVE)))
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOL plugin_manager_sync_from_bridge(EDITP *ep)
+{
+    if (plugin_bridge_is_active())
+    {
+        return plugin_bridge_sync_from_bridge(ep);
+    }
+    return FALSE;
+}
+
+BOOL plugin_manager_render_video_frame(EDITP *ep, int frame_num)
+{
+    if (!ep)
+        return FALSE;
+
+    if (plugin_bridge_is_active())
+    {
+        // if no native 64-bit filters ran first, let the 32-bit bridge decode + render directly in its own EDITP and return the final YC48 frame via shared memory
+        return plugin_bridge_render_frame(ep, frame_num, FALSE);
+    }
+
+    if (!editp_is_editing(ep))
+        return FALSE;
+    return render_pipeline_range(ep, frame_num, NULL);
+}
+
+BOOL plugin_manager_apply_filter(int filter_id, void *editp_ptr)
+{
+    EDITP *ep = (EDITP *)editp_ptr;
+    PluginEntry *e;
+    FILTER_PROC_INFO fpip;
+
+    if (!ep || filter_id < 0 || filter_id >= g_plugin_count)
+        return FALSE;
+    e = &g_plugins[filter_id];
+    if (!e->stage1_initialized || !e->runtime.func_proc)
+        return FALSE;
+    if (e->runtime.flag & FILTER_FLAG_AUDIO_FILTER)
+        return FALSE;
+
+    ZeroMemory(&fpip, sizeof(fpip));
+    fpip.ycp_edit = editp_get_ycp_edit(ep);
+    fpip.ycp_temp = editp_get_ycp_temp(ep);
+    editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
+    fpip.frame = editp_get_frame(ep);
+    fpip.frame_n = editp_get_frame_n(ep);
+    fpip.org_w = fpip.w;
+    fpip.org_h = fpip.h;
+    fpip.editp = ep;
+    fpip.yc_size = (int)sizeof(PIXEL_YC);
+    fpip.line_size = fpip.max_w * (int)sizeof(PIXEL_YC);
+
+    if (!e->runtime.func_proc(&e->runtime, &fpip))
+        return FALSE;
+    if (fpip.ycp_edit == editp_get_ycp_temp(ep))
+    {
+        editp_swap_ycp(ep, fpip.ycp_edit, fpip.ycp_temp);
+    }
+    return TRUE;
+}
+
+void plugin_manager_debug_dump(void)
+{
+    int i;
+    if (plugin_bridge_is_active())
+    {
+        dbg_plugin("bridged 32-bit filters: %d", plugin_bridge_get_filter_count());
+        plugin_bridge_debug_cmd("plugins");
+        return;
+    }
+
+    dbg_plugin("loaded filters: %d (menu items: %d)", g_plugin_count, g_menu_item_count);
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        const PluginEntry *e = &g_plugins[i];
+        const FILTER *fp = &e->runtime;
+        dbg_plugin("  [%d] '%s' | HMODULE=0x%p FILTER=0x%p DLL_TBL=0x%p HWND=0x%p",
+                   i, e->name, (void *)e->module, (void *)fp,
+                   (void *)e->src_dll, (void *)e->hwnd);
+        dbg_plugin("      flag=0x%08X (%s%s%s%s%s%s) tracks=%d checks=%d ex_data=%dB path='%s'",
+                   (unsigned)fp->flag,
+                   e->faulted ? "FAULTED " : "",
+                   (fp->flag & FILTER_FLAG_ACTIVE) ? "ACTIVE " : "",
+                   (fp->flag & FILTER_FLAG_ALWAYS_ACTIVE) ? "ALWAYS_ACTIVE " : "",
+                   (fp->flag & FILTER_FLAG_WINDOW_DISP) ? "WIN_DISP " : "",
+                   (fp->flag & FILTER_FLAG_AUDIO_FILTER) ? "AUDIO " : "",
+                   (fp->flag & FILTER_FLAG_MAIN_MESSAGE) ? "MAIN_MSG " : "",
+                   fp->track_n, fp->check_n, fp->ex_data_size, e->path);
+    }
+}

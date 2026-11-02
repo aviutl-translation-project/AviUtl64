@@ -240,7 +240,8 @@ BOOL plugin_setup_runtime_filter(FILTER *fp_out, FILTER_DLL *src,
     fp_out->dll_hinst = hinst;
     if (path && path[0])
     {
-        char *dup = (char *)malloc(MAX_PATH);
+        // allocate extra zeroed tail for aviutl_exedit_sdk FilterPlugin::path (char[260] + HMENU menu1, menu2)
+        char *dup = (char *)calloc(1, MAX_PATH + 32);
         if (dup)
         {
             if (GetFullPathNameA(path, MAX_PATH, dup, NULL) == 0)

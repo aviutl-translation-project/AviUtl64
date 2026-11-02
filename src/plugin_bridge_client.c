@@ -401,7 +401,7 @@ BOOL plugin_bridge_load_dir(const char *plugin_dir, HWND main_hwnd, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_LOAD_DIR;
     lstrcpynA(req.str, plugin_dir ? plugin_dir : "", sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     if (ep)
         plugin_bridge_sync_to_bridge(ep);
@@ -421,7 +421,7 @@ BOOL plugin_bridge_load_file(const char *auf_path, HWND main_hwnd, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_LOAD_FILE;
     lstrcpynA(req.str, auf_path ? auf_path : "", sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     if (ep)
         plugin_bridge_sync_to_bridge(ep);
@@ -677,7 +677,7 @@ BOOL plugin_bridge_open_video(const char *filepath, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_OPEN_VIDEO;
     lstrcpynA(req.str, filepath, sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     if (ep)
         plugin_bridge_sync_from_bridge(ep);
@@ -693,7 +693,7 @@ BOOL plugin_bridge_open_audio(const char *filepath, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_OPEN_AUDIO;
     lstrcpynA(req.str, filepath, sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     if (ep)
         plugin_bridge_sync_from_bridge(ep);
@@ -888,7 +888,7 @@ BOOL plugin_bridge_render_frame_subset(EDITP *ep, int frame_num, BOOL push_host_
             req.str[i] = (char)(unsigned char)filter_indices[i];
         }
     }
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
 
     plugin_bridge_sync_from_bridge(ep);
@@ -1002,7 +1002,7 @@ BOOL plugin_bridge_notify_save_end(EDITP *ep, int out_flags)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_SAVE_END;
     req.arg0 = out_flags;
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     if (ep)
         plugin_bridge_sync_from_bridge(ep);
@@ -1022,7 +1022,7 @@ BOOL plugin_bridge_scan_auo(const char *plugin_dir, HWND main_hwnd, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_SCAN_AUO;
     lstrcpynA(req.str, plugin_dir ? plugin_dir : "", sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     return resp.val0 > 0;
 }
@@ -1042,7 +1042,7 @@ BOOL plugin_bridge_load_auo(const char *auo_path, HWND main_hwnd, EDITP *ep)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_LOAD_AUO;
     lstrcpynA(req.str, auo_path, sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     return resp.val0 > 0;
 }
@@ -1126,7 +1126,7 @@ BOOL plugin_bridge_scan_input_color(const char *plugin_dir, HWND main_hwnd)
     ZeroMemory(&req, sizeof(req));
     req.cmd = BRIDGE_CMD_SCAN_INPUT_COLOR;
     lstrcpynA(req.str, dir, sizeof(req.str));
-    if (!bridge_rpc(&req, &resp, 15000))
+    if (!bridge_rpc(&req, &resp, 60000))
         return FALSE;
     lstrcpynA(g_scanned_ic_dir, dir, sizeof(g_scanned_ic_dir));
     return TRUE;

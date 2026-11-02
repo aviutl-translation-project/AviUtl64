@@ -1,4 +1,7 @@
 #include <windows.h>
+#include <commctrl.h>
+#include <objbase.h>
+#include <vfw.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -755,12 +758,23 @@ int main(int argc, char **argv)
     OVERLAPPED ov_read;
     BridgeRpcReq req;
     BOOL read_pending = FALSE;
+    HRESULT ole_hr;
 
     if (argc < 5)
     {
         fprintf(stderr, "Usage: reaviutl_bridge32 <pipe> <shm> <parent_pid> <host_hwnd>\n");
         return 1;
     }
+
+    // match aviutl.exe 0x00402e70 startup: initialize STA COM/OLE, CommonControls, and AVIFile on UI thread before loading plugins
+    ole_hr = OleInitialize(NULL);
+    {
+        INITCOMMONCONTROLSEX icc;
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = 0xFFFF;
+        InitCommonControlsEx(&icc);
+    }
+    AVIFileInit();
 
     debug_console_init(TRUE);
 
@@ -832,6 +846,15 @@ int main(int argc, char **argv)
                 g_in_rpc = TRUE;
                 handle_rpc(&req, &resp);
                 sync_shm_from_local();
+                if (g_bridge_hwnd)
+                {
+                    MSG rmsg;
+                    while (PeekMessageA(&rmsg, g_bridge_hwnd,
+                                        WM_REAVIUTL_PLUGIN_REDRAW, WM_REAVIUTL_PLUGIN_REDRAW,
+                                        PM_REMOVE))
+                    {
+                    }
+                }
                 g_in_rpc = FALSE;
                 if (!pipe_write_full(&resp, sizeof(resp)))
                     break;
@@ -884,6 +907,15 @@ int main(int argc, char **argv)
                 g_in_rpc = TRUE;
                 handle_rpc(&req, &resp);
                 sync_shm_from_local();
+                if (g_bridge_hwnd)
+                {
+                    MSG rmsg;
+                    while (PeekMessageA(&rmsg, g_bridge_hwnd,
+                                        WM_REAVIUTL_PLUGIN_REDRAW, WM_REAVIUTL_PLUGIN_REDRAW,
+                                        PM_REMOVE))
+                    {
+                    }
+                }
                 g_in_rpc = FALSE;
                 if (!pipe_write_full(&resp, sizeof(resp)))
                     break;
@@ -912,6 +944,11 @@ int main(int argc, char **argv)
             }
         }
     }
+    if (g_editp && editp_is_editing(g_editp))
+    {
+        plugin_manager_notify_file_close(g_editp);
+        editp_close_video(g_editp);
+    }
     profile_cfg_shutdown();
     video_export_shutdown();
     plugin_manager_shutdown();
@@ -926,6 +963,11 @@ int main(int argc, char **argv)
     if (g_bridge_hwnd && IsWindow(g_bridge_hwnd))
     {
         DestroyWindow(g_bridge_hwnd);
+    }
+    AVIFileExit();
+    if (SUCCEEDED(ole_hr))
+    {
+        OleUninitialize();
     }
     if (g_pipe != INVALID_HANDLE_VALUE)
         CloseHandle(g_pipe);

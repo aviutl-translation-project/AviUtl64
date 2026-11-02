@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <objbase.h>
+#include <vfw.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1446,6 +1447,30 @@ static UINT_PTR CALLBACK LoadOptionHookProc(HWND hdlg, UINT msg, WPARAM wp, LPAR
     return 0;
 }
 
+static int find_exedit_filter_index(void)
+{
+    int idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
+    int i, cnt;
+    if (idx >= 0)
+        return idx;
+    idx = plugin_manager_find_by_name("Advanced Editing");
+    if (idx >= 0)
+        return idx;
+    cnt = plugin_manager_get_count();
+    for (i = 0; i < cnt; i++)
+    {
+        const char *p = plugin_manager_get_path(i);
+        if (p && p[0])
+        {
+            const char *base = strrchr(p, '\\');
+            base = base ? (base + 1) : p;
+            if (lstrcmpiA(base, "exedit.auf") == 0)
+                return i;
+        }
+    }
+    return -1;
+}
+
 static BOOL open_media_or_exo_with_opts(HWND hwnd, const char *path, BOOL force_project_aup,
                                         const EditpLoadOptions *in_opts)
 {
@@ -1461,7 +1486,7 @@ static BOOL open_media_or_exo_with_opts(HWND hwnd, const char *path, BOOL force_
     ext = strrchr(path, '.');
     if (ext && lstrcmpiA(ext, ".exo") == 0)
     {
-        int ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
+        int ex_idx = find_exedit_filter_index();
         if (ex_idx >= 0)
         {
             plugin_manager_show_window(ex_idx, TRUE);
@@ -1484,7 +1509,7 @@ static BOOL open_media_or_exo_with_opts(HWND hwnd, const char *path, BOOL force_
                    (force_project_aup || preview_get_sys_config()->openprojectaup != 0);
     if (treat_as_aup)
     {
-        int ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
+        int ex_idx = find_exedit_filter_index();
         if (ex_idx >= 0)
         {
             plugin_manager_show_window(ex_idx, TRUE);
@@ -4149,9 +4174,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     int win_x = CW_USEDEFAULT, win_y = CW_USEDEFAULT, win_w = 640, win_h = 480;
     BOOL win_max = FALSE;
     int ex_idx;
+    HRESULT ole_hr;
 
     (void)hPrev;
     g_smoke_exit = (cmdline && strstr(cmdline, "--smoke-exit") != NULL);
+
+    // match aviutl.exe 0x00402e70 startup: initialize STA COM/OLE, CommonControls, and AVIFile on UI thread before loading plugins
+    ole_hr = OleInitialize(NULL);
+    {
+        INITCOMMONCONTROLSEX icc;
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = 0xFFFF;
+        InitCommonControlsEx(&icc);
+    }
+    AVIFileInit();
 
     // init console before loading plugins so early stdout/lua output is visible
     debug_console_init(FALSE);
@@ -4233,7 +4269,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     UpdateWindow(hwnd);
 
     // automatically show the exedit timeline window if exedit.auf is installed
-    ex_idx = plugin_manager_find_by_name(EXEDIT_SJIS_NAME);
+    ex_idx = find_exedit_filter_index();
     if (ex_idx >= 0)
     {
         plugin_manager_show_window(ex_idx, TRUE);
@@ -4321,6 +4357,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     {
         free(g_wave_frame_pcm);
         g_wave_frame_pcm = NULL;
+    }
+    AVIFileExit();
+    if (SUCCEEDED(ole_hr))
+    {
+        OleUninitialize();
     }
     return (int)msg.wParam;
 }

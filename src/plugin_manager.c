@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,13 +34,44 @@
 #define FILTER_CONTAINER_CLASS "AviUtlFilterClass"
 #define HOST_DUMMY_OWNER_CLASS "AviUtlHostDummyOwner"
 
+#if !REAVIUTL_X64
+#pragma pack(push, 4)
+#endif
+
+// undocumented AviUtl 1.10 internal FILTER tail (+0x8c..+0x4c4 on x86, 0x0042c930 / aviutl_exedit_sdk FilterPlugin)
+typedef struct
+{
+    int menu_index;               // +0x8c (puVar4[0x23] = cmd_slot)
+    HWND hwnd_parent;             // +0x90 (puVar4[0x24] = owner_hwnd)
+    HWND hwnd_active_btn;         // +0x94 (puVar4[0x25] = active checkbox)
+    HWND track_trackbar_hwnd[32]; // +0x98
+    HWND track_edit_hwnd[32];     // +0x118
+    HWND track_btn_dec_hwnd[32];  // +0x198
+    HWND track_btn_inc_hwnd[32];  // +0x218
+    HWND track_static_hwnd[32];   // +0x298
+    HWND check_hwnd[32];          // +0x318
+    int track_inline[32];         // +0x398 (puVar4 + 0xe6)
+    int check_inline[32];         // +0x418 (puVar4 + 0x106)
+    HMENU hmenu_main;             // +0x498 (puVar4[0x126])
+    int reserved_49c;             // +0x49c
+    HINSTANCE hinst_parent;       // +0x4a0 (puVar4[0x128] = host HINSTANCE)
+    void *cache_edit;             // +0x4a4
+    void *cache_temp;             // +0x4a8
+    void *cache_ptr;              // +0x4ac
+    int cache_w, cache_h;         // +0x4b0, +0x4b4
+    int cache_d;                  // +0x4b8
+    int cache_flag;               // +0x4bc
+    DWORD mode_yuy2;              // +0x4c0 (puVar4[0x130])
+} FilterInternalTail;
+
 typedef struct
 {
     char path[MAX_PATH];
     char name[256];
     HMODULE module;
     FILTER_DLL *src_dll;
-    FILTER runtime; // persistent exedit caches &e->runtime in g_fp_main
+    FILTER runtime;                  // persistent exedit caches &e->runtime in g_fp_main
+    FilterInternalTail runtime_tail; // contiguous internal tail past +0x8c for C++20 SDK plugins
     HWND hwnd;
     int index;
     int cmd_slot;
@@ -62,6 +94,13 @@ typedef struct
     HWND hwnd_check_btn[MAX_CHECK_CTRLS];
     BOOL updating_track_ui;
 } PluginEntry;
+
+#if !REAVIUTL_X64
+#pragma pack(pop)
+typedef char reaviutl_abi_flt_tail_parent[((offsetof(PluginEntry, runtime_tail.hwnd_parent) - offsetof(PluginEntry, runtime)) == 0x90) ? 1 : -1];
+typedef char reaviutl_abi_flt_tail_hinst[((offsetof(PluginEntry, runtime_tail.hinst_parent) - offsetof(PluginEntry, runtime)) == 0x4a0) ? 1 : -1];
+typedef char reaviutl_abi_flt_tail_yuy2[((offsetof(PluginEntry, runtime_tail.mode_yuy2) - offsetof(PluginEntry, runtime)) == 0x4c0) ? 1 : -1];
+#endif
 
 typedef struct
 {
@@ -1111,7 +1150,12 @@ static void ensure_window_classes(void)
     if (g_classes_registered)
         return;
 
-    InitCommonControls();
+    {
+        INITCOMMONCONTROLSEX icc;
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = 0xFFFF;
+        InitCommonControlsEx(&icc);
+    }
     hInst = GetModuleHandleA(NULL);
 
     ZeroMemory(&wc, sizeof(wc));
@@ -1262,6 +1306,8 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
                                6, y_pos + 2, 50, 16, hwnd, NULL, hInst, NULL);
         if (hLbl)
             SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, 0);
+        if (t < 32)
+            e->runtime_tail.track_static_hwnd[t] = hLbl;
 
         e->hwnd_track_bar[t] = CreateWindowExA(
             0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
@@ -1312,6 +1358,14 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
         if (e->hwnd_track_val[t])
             SendMessageA(e->hwnd_track_val[t], WM_SETFONT, (WPARAM)hFont, 0);
 
+        if (t < 32)
+        {
+            e->runtime_tail.track_trackbar_hwnd[t] = e->hwnd_track_bar[t];
+            e->runtime_tail.track_edit_hwnd[t] = e->hwnd_track_val[t];
+            e->runtime_tail.track_btn_dec_hwnd[t] = e->hwnd_track_dec[t];
+            e->runtime_tail.track_btn_inc_hwnd[t] = e->hwnd_track_inc[t];
+        }
+
         y_pos += 24;
     }
     e->updating_track_ui = FALSE;
@@ -1350,6 +1404,10 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
         {
             SendMessageW(e->hwnd_check_btn[c], WM_SETFONT, (WPARAM)hFont, 0);
         }
+        if (c < 32)
+        {
+            e->runtime_tail.check_hwnd[c] = e->hwnd_check_btn[c];
+        }
         y_pos += 20;
     }
 
@@ -1370,28 +1428,66 @@ static void bind_host_exfunc_callbacks(HWND owner_hwnd, EDITP *editp)
     }
 }
 
-static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
+static void notify_stage3_change_window(void)
+{
+    int i;
+    // stage 3 (0x0042c930 lines 800..806): send WM_FILTER_CHANGE_WINDOW (0x046e) to every initialized filter window
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (!e->stage2_initialized || e->faulted)
+            continue;
+        if (e->runtime.func_WndProc && e->runtime.hwnd)
+        {
+            safe_call_wndproc(e, e->runtime.hwnd, WM_FILTER_CHANGE_WINDOW, 0, 0,
+                              exfunc_get_editp(), "Stage 3 WM_FILTER_CHANGE_WINDOW");
+        }
+    }
+}
+
+static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp, BOOL defer_stage3)
 {
     int i;
 
     editp_set_registered_filter_count(g_plugin_count);
     bind_host_exfunc_callbacks(owner_hwnd, editp);
 
-    // create owned tool windows & populate runtime FILTER structs for ALL plugins before calling func_init on any of them (so get_filterp(0..N-1) works)
+    // create owned tool windows, restore saved aviutl.ini geometry/visibility, & populate runtime FILTER structs for ALL plugins before calling func_init (0x0042c930)
     {
         char ini[MAX_PATH];
         int next_vid_prio = 1;
         int next_aud_prio = 1;
+        int vx0 = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy0 = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        HINSTANCE host_hinst = GetModuleHandleA(NULL);
+        HMENU host_menu = (owner_hwnd && IsWindow(owner_hwnd)) ? GetMenu(owner_hwnd) : NULL;
+        if (vw <= 0)
+            vw = GetSystemMetrics(SM_CXSCREEN);
+        if (vh <= 0)
+            vh = GetSystemMetrics(SM_CYSCREEN);
         get_plugin_ini_path(ini, sizeof(ini));
 
         for (i = 0; i < g_plugin_count; i++)
         {
             PluginEntry *e = &g_plugins[i];
+            char sec[256];
             int fl, def_prio;
+
             e->hwnd = create_filter_window(e, owner_hwnd);
             plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
+
+            e->runtime_tail.menu_index = e->cmd_slot;
+            e->runtime_tail.hwnd_parent = owner_hwnd;
+            e->runtime_tail.hwnd_active_btn = e->hwnd_active_chk;
+            e->runtime_tail.hmenu_main = host_menu;
+            e->runtime_tail.hinst_parent = host_hinst;
+
             fl = e->runtime.flag;
             e->default_flag = fl;
+            sanitize_ini_section(e->name, sec, sizeof(sec));
+
             if (fl & FILTER_FLAG_INTERLACE_FILTER)
             {
                 def_prio = -1;
@@ -1399,7 +1495,6 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
             }
             else
             {
-                char sec[256];
                 if (fl & FILTER_FLAG_PRIORITY_HIGHEST)
                 {
                     def_prio = 0;
@@ -1416,7 +1511,6 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                 {
                     def_prio = (next_vid_prio < 126) ? next_vid_prio++ : 126;
                 }
-                sanitize_ini_section(e->name, sec, sizeof(sec));
                 if (sec[0])
                 {
                     e->priority = (int)GetPrivateProfileIntA(sec, "priority", def_prio, ini);
@@ -1427,13 +1521,62 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                 }
             }
             e->default_priority = def_prio;
+
+            // 0x0042c930 lines 308..668: restore saved x, y, w, h, and disp before func_init / WM_FILTER_INIT
+            if (sec[0] && e->hwnd && IsWindow(e->hwnd))
+            {
+                int wx = (int)GetPrivateProfileIntA(sec, "x", -32000, ini);
+                int wy = (int)GetPrivateProfileIntA(sec, "y", -32000, ini);
+                int ww = 0, wh = 0, disp;
+                UINT swp = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
+
+                if (GetWindowLongA(e->hwnd, GWL_STYLE) & WS_THICKFRAME)
+                {
+                    ww = (int)GetPrivateProfileIntA(sec, "w", 0, ini);
+                    wh = (int)GetPrivateProfileIntA(sec, "h", 0, ini);
+                    if (ww >= 128 && wh >= 96)
+                        swp &= ~SWP_NOSIZE;
+                }
+                if (wx != -32000 && wy != -32000)
+                {
+                    if (wx < vx0 - 64)
+                        wx = vx0;
+                    if (wy < vy0 - 16)
+                        wy = vy0;
+                    if (wx > vx0 + vw - 48)
+                        wx = vx0 + vw - 128;
+                    if (wy > vy0 + vh - 48)
+                        wy = vy0 + vh - 96;
+                    SetWindowPos(e->hwnd, NULL, wx, wy, ww, wh, swp);
+                }
+                else if (swp == (SWP_NOZORDER | SWP_NOACTIVATE))
+                {
+                    SetWindowPos(e->hwnd, NULL, 0, 0, ww, wh, swp | SWP_NOMOVE);
+                }
+
+                disp = (int)GetPrivateProfileIntA(sec, "disp", 0, ini);
+                if (disp != 0)
+                {
+                    e->runtime.flag |= FILTER_FLAG_WINDOW_DISP;
+                    if (e->src_dll)
+                        e->src_dll->flag = e->runtime.flag;
+                    ShowWindow(e->hwnd, SW_SHOWNA);
+                }
+                else
+                {
+                    e->runtime.flag &= ~FILTER_FLAG_WINDOW_DISP;
+                    if (e->src_dll)
+                        e->src_dll->flag = e->runtime.flag;
+                }
+            }
+
             dbg_plugin("Filter[%d] '%s' | slot=%d HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X prio=%d",
                        i, e->name, e->cmd_slot, (void *)e->module, (void *)&e->runtime,
                        (void *)e->hwnd, (unsigned)e->runtime.flag, e->priority);
         }
     }
 
-    // run func_init(fp) on each filter in order
+    // stage 1: run func_init(fp) on each filter in order
     for (i = 0; i < g_plugin_count; i++)
     {
         PluginEntry *e = &g_plugins[i];
@@ -1447,7 +1590,9 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                          i, e->name, e->faulted ? "FAULTED" : "returned FALSE",
                          (unsigned long)(GetTickCount() - t0));
                 e->stage1_initialized = FALSE;
-                e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+                e->runtime.flag &= ~(FILTER_FLAG_ACTIVE | FILTER_FLAG_WINDOW_DISP);
+                if (e->src_dll)
+                    e->src_dll->flag = e->runtime.flag;
                 if (e->hwnd && IsWindow(e->hwnd))
                 {
                     ShowWindow(e->hwnd, SW_HIDE);
@@ -1476,6 +1621,11 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                 dbg_warn("Filter[%d] '%s' Stage 2 WM_FILTER_INIT FAULTED -> disabled",
                          i, e->name);
                 e->stage1_initialized = FALSE;
+                e->runtime.flag &= ~(FILTER_FLAG_ACTIVE | FILTER_FLAG_WINDOW_DISP);
+                if (e->src_dll)
+                    e->src_dll->flag = e->runtime.flag;
+                if (e->hwnd && IsWindow(e->hwnd))
+                    ShowWindow(e->hwnd, SW_HIDE);
                 continue;
             }
             dbg_plugin("Filter[%d] '%s' Stage 2 WM_FILTER_INIT OK (%lu ms, +%d menu items)",
@@ -1485,64 +1635,9 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
         e->stage2_initialized = TRUE;
     }
 
-    // restore saved window positions & visibility from aviutl.ini (0x0042c930)
+    if (!defer_stage3)
     {
-        char ini[MAX_PATH];
-        int vx0 = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        int vy0 = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        if (vw <= 0)
-            vw = GetSystemMetrics(SM_CXSCREEN);
-        if (vh <= 0)
-            vh = GetSystemMetrics(SM_CYSCREEN);
-        get_plugin_ini_path(ini, sizeof(ini));
-
-        for (i = 0; i < g_plugin_count; i++)
-        {
-            PluginEntry *e = &g_plugins[i];
-            char sec[256];
-            int wx, wy, ww = 0, wh = 0, disp;
-            UINT swp = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
-
-            if (!e->stage1_initialized || !e->hwnd || !IsWindow(e->hwnd))
-                continue;
-            sanitize_ini_section(e->name, sec, sizeof(sec));
-            if (!sec[0])
-                continue;
-
-            wx = (int)GetPrivateProfileIntA(sec, "x", -32000, ini);
-            wy = (int)GetPrivateProfileIntA(sec, "y", -32000, ini);
-            if (GetWindowLongA(e->hwnd, GWL_STYLE) & WS_THICKFRAME)
-            {
-                ww = (int)GetPrivateProfileIntA(sec, "w", 0, ini);
-                wh = (int)GetPrivateProfileIntA(sec, "h", 0, ini);
-                if (ww >= 128 && wh >= 96)
-                    swp &= ~SWP_NOSIZE;
-            }
-            if (wx != -32000 && wy != -32000)
-            {
-                if (wx < vx0 - 64)
-                    wx = vx0;
-                if (wy < vy0 - 16)
-                    wy = vy0;
-                if (wx > vx0 + vw - 48)
-                    wx = vx0 + vw - 128;
-                if (wy > vy0 + vh - 48)
-                    wy = vy0 + vh - 96;
-                SetWindowPos(e->hwnd, NULL, wx, wy, ww, wh, swp);
-            }
-            else if (swp == (SWP_NOZORDER | SWP_NOACTIVATE))
-            {
-                SetWindowPos(e->hwnd, NULL, 0, 0, ww, wh, swp | SWP_NOMOVE);
-            }
-
-            disp = (int)GetPrivateProfileIntA(sec, "disp", 0, ini);
-            if (disp != 0)
-            {
-                plugin_manager_show_window(i, TRUE);
-            }
-        }
+        notify_stage3_change_window();
     }
 
     // if a project/video is already open in editp, notify newly initialized filters
@@ -1728,7 +1823,7 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
 
     if (g_plugin_count > 0)
     {
-        initialize_registered_plugins(owner_hwnd, editp);
+        initialize_registered_plugins(owner_hwnd, editp, saw_32bit_plugin_on_x64);
     }
 
 #if REAVIUTL_X64
@@ -1747,6 +1842,11 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
 
     editp_set_registered_filter_count(
         g_plugin_count + (plugin_bridge_is_active() ? plugin_bridge_get_filter_count() : 0));
+
+    if (saw_32bit_plugin_on_x64 && g_plugin_count > 0)
+    {
+        notify_stage3_change_window();
+    }
 
     return (g_plugin_count > 0 || plugin_bridge_is_active());
 }
@@ -1815,7 +1915,7 @@ BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP 
 
     if (g_plugin_count > 0)
     {
-        initialize_registered_plugins(owner_hwnd, editp);
+        initialize_registered_plugins(owner_hwnd, editp, FALSE);
         return TRUE;
     }
     return FALSE;

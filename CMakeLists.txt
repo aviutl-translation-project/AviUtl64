@@ -18,6 +18,7 @@ set(REAVIUTL_CORE_SOURCES
 	src/plugin_manager.c
 	src/plugin_loader.c
 	src/plugin_bridge_client.c
+	src/builtin_filters.c
 	src/color_plugin.c
 	src/input_plugin.c
 	src/video_export.c

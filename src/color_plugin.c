@@ -29,6 +29,8 @@ static int g_color_count = 0;
 static BOOL g_use_sse = TRUE;
 static BOOL g_use_sse2 = TRUE;
 static BOOL g_yuy2_mode = FALSE;
+static int g_selected_input = 2;  // 0=BT.601, 1=BT.709, 2=Auto, >=3=external .auc
+static int g_selected_output = 2; // 0=BT.601, 1=BT.709, 2=Auto, >=3=external .auc
 
 static void get_ini_path(char *out_path, size_t out_sz)
 {
@@ -420,6 +422,28 @@ BOOL color_plugin_get_ext_summary(int ext_idx, ColorPluginSummary *out_sum)
     return FALSE;
 }
 
+void color_plugin_set_selected_input(int idx)
+{
+    if (idx >= 0 && idx < g_color_count)
+        g_selected_input = idx;
+}
+
+int color_plugin_get_selected_input(void)
+{
+    return (g_selected_input >= 0 && g_selected_input < g_color_count) ? g_selected_input : 2;
+}
+
+void color_plugin_set_selected_output(int idx)
+{
+    if (idx >= 0 && idx < g_color_count)
+        g_selected_output = idx;
+}
+
+int color_plugin_get_selected_output(void)
+{
+    return (g_selected_output >= 0 && g_selected_output < g_color_count) ? g_selected_output : 2;
+}
+
 static void fill_color_proc_info(COLOR_PROC_INFO *cpi, PIXEL_YC *ycp, int yc_stride,
                                  void *pixelp, DWORD norm_fmt, int w, int h, BOOL invert_height)
 {
@@ -454,7 +478,7 @@ BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
 {
     DWORD norm;
     COLOR_PROC_INFO cpi;
-    int i;
+    int i, sel = color_plugin_get_selected_input();
 
     if (!ycp || !pixelp || w <= 0 || h <= 0)
     {
@@ -468,7 +492,26 @@ BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
     norm = yc48_normalize_format(format);
     fill_color_proc_info(&cpi, ycp, yc_stride, (void *)pixelp, norm, w, h, invert_height);
 
-    // try native external .auc plugins first
+    // explicit BT.601 or BT.709 selection
+    if ((sel == 0 || sel == 1) && norm == 0x32595559u)
+    {
+        int stride = ((w + 1) / 2) * 4;
+        return yuy2_to_yc48(ycp, yc_stride, (const unsigned char *)pixelp, stride,
+                            w, h, (sel == 1) ? TRUE : FALSE);
+    }
+
+    // explicit external .auc selection first
+    if (sel >= 0 && sel < g_color_count)
+    {
+        ColorPluginEntry *es = &g_color_plugins[sel];
+        if (es->builtin_kind == 0 && !es->bridged_x86 && es->table)
+        {
+            if (seh_color_pixel2yc(es->table, &cpi))
+                return TRUE;
+        }
+    }
+
+    // try native external .auc plugins
     for (i = 0; i < g_color_count; i++)
     {
         ColorPluginEntry *e = &g_color_plugins[i];
@@ -485,8 +528,9 @@ BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
     if (norm == 0x32595559u) // "YUY2"
     {
         int stride = ((w + 1) / 2) * 4;
+        BOOL bt709 = (sel == 0) ? FALSE : (sel == 1 ? TRUE : ((h >= 720) ? TRUE : FALSE));
         return yuy2_to_yc48(ycp, yc_stride, (const unsigned char *)pixelp, stride,
-                            w, h, (h >= 720) ? TRUE : FALSE);
+                            w, h, bt709);
     }
 
     return FALSE;
@@ -498,7 +542,7 @@ BOOL color_plugin_yc2pixel(void *pixelp, const PIXEL_YC *ycp, int yc_stride,
 {
     DWORD norm;
     COLOR_PROC_INFO cpi;
-    int i;
+    int i, sel = color_plugin_get_selected_output();
 
     if (!pixelp || !ycp || w <= 0 || h <= 0)
     {
@@ -511,6 +555,23 @@ BOOL color_plugin_yc2pixel(void *pixelp, const PIXEL_YC *ycp, int yc_stride,
 
     norm = yc48_normalize_format(format);
     fill_color_proc_info(&cpi, (PIXEL_YC *)ycp, yc_stride, pixelp, norm, w, h, invert_height);
+
+    if ((sel == 0 || sel == 1) && norm == 0x32595559u)
+    {
+        int stride = ((w + 1) / 2) * 4;
+        return yc48_to_yuy2_ex((unsigned char *)pixelp, stride, ycp, yc_stride,
+                               w, h, (sel == 1) ? TRUE : FALSE);
+    }
+
+    if (sel >= 0 && sel < g_color_count)
+    {
+        ColorPluginEntry *es = &g_color_plugins[sel];
+        if (es->builtin_kind == 0 && !es->bridged_x86 && es->table)
+        {
+            if (seh_color_yc2pixel(es->table, &cpi))
+                return TRUE;
+        }
+    }
 
     for (i = 0; i < g_color_count; i++)
     {
@@ -527,8 +588,9 @@ BOOL color_plugin_yc2pixel(void *pixelp, const PIXEL_YC *ycp, int yc_stride,
     if (norm == 0x32595559u) // "YUY2"
     {
         int stride = ((w + 1) / 2) * 4;
+        BOOL bt709 = (sel == 0) ? FALSE : (sel == 1 ? TRUE : ((h >= 720) ? TRUE : FALSE));
         return yc48_to_yuy2_ex((unsigned char *)pixelp, stride, ycp, yc_stride,
-                               w, h, (h >= 720) ? TRUE : FALSE);
+                               w, h, bt709);
     }
 
     return FALSE;

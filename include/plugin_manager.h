@@ -12,6 +12,7 @@
 
 #define PLUGIN_CMD_TOGGLE_BASE 10001
 #define PLUGIN_CMD_WINDOW_BASE 11001
+#define PLUGIN_CMD_CONFIG_ITEM_BASE 12000
 #define PLUGIN_CMD_IMPORT_BASE 14001
 #define PLUGIN_CMD_EXPORT_BASE 15001
 #define PLUGIN_CMD_MENU_ITEM_BASE 16000
@@ -26,12 +27,16 @@ typedef struct PluginMenuItem
     int flag;
 } PluginMenuItem;
 
+void plugin_manager_set_builtins_enabled(BOOL enabled);
 BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp);
 BOOL plugin_manager_init(const char *plugin_dir);
 BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP *editp);
 void plugin_manager_shutdown(void);
 
 int plugin_manager_get_count(void);
+BOOL plugin_manager_is_builtin(int index);
+int plugin_manager_get_cmd_slot(int index);
+int plugin_manager_find_by_cmd_slot(int cmd_slot);
 const char *plugin_manager_get_name(int index);
 const char *plugin_manager_get_information(int index);
 const char *plugin_manager_get_path(int index);
@@ -49,6 +54,15 @@ BOOL plugin_manager_is_bridged(void);
 int plugin_manager_get_menu_item_count(void);
 BOOL plugin_manager_get_menu_item(int index, PluginMenuItem *out_item);
 BOOL plugin_manager_exec_menu_item_index(int menu_index);
+
+int plugin_manager_get_config_check_count(int index);
+const char *plugin_manager_get_config_check_name(int index, int check_idx);
+int plugin_manager_get_config_check_default(int index, int check_idx);
+int plugin_manager_get_config_check_value(int index, int check_idx);
+BOOL plugin_manager_select_config_check(int index, int check_idx);
+void plugin_manager_clear_config_cmd_map(void);
+int plugin_manager_register_config_cmd(int filter_index, int check_idx);
+void plugin_manager_reset_window_positions(HWND main_hwnd);
 
 HMENU plugin_manager_build_menu(void);
 

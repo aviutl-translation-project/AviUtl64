@@ -30,6 +30,11 @@ BOOL color_plugin_get_summary(int idx, ColorPluginSummary *out_sum);
 int color_plugin_get_ext_count(void);
 BOOL color_plugin_get_ext_summary(int ext_idx, ColorPluginSummary *out_sum);
 
+void color_plugin_set_selected_input(int idx);
+int color_plugin_get_selected_input(void);
+void color_plugin_set_selected_output(int idx);
+int color_plugin_get_selected_output(void);
+
 BOOL color_plugin_pixel2yc(PIXEL_YC *ycp, int yc_stride,
                            const void *pixelp, DWORD format,
                            int w, int h, BOOL invert_height);

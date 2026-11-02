@@ -38,6 +38,8 @@ PIXEL_YC *editp_get_ycp_temp(EDITP *ep);
 void editp_swap_ycp(EDITP *ep, PIXEL_YC *new_edit, PIXEL_YC *new_temp);
 
 void editp_get_dimensions(EDITP *ep, int *w, int *h, int *max_w, int *max_h);
+void editp_get_org_dimensions(EDITP *ep, int *org_w, int *org_h);
+void editp_set_frame_dimensions(EDITP *ep, int w, int h);
 int editp_get_frame(EDITP *ep);
 int editp_set_frame(EDITP *ep, int n);
 int editp_get_frame_n(EDITP *ep);

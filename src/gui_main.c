@@ -18,6 +18,7 @@
 #include "yc48_convert.h"
 #include "plugin_manager.h"
 #include "plugin_bridge.h"
+#include "builtin_filters.h"
 #include "color_plugin.h"
 #include "input_plugin.h"
 #include "video_export.h"
@@ -596,55 +597,155 @@ static void apply_menu(HWND hwnd)
         }
     }
 
-    // [フィルタ], [設定], [表示], [インポート], [エクスポート]
+    // [フィルタ], [設定], [表示], [インポート], [エクスポート] (0x0042c930)
+    plugin_manager_clear_config_cmd_map();
+    builtin_filters_reload_dynamic_lists();
     fcount = plugin_manager_get_count();
-    for (i = 0; i < fcount; i++)
     {
-        int flags = plugin_manager_get_flags(i);
-        const char *nm = plugin_manager_get_name(i);
-        HWND fhwnd = plugin_manager_get_window(i);
-        wchar_t wnm[256], witem[300];
-        BOOL is_audio = (flags & FILTER_FLAG_AUDIO_FILTER) != 0;
-        BOOL is_disp = (flags & FILTER_FLAG_DISP_FILTER) != 0;
+        HMENU cur_cfg_popup = NULL;
+        HMENU interlace_cfg_popup = NULL;
 
-        sjis_to_wide_str((nm && nm[0]) ? nm : "Filter", wnm, 256);
-
-        if (!(flags & FILTER_FLAG_ALWAYS_ACTIVE) && !is_disp)
+        for (i = 0; i < fcount; i++)
         {
-            UINT ufl = MF_BYCOMMAND | MF_STRING |
-                       ((flags & FILTER_FLAG_ACTIVE) ? MF_CHECKED : MF_UNCHECKED);
-            InsertMenuW(bar, is_audio ? 10999u : 10000u, ufl,
-                        (UINT_PTR)(PLUGIN_CMD_TOGGLE_BASE + i), wnm);
-        }
+            int flags = plugin_manager_get_flags(i);
+            int slot = plugin_manager_get_cmd_slot(i);
+            const char *nm = plugin_manager_get_name(i);
+            HWND fhwnd = plugin_manager_get_window(i);
+            wchar_t wnm[256], witem[300];
+            BOOL is_audio = (flags & FILTER_FLAG_AUDIO_FILTER) != 0;
+            BOOL is_disp = (flags & FILTER_FLAG_DISP_FILTER) != 0;
+            BOOL is_interlace = (flags & FILTER_FLAG_INTERLACE_FILTER) != 0;
+            BOOL is_cfg_menu = (flags & (FILTER_FLAG_CONFIG_POPUP | FILTER_FLAG_CONFIG_CHECK |
+                                         FILTER_FLAG_CONFIG_RADIO | BUILTIN_FLAG_POPUP_APPEND)) != 0;
 
-        if (!(flags & FILTER_FLAG_NO_CONFIG))
-        {
-            BOOL vis = ((flags & FILTER_FLAG_WINDOW_DISP) != 0) ||
-                       (fhwnd && IsWindowVisible(fhwnd));
-            UINT ufl = MF_BYCOMMAND | MF_STRING | (vis ? MF_CHECKED : MF_UNCHECKED);
-            if (is_disp)
+            sjis_to_wide_str((nm && nm[0]) ? nm : "Filter", wnm, 256);
+
+            if (slot >= 0 &&
+                !(flags & FILTER_FLAG_ALWAYS_ACTIVE) &&
+                !is_disp && !is_interlace && !is_cfg_menu)
             {
-                wsprintfW(witem, L"%s%s", wnm, w_disp_suffix);
-                InsertMenuW(bar, 10998u, ufl,
-                            (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), witem);
+                UINT ufl = MF_BYCOMMAND | MF_STRING |
+                           ((flags & FILTER_FLAG_ACTIVE) ? MF_CHECKED : MF_UNCHECKED);
+                InsertMenuW(bar, is_audio ? 10999u : 10000u, ufl,
+                            (UINT_PTR)(PLUGIN_CMD_TOGGLE_BASE + slot), wnm);
             }
-            else
-            {
-                wsprintfW(witem, L"%s%s", wnm, w_cfg_suffix);
-                InsertMenuW(bar, is_audio ? 11999u : 11000u, ufl,
-                            (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), witem);
-            }
-        }
 
-        if (flags & FILTER_FLAG_IMPORT)
-        {
-            InsertMenuW(bar, 14000u, MF_BYCOMMAND | MF_STRING,
-                        (UINT_PTR)(PLUGIN_CMD_IMPORT_BASE + i), wnm);
-        }
-        if (flags & FILTER_FLAG_EXPORT)
-        {
-            InsertMenuW(bar, 15000u, MF_BYCOMMAND | MF_STRING,
-                        (UINT_PTR)(PLUGIN_CMD_EXPORT_BASE + i), wnm);
+            if (!(flags & FILTER_FLAG_NO_CONFIG))
+            {
+                BOOL vis = ((flags & FILTER_FLAG_WINDOW_DISP) != 0) ||
+                           (fhwnd && IsWindowVisible(fhwnd));
+                UINT ufl = MF_STRING | (vis ? MF_CHECKED : MF_UNCHECKED);
+
+                if (is_disp)
+                {
+                    if (slot >= 0)
+                    {
+                        wsprintfW(witem, L"%s%s", wnm,
+                                  (flags & BUILTIN_FLAG_NO_CFG_SUFFIX) ? L"" : w_disp_suffix);
+                        InsertMenuW(bar, 10998u, MF_BYCOMMAND | ufl,
+                                    (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + slot), witem);
+                    }
+                }
+                else if (is_cfg_menu)
+                {
+                    int c, ccount = plugin_manager_get_config_check_count(i);
+                    BOOL use_popup = (flags & (FILTER_FLAG_CONFIG_POPUP | BUILTIN_FLAG_POPUP_APPEND)) != 0;
+
+                    if ((flags & FILTER_FLAG_CONFIG_POPUP) && !(flags & BUILTIN_FLAG_POPUP_APPEND))
+                    {
+                        cur_cfg_popup = CreatePopupMenu();
+                        wsprintfW(witem, L"%s%s", wnm,
+                                  (flags & BUILTIN_FLAG_NO_CFG_SUFFIX) ? L"" : w_cfg_suffix);
+                        InsertMenuW(bar, 11998u, MF_BYCOMMAND | MF_POPUP,
+                                    (UINT_PTR)cur_cfg_popup, witem);
+                        if (i == 17 && plugin_manager_is_builtin(i))
+                        {
+                            interlace_cfg_popup = cur_cfg_popup;
+                        }
+                    }
+
+                    for (c = 0; c < ccount; c++)
+                    {
+                        const char *cname = plugin_manager_get_config_check_name(i, c);
+                        int cdef = plugin_manager_get_config_check_default(i, c);
+                        int cval = plugin_manager_get_config_check_value(i, c);
+                        wchar_t wcname[256];
+
+                        sjis_to_wide_str(cname ? cname : "", wcname, 256);
+                        if (cdef < 0)
+                        {
+                            if (use_popup && cur_cfg_popup)
+                            {
+                                AppendMenuW(cur_cfg_popup, MF_STRING | MF_GRAYED | MF_DISABLED,
+                                            0, wcname);
+                            }
+                            else
+                            {
+                                InsertMenuW(bar, 11998u,
+                                            MF_BYCOMMAND | MF_STRING | MF_GRAYED | MF_DISABLED,
+                                            0, wcname);
+                            }
+                        }
+                        else
+                        {
+                            int cmd_id = plugin_manager_register_config_cmd(i, c);
+                            UINT cfl = MF_STRING | (cval ? MF_CHECKED : MF_UNCHECKED);
+                            if (cmd_id > 0)
+                            {
+                                if (use_popup && cur_cfg_popup)
+                                {
+                                    AppendMenuW(cur_cfg_popup, cfl, (UINT_PTR)cmd_id, wcname);
+                                }
+                                else
+                                {
+                                    InsertMenuW(bar, 11998u, MF_BYCOMMAND | cfl,
+                                                (UINT_PTR)cmd_id, wcname);
+                                }
+                            }
+                        }
+                    }
+
+                    if ((flags & BUILTIN_FLAG_POPUP_SEP) && use_popup && cur_cfg_popup)
+                    {
+                        AppendMenuW(cur_cfg_popup, MF_SEPARATOR, 0, NULL);
+                    }
+                }
+                else if (is_interlace)
+                {
+                    if (slot >= 0)
+                    {
+                        wsprintfW(witem, L"%s%s", wnm, w_cfg_suffix);
+                        if (interlace_cfg_popup)
+                        {
+                            AppendMenuW(interlace_cfg_popup, ufl,
+                                        (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + slot), witem);
+                        }
+                        else
+                        {
+                            InsertMenuW(bar, 11000u, MF_BYCOMMAND | ufl,
+                                        (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + slot), witem);
+                        }
+                    }
+                }
+                else if (slot >= 0)
+                {
+                    wsprintfW(witem, L"%s%s", wnm,
+                              (flags & BUILTIN_FLAG_NO_CFG_SUFFIX) ? L"" : w_cfg_suffix);
+                    InsertMenuW(bar, is_audio ? 11999u : 11000u, MF_BYCOMMAND | ufl,
+                                (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + slot), witem);
+                }
+            }
+
+            if ((flags & FILTER_FLAG_IMPORT) && slot >= 0)
+            {
+                InsertMenuW(bar, 14000u, MF_BYCOMMAND | MF_STRING,
+                            (UINT_PTR)(PLUGIN_CMD_IMPORT_BASE + slot), wnm);
+            }
+            if ((flags & FILTER_FLAG_EXPORT) && slot >= 0)
+            {
+                InsertMenuW(bar, 15000u, MF_BYCOMMAND | MF_STRING,
+                            (UINT_PTR)(PLUGIN_CMD_EXPORT_BASE + slot), wnm);
+            }
         }
     }
 
@@ -711,6 +812,7 @@ static void apply_menu(HWND hwnd)
     }
     preview_sync_menu_checks(hwnd);
     DrawMenuBar(hwnd);
+    builtin_filters_notify_menu_rebuilt(hwnd);
 }
 
 static BOOL fill_and_submit_wave_hdr(WAVEHDR *wh)
@@ -800,6 +902,8 @@ static void stop_playback(HWND hwnd)
 {
     BOOL was_playing = g_playing;
     g_playing = FALSE;
+
+    builtin_filters_stop_playback();
 
     if (was_playing)
     {
@@ -1622,22 +1726,13 @@ static void seek_matching_frame(HWND hwnd, int dir, BOOL match_mark)
 static void reset_window_positions(HWND hwnd)
 {
     RECT wa;
-    int i, fcount = plugin_manager_get_count();
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0))
     {
         SetRect(&wa, 0, 0, 1280, 720);
     }
     SetWindowPos(hwnd, NULL, wa.left + 32, wa.top + 32, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    for (i = 0; i < fcount; i++)
-    {
-        HWND fh = plugin_manager_get_window(i);
-        if (fh && IsWindow(fh))
-        {
-            SetWindowPos(fh, NULL, wa.left + 48 + (i % 6) * 28, wa.top + 360 + (i % 6) * 24,
-                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
+    plugin_manager_reset_window_positions(hwnd);
 }
 
 // 0x00404b60: Browse button handler inside SYSTEM dialog (108)
@@ -2030,6 +2125,9 @@ static void show_filter_plugin_info(HWND owner)
         const char *pth = plugin_manager_get_path(i);
         const char *base = aviutl_basename(pth);
         wchar_t winf[256], wbase[256], line[600];
+
+        if (plugin_manager_is_builtin(i))
+            continue;
 
         sjis_to_wide_str((inf && inf[0]) ? inf : (nm ? nm : ""), winf, 256);
         sjis_to_wide_str(base, wbase, 256);
@@ -2759,7 +2857,7 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             if (!ctrl && !shift && !alt && wp == VK_SPACE)
             {
-                toggle_playback(hwnd);
+                SendMessageA(hwnd, WM_COMMAND, 1099, 0);
                 return 0;
             }
             return 0;
@@ -2947,6 +3045,8 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 108: // file -> settings -> System Settings
             run_system_settings_dialog(hwnd);
             winsnap_set_enabled(preview_get_sys_config()->windowsnap != 0);
+            apply_menu(hwnd);
+            builtin_filters_refresh_tool_window();
             return 0;
         case 1006: // other -> File Information
             show_current_file_info(hwnd);
@@ -3030,8 +3130,17 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         case 9005: // play button (movieplaymain)
-        case 1099: // play / Stop
             toggle_playback(hwnd);
+            return 0;
+        case 1099: // play / Stop (0x00405450: Playback Window unless movieplaymain != 0)
+            if (preview_get_sys_config()->movieplaymain != 0)
+            {
+                toggle_playback(hwnd);
+            }
+            else if (!builtin_filters_toggle_playback_window_play(hwnd, g_editp))
+            {
+                toggle_playback(hwnd);
+            }
             return 0;
         case 5396: // first frame (Home)
             seek_to_frame_ex(hwnd, 0, TRUE);
@@ -3257,6 +3366,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     input_plugin_set_wav_config_handler(run_wav_option_dialog);
     color_plugin_init(plugin_dir, hwnd);
     input_plugin_init(plugin_dir, hwnd);
+    plugin_manager_set_builtins_enabled(TRUE);
     plugin_manager_init_ex(plugin_dir, hwnd, g_editp);
     video_export_set_ui_callbacks(cb_export_preview_update, cb_export_progress);
     video_export_scan_auo(plugin_dir, hwnd, g_editp);

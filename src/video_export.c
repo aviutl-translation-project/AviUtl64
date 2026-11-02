@@ -12,6 +12,7 @@
 #include "video_export.h"
 #include "plugin_manager.h"
 #include "plugin_bridge.h"
+#include "builtin_filters.h"
 #include "yc48_convert.h"
 #include "exfunc.h"
 #include "i18n.h"
@@ -62,9 +63,11 @@ typedef struct
     EDITP *ep;
     int select_s;
     int select_e;
-    int *tl_frames; // [0 .. out_n-1] non-deleted timeline frame indices
+    int *tl_frames; // [0 .. out_n-1] non-deleted (and framerate-kept) video timeline frame indices
     int out_n;
-    int *aud_sample_ofs; // [0 .. out_n] cumulative sample offsets
+    int *aud_frames; // [0 .. aud_frame_n-1] all non-deleted timeline frame indices for audio
+    int aud_frame_n;
+    int *aud_sample_ofs; // [0 .. aud_frame_n] cumulative sample offsets
     int total_audio_samples;
     int audio_rate;
     int audio_ch;
@@ -625,10 +628,10 @@ static void pump_encode_messages_and_progress(HWND owner, int now, int total, BO
     }
 }
 
-// build non-deleted timeline frame map & sample offset table
-static BOOL setup_encode_session(HWND owner, EDITP *ep, int *out_s, int *out_e)
+// build non-deleted timeline frame map (with optional framerate decimation) & sample offset table
+static BOOL setup_encode_session(HWND owner, EDITP *ep, BOOL apply_fps_decimate, int *out_s, int *out_e)
 {
-    int fn, s = 0, e = 0, f, count = 0;
+    int fn, s = 0, e = 0, f, vid_count = 0, aud_count = 0;
 
     if (!ep || !editp_is_editing(ep))
         return FALSE;
@@ -644,36 +647,55 @@ static BOOL setup_encode_session(HWND owner, EDITP *ep, int *out_s, int *out_e)
 
     ZeroMemory(&g_enc, sizeof(g_enc));
     g_enc.tl_frames = (int *)malloc((size_t)(e - s + 1) * sizeof(int));
-    if (!g_enc.tl_frames)
+    g_enc.aud_frames = (int *)malloc((size_t)(e - s + 1) * sizeof(int));
+    if (!g_enc.tl_frames || !g_enc.aud_frames)
+    {
+        free(g_enc.tl_frames);
+        free(g_enc.aud_frames);
+        ZeroMemory(&g_enc, sizeof(g_enc));
         return FALSE;
+    }
 
     for (f = s; f <= e; f++)
     {
         BYTE st = 0;
+        int rel_idx;
         if (editp_get_frame_status(ep, f, &st) && (st & EDIT_FRAME_EDIT_FLAG_DELFRAME))
         {
             continue;
         }
-        g_enc.tl_frames[count++] = f;
+        rel_idx = aud_count;
+        g_enc.aud_frames[aud_count++] = f;
+        if (!apply_fps_decimate || builtin_filters_is_framerate_kept_frame(rel_idx))
+        {
+            g_enc.tl_frames[vid_count++] = f;
+        }
     }
-    if (count <= 0)
+    if (aud_count <= 0)
     {
         free(g_enc.tl_frames);
-        g_enc.tl_frames = NULL;
+        free(g_enc.aud_frames);
+        ZeroMemory(&g_enc, sizeof(g_enc));
         return FALSE;
     }
+    if (vid_count <= 0)
+    {
+        g_enc.tl_frames[0] = g_enc.aud_frames[0];
+        vid_count = 1;
+    }
 
-    g_enc.aud_sample_ofs = (int *)malloc((size_t)(count + 1) * sizeof(int));
+    g_enc.aud_sample_ofs = (int *)malloc((size_t)(aud_count + 1) * sizeof(int));
     if (!g_enc.aud_sample_ofs)
     {
         free(g_enc.tl_frames);
-        g_enc.tl_frames = NULL;
+        free(g_enc.aud_frames);
+        ZeroMemory(&g_enc, sizeof(g_enc));
         return FALSE;
     }
     g_enc.aud_sample_ofs[0] = 0;
-    for (f = 0; f < count; f++)
+    for (f = 0; f < aud_count; f++)
     {
-        int smp = editp_read_audio_frame(ep, g_enc.tl_frames[f], NULL);
+        int smp = editp_read_audio_frame(ep, g_enc.aud_frames[f], NULL);
         if (smp < 0)
             smp = 0;
         g_enc.aud_sample_ofs[f + 1] = g_enc.aud_sample_ofs[f] + smp;
@@ -685,8 +707,9 @@ static BOOL setup_encode_session(HWND owner, EDITP *ep, int *out_s, int *out_e)
     g_enc.ep = ep;
     g_enc.select_s = s;
     g_enc.select_e = e;
-    g_enc.out_n = count;
-    g_enc.total_audio_samples = g_enc.aud_sample_ofs[count];
+    g_enc.out_n = vid_count;
+    g_enc.aud_frame_n = aud_count;
+    g_enc.total_audio_samples = g_enc.aud_sample_ofs[aud_count];
     g_enc.audio_rate = editp_get_audio_rate(ep) > 0 ? editp_get_audio_rate(ep) : 44100;
     g_enc.audio_ch = editp_get_audio_ch(ep) > 0 ? editp_get_audio_ch(ep) : 2;
     g_enc.cached_aud_k = -1;
@@ -702,6 +725,7 @@ static BOOL setup_encode_session(HWND owner, EDITP *ep, int *out_s, int *out_e)
 static void teardown_encode_session(void)
 {
     free(g_enc.tl_frames);
+    free(g_enc.aud_frames);
     free(g_enc.aud_sample_ofs);
     free(g_enc.vid_buf);
     free(g_enc.aud_out_buf);
@@ -788,9 +812,11 @@ static void *__cdecl auo_cb_get_audio(int start, int length, int *readed)
         g_enc.aud_out_shorts_cap = need_shorts + 64;
     }
 
-    // binary search aud_sample_ofs[0..out_n] for first frame k with ofs[k+1] > start
+    // binary search aud_sample_ofs[0..aud_frame_n] for first frame k with ofs[k+1] > start
+    if (g_enc.aud_frame_n <= 0)
+        return g_enc.aud_out_buf;
     lo = 0;
-    hi = g_enc.out_n - 1;
+    hi = g_enc.aud_frame_n - 1;
     while (lo < hi)
     {
         int mid = lo + (hi - lo) / 2;
@@ -801,7 +827,7 @@ static void *__cdecl auo_cb_get_audio(int start, int length, int *readed)
     }
     k = lo;
 
-    while (copied < length && k < g_enc.out_n)
+    while (copied < length && k < g_enc.aud_frame_n)
     {
         int f_s0 = g_enc.aud_sample_ofs[k];
         int f_s1 = g_enc.aud_sample_ofs[k + 1];
@@ -824,7 +850,7 @@ static void *__cdecl auo_cb_get_audio(int start, int length, int *readed)
                 }
                 memset(g_enc.cached_aud_pcm, 0, (size_t)f_len * (size_t)ch * sizeof(short));
                 got = plugin_manager_render_audio_frame(
-                    g_enc.ep, g_enc.tl_frames[k], g_enc.cached_aud_pcm, FALSE);
+                    g_enc.ep, g_enc.aud_frames[k], g_enc.cached_aud_pcm, FALSE);
                 if (got < f_len && got >= 0)
                 {
                     memset(g_enc.cached_aud_pcm + (size_t)got * (size_t)ch, 0,
@@ -1431,17 +1457,8 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     if (fps_s <= 0)
         fps_s = 1;
 
-    if (!setup_encode_session(owner, ep, &s, &e))
+    if (!setup_encode_session(owner, ep, TRUE, &s, &e))
     {
-        return FALSE;
-    }
-
-    dib_stride = (w * 3 + 3) & ~3;
-    dib_bytes = dib_stride * h;
-    dib_buf = (unsigned char *)malloc((size_t)dib_bytes);
-    if (!dib_buf)
-    {
-        teardown_encode_session();
         return FALSE;
     }
 
@@ -1451,10 +1468,30 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
     plugin_manager_notify_save_start(ep, s, e,
                                      OUTPUT_INFO_FLAG_VIDEO | (include_audio ? OUTPUT_INFO_FLAG_AUDIO : 0));
+    AVIFileInit();
+
+    builtin_filters_adjust_export_fps(&fps_r, &fps_s);
+    if (g_enc.out_n > 0)
+    {
+        if (!plugin_manager_render_video_frame(ep, g_enc.tl_frames[0]))
+        {
+            editp_load_frame(ep, g_enc.tl_frames[0]);
+        }
+        editp_get_dimensions(ep, &w, &h, &mw, &mh);
+    }
+    if (w <= 0 || h <= 0)
+        goto cleanup;
+
+    dib_stride = (w * 3 + 3) & ~3;
+    dib_bytes = dib_stride * h;
+    dib_buf = (unsigned char *)malloc((size_t)dib_bytes);
+    if (!dib_buf)
+    {
+        goto cleanup;
+    }
 
     // delete existing target file first so AVIFileOpenA(OF_CREATE|OF_WRITE) starts fresh
     DeleteFileA(abs_path);
-    AVIFileInit();
 
     if (AVIFileOpenA(&pfile, abs_path, OF_CREATE | OF_WRITE, NULL) != 0 || !pfile)
     {
@@ -1616,107 +1653,119 @@ BOOL video_export_avi_file(HWND owner, EDITP *ep, const char *save_path, int out
     }
 
     // frame-by-frame render + interleave loop
-    for (k = 0; k < g_enc.out_n; k++)
     {
-        int tl_f = g_enc.tl_frames[k];
-        BYTE st = 0;
-
-        pump_encode_messages_and_progress(owner, k, g_enc.out_n, k == 0);
-        if (g_enc.abort_req)
+        int aud_k = 0;
+        for (k = 0; k < g_enc.out_n; k++)
         {
-            dbg_warn("AVI export aborted by user at frame %d/%d", k, g_enc.out_n);
-            break;
-        }
+            int tl_f = g_enc.tl_frames[k];
+            BYTE st = 0;
 
-        editp_get_frame_status(ep, tl_f, &st);
-        if ((st & EDIT_FRAME_EDIT_FLAG_NULLFRAME) && k > 0)
-        {
-            // aviutl [copy]/NULLFRAME: emit 0-byte drop sample in AVI stream
-            if (AVIStreamWrite(pvid_wr, (LONG)k, 1, NULL, 0, 0, NULL, NULL) != 0)
+            pump_encode_messages_and_progress(owner, k, g_enc.out_n, k == 0);
+            if (g_enc.abort_req)
             {
-                dbg_error("AVIStreamWrite(drop frame %d) failed", k);
-                goto cleanup;
+                dbg_warn("AVI export aborted by user at frame %d/%d", k, g_enc.out_n);
+                break;
             }
-        }
-        else
-        {
-            int cw = 0, ch_h = 0, cmw = 0, cmh = 0;
-            DWORD vflags = (pvid_wr == pvid || (st & EDIT_FRAME_EDIT_FLAG_KEYFRAME))
-                               ? AVIIF_KEYFRAME
-                               : 0;
-            if (!plugin_manager_render_video_frame(ep, tl_f))
-            {
-                editp_load_frame(ep, tl_f);
-            }
-            editp_get_dimensions(ep, &cw, &ch_h, &cmw, &cmh);
-            memset(dib_buf, 0, (size_t)dib_bytes);
-            yc2rgb_dib24(dib_buf, dib_stride, editp_get_ycp_edit(ep),
-                         cmw, cw < w ? cw : w, ch_h < h ? ch_h : h, TRUE);
-            if (AVIStreamWrite(pvid_wr, (LONG)k, 1, dib_buf, (LONG)dib_bytes,
-                               vflags, NULL, NULL) != 0)
-            {
-                dbg_error("AVIStreamWrite(video frame %d) failed", k);
-                goto cleanup;
-            }
-        }
 
-        if (g_on_preview_update && owner)
-        {
-            g_on_preview_update(owner);
-        }
-
-        if (paud)
-        {
-            int need_smp = g_enc.aud_sample_ofs[k + 1] - g_enc.aud_sample_ofs[k];
-            int ach = g_enc.audio_ch;
-            if (need_smp > 0)
+            editp_get_frame_status(ep, tl_f, &st);
+            if ((st & EDIT_FRAME_EDIT_FLAG_NULLFRAME) && k > 0)
             {
-                int got;
-                if ((need_smp + 128) * ach > pcm_cap || !pcm_buf)
+                // aviutl [copy]/NULLFRAME: emit 0-byte drop sample in AVI stream
+                if (AVIStreamWrite(pvid_wr, (LONG)k, 1, NULL, 0, 0, NULL, NULL) != 0)
                 {
-                    int ncap = (need_smp + 256) * ach;
-                    short *nb = (short *)realloc(pcm_buf, (size_t)ncap * sizeof(short));
-                    if (!nb)
-                        goto cleanup;
-                    pcm_buf = nb;
-                    pcm_cap = ncap;
+                    dbg_error("AVIStreamWrite(drop frame %d) failed", k);
+                    goto cleanup;
                 }
-                memset(pcm_buf, 0, (size_t)need_smp * (size_t)ach * sizeof(short));
-                got = plugin_manager_render_audio_frame(ep, tl_f, pcm_buf, FALSE);
-                if (got <= 0)
-                    got = need_smp;
-
-                if (has && ash_prep)
+            }
+            else
+            {
+                int cw = 0, ch_h = 0, cmw = 0, cmh = 0;
+                DWORD vflags = (pvid_wr == pvid || (st & EDIT_FRAME_EDIT_FLAG_KEYFRAME))
+                                   ? AVIIF_KEYFRAME
+                                   : 0;
+                if (!plugin_manager_render_video_frame(ep, tl_f))
                 {
-                    DWORD in_bytes = (DWORD)(got * ach * 2);
-                    if (in_bytes <= (DWORD)(16384 * ach * 2))
+                    editp_load_frame(ep, tl_f);
+                }
+                editp_get_dimensions(ep, &cw, &ch_h, &cmw, &cmh);
+                memset(dib_buf, 0, (size_t)dib_bytes);
+                yc2rgb_dib24(dib_buf, dib_stride, editp_get_ycp_edit(ep),
+                             cmw, cw < w ? cw : w, ch_h < h ? ch_h : h, TRUE);
+                if (AVIStreamWrite(pvid_wr, (LONG)k, 1, dib_buf, (LONG)dib_bytes,
+                                   vflags, NULL, NULL) != 0)
+                {
+                    dbg_error("AVIStreamWrite(video frame %d) failed", k);
+                    goto cleanup;
+                }
+            }
+
+            if (g_on_preview_update && owner)
+            {
+                g_on_preview_update(owner);
+            }
+
+            if (paud)
+            {
+                int target_aud_end = (k + 1 >= g_enc.out_n)
+                                         ? g_enc.aud_frame_n
+                                         : (int)(((long long)(k + 1) * (long long)g_enc.aud_frame_n) /
+                                                 (long long)g_enc.out_n);
+                int ach = g_enc.audio_ch;
+                while (aud_k < target_aud_end)
+                {
+                    int aud_tl_f = g_enc.aud_frames[aud_k];
+                    int need_smp = g_enc.aud_sample_ofs[aud_k + 1] - g_enc.aud_sample_ofs[aud_k];
+                    aud_k++;
+                    if (need_smp > 0)
                     {
-                        ash.cbSrcLength = in_bytes;
-                        ash.cbSrcLengthUsed = 0;
-                        ash.cbDstLengthUsed = 0;
-                        if (acmStreamConvert(has, &ash, ACM_STREAMCONVERTF_BLOCKALIGN) == MMSYSERR_NOERROR &&
-                            ash.cbDstLengthUsed > 0)
+                        int got;
+                        if ((need_smp + 128) * ach > pcm_cap || !pcm_buf)
                         {
-                            LONG blk_a = g_acodec_wfx->nBlockAlign > 0 ? g_acodec_wfx->nBlockAlign : 1;
-                            LONG nblocks = (LONG)(ash.cbDstLengthUsed / (DWORD)blk_a);
-                            if (nblocks < 1)
-                                nblocks = 1;
-                            AVIStreamWrite(paud, aud_pos, nblocks, acm_dst,
-                                           (LONG)ash.cbDstLengthUsed, 0, NULL, NULL);
-                            aud_pos += nblocks;
+                            int ncap = (need_smp + 256) * ach;
+                            short *nb = (short *)realloc(pcm_buf, (size_t)ncap * sizeof(short));
+                            if (!nb)
+                                goto cleanup;
+                            pcm_buf = nb;
+                            pcm_cap = ncap;
+                        }
+                        memset(pcm_buf, 0, (size_t)need_smp * (size_t)ach * sizeof(short));
+                        got = plugin_manager_render_audio_frame(ep, aud_tl_f, pcm_buf, FALSE);
+                        if (got <= 0)
+                            got = need_smp;
+
+                        if (has && ash_prep)
+                        {
+                            DWORD in_bytes = (DWORD)(got * ach * 2);
+                            if (in_bytes <= (DWORD)(16384 * ach * 2))
+                            {
+                                ash.cbSrcLength = in_bytes;
+                                ash.cbSrcLengthUsed = 0;
+                                ash.cbDstLengthUsed = 0;
+                                if (acmStreamConvert(has, &ash, ACM_STREAMCONVERTF_BLOCKALIGN) == MMSYSERR_NOERROR &&
+                                    ash.cbDstLengthUsed > 0)
+                                {
+                                    LONG blk_a = g_acodec_wfx->nBlockAlign > 0 ? g_acodec_wfx->nBlockAlign : 1;
+                                    LONG nblocks = (LONG)(ash.cbDstLengthUsed / (DWORD)blk_a);
+                                    if (nblocks < 1)
+                                        nblocks = 1;
+                                    AVIStreamWrite(paud, aud_pos, nblocks, acm_dst,
+                                                   (LONG)ash.cbDstLengthUsed, 0, NULL, NULL);
+                                    aud_pos += nblocks;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            LONG bytes = (LONG)(got * ach * 2);
+                            if (AVIStreamWrite(paud, aud_pos, (LONG)got, pcm_buf, bytes,
+                                               AVIIF_KEYFRAME, NULL, NULL) != 0)
+                            {
+                                dbg_error("AVIStreamWrite(audio frame %d) failed", aud_k - 1);
+                                goto cleanup;
+                            }
+                            aud_pos += (LONG)got;
                         }
                     }
-                }
-                else
-                {
-                    LONG bytes = (LONG)(got * ach * 2);
-                    if (AVIStreamWrite(paud, aud_pos, (LONG)got, pcm_buf, bytes,
-                                       AVIIF_KEYFRAME, NULL, NULL) != 0)
-                    {
-                        dbg_error("AVIStreamWrite(audio frame %d) failed", k);
-                        goto cleanup;
-                    }
-                    aud_pos += (LONG)got;
                 }
             }
         }
@@ -1844,7 +1893,7 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
     {
         return FALSE;
     }
-    if (!setup_encode_session(owner, ep, &s, &e))
+    if (!setup_encode_session(owner, ep, FALSE, &s, &e))
     {
         return FALSE;
     }
@@ -1876,13 +1925,13 @@ BOOL video_export_wav_file(HWND owner, EDITP *ep, const char *save_path)
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
     plugin_manager_notify_save_start(ep, s, e, OUTPUT_INFO_FLAG_AUDIO);
 
-    for (k = 0; k < g_enc.out_n; k++)
+    for (k = 0; k < g_enc.aud_frame_n; k++)
     {
-        int tl_f = g_enc.tl_frames[k];
+        int tl_f = g_enc.aud_frames[k];
         int need_smp = g_enc.aud_sample_ofs[k + 1] - g_enc.aud_sample_ofs[k];
         int got;
 
-        pump_encode_messages_and_progress(owner, k, g_enc.out_n, k == 0);
+        pump_encode_messages_and_progress(owner, k, g_enc.aud_frame_n, k == 0);
         if (g_enc.abort_req)
             break;
         if (need_smp <= 0)
@@ -2068,9 +2117,28 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
     if (fps_s <= 0)
         fps_s = 1;
 
-    if (!setup_encode_session(owner, ep, &s, &e))
+    if (!setup_encode_session(owner, ep, (eff_flags & OUTPUT_INFO_FLAG_VIDEO) != 0, &s, &e))
     {
         return FALSE;
+    }
+
+    saved_frame = editp_get_frame(ep);
+    editp_set_output_path(ep, save_buf);
+    plugin_manager_notify_update(ep);
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    plugin_manager_notify_save_start(ep, s, e, eff_flags & 3);
+
+    if (eff_flags & OUTPUT_INFO_FLAG_VIDEO)
+    {
+        builtin_filters_adjust_export_fps(&fps_r, &fps_s);
+        if (g_enc.out_n > 0)
+        {
+            if (!plugin_manager_render_video_frame(ep, g_enc.tl_frames[0]))
+            {
+                editp_load_frame(ep, g_enc.tl_frames[0]);
+            }
+            editp_get_dimensions(ep, &w, &h, &mw, &mh);
+        }
     }
 
     ZeroMemory(&oip, sizeof(oip));
@@ -2096,12 +2164,6 @@ BOOL video_export_auo_file(HWND owner, EDITP *ep, int auo_idx,
     oip.func_get_flag = auo_cb_get_flag;
     oip.func_update_preview = auo_cb_update_preview;
     oip.func_get_video_ex = auo_cb_get_video_ex;
-
-    saved_frame = editp_get_frame(ep);
-    editp_set_output_path(ep, save_buf);
-    plugin_manager_notify_update(ep);
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
-    plugin_manager_notify_save_start(ep, s, e, eff_flags & 3);
 
     dbg_plugin("Starting plugin output '%s' -> '%s' (%dx%d, %d frames, flag=0x%x)",
                entry->name, save_buf, w, h, oip.n, (unsigned)oip.flag);

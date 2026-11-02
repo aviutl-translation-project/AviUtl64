@@ -6,6 +6,7 @@
 #include "plugin_manager.h"
 #include "plugin_loader.h"
 #include "plugin_bridge.h"
+#include "builtin_filters.h"
 #include "aup_project.h"
 #include "editp.h"
 #include "exfunc.h"
@@ -14,8 +15,9 @@
 #include "winsnap.h"
 #include "debug_console.h"
 
-#define MAX_PLUGINS 128
+#define MAX_PLUGINS 192
 #define MAX_PLUGIN_MENU_ITEMS 512
+#define MAX_CONFIG_CMD_ITEMS 256
 #define MAX_TRACK_CTRLS 64
 #define MAX_CHECK_CTRLS 48
 
@@ -39,8 +41,10 @@ typedef struct
     FILTER runtime; // persistent exedit caches &e->runtime in g_fp_main
     HWND hwnd;
     int index;
+    int cmd_slot;
     int cmd_id;
     int priority;
+    BOOL is_builtin;
     BOOL stage1_initialized;
     BOOL stage2_initialized;
     BOOL faulted;
@@ -56,8 +60,19 @@ typedef struct
     BOOL updating_track_ui;
 } PluginEntry;
 
+typedef struct
+{
+    int filter_index;
+    int check_idx;
+} ConfigCmdEntry;
+
 static PluginEntry g_plugins[MAX_PLUGINS];
 static int g_plugin_count = 0;
+static BOOL g_builtins_enabled = FALSE;
+static int g_next_seq_cmd_slot = 21;
+
+static ConfigCmdEntry g_config_cmds[MAX_CONFIG_CMD_ITEMS];
+static int g_config_cmd_count = 0;
 
 static PluginMenuItem g_menu_items[MAX_PLUGIN_MENU_ITEMS];
 static int g_menu_item_count = 0;
@@ -277,6 +292,100 @@ static void get_plugin_ini_path(char *out_path, size_t out_sz)
     }
 }
 
+static void sanitize_ini_section(const char *raw_name, char *out_sec, size_t out_sz)
+{
+    size_t i = 0, o = 0;
+    if (!out_sec || out_sz == 0)
+        return;
+    out_sec[0] = '\0';
+    if (!raw_name)
+        return;
+    while (raw_name[i] && o + 1 < out_sz)
+    {
+        if (raw_name[i] != '[' && raw_name[i] != ']')
+        {
+            out_sec[o++] = raw_name[i];
+        }
+        i++;
+    }
+    out_sec[o] = '\0';
+}
+
+static void sync_dynamic_config_check_arrays(PluginEntry *e)
+{
+    int old_n, new_n, i, any_checked = 0;
+    int *new_chk;
+
+    if (!e || !e->src_dll)
+        return;
+    e->runtime.check_name = e->src_dll->check_name;
+    e->runtime.check_default = e->src_dll->check_default;
+    new_n = e->src_dll->check_n;
+    old_n = e->runtime.check_n;
+    if (new_n == old_n)
+        return;
+    if (new_n <= 0)
+    {
+        free(e->runtime.check);
+        e->runtime.check = NULL;
+        e->runtime.check_n = 0;
+        e->src_dll->check = NULL;
+        return;
+    }
+    new_chk = (int *)calloc((size_t)new_n, sizeof(int));
+    if (!new_chk)
+        return;
+    for (i = 0; i < new_n; i++)
+    {
+        if (i < old_n && e->runtime.check)
+            new_chk[i] = e->runtime.check[i];
+        else if (e->src_dll->check_default && e->src_dll->check_default[i] > 0)
+            new_chk[i] = e->src_dll->check_default[i];
+        if (new_chk[i] > 0)
+            any_checked = 1;
+    }
+    if ((e->runtime.flag & FILTER_FLAG_CONFIG_RADIO) && !any_checked)
+    {
+        for (i = 0; i < new_n; i++)
+        {
+            if (!e->src_dll->check_default || e->src_dll->check_default[i] >= 0)
+            {
+                new_chk[i] = 1;
+                break;
+            }
+        }
+    }
+    free(e->runtime.check);
+    e->runtime.check = new_chk;
+    e->runtime.check_n = new_n;
+    e->src_dll->check = new_chk;
+}
+
+static int read_source_audio_with_delay(EDITP *ep, int frame_num, short *buf, BOOL apply_delay)
+{
+    int delay = (apply_delay && g_builtins_enabled) ? builtin_filters_get_audio_delay_frames() : 0;
+    int src_frame = frame_num - delay;
+    int total_frames, samples, ch;
+
+    if (!ep || !editp_is_editing(ep))
+        return 0;
+    if (delay == 0)
+        return editp_read_audio_frame(ep, frame_num, buf);
+
+    samples = editp_read_audio_frame(ep, frame_num, NULL);
+    if (!buf || samples <= 0)
+        return samples;
+
+    total_frames = editp_get_frame_n(ep);
+    ch = editp_get_audio_ch(ep);
+    if (src_frame < 0 || src_frame >= total_frames)
+    {
+        memset(buf, 0, (size_t)samples * (size_t)(ch > 0 ? ch : 2) * sizeof(short));
+        return samples;
+    }
+    return editp_read_audio_frame(ep, src_frame, buf);
+}
+
 static void invalidate_downstream_from_entry(int plugin_index)
 {
     int order[MAX_PLUGINS + BRIDGE_MAX_FILTERS];
@@ -318,7 +427,7 @@ static void invalidate_downstream_from_entry(int plugin_index)
     }
 }
 
-static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep)
+static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep, int frame_num)
 {
     FILTER_PROC_INFO fpip;
 
@@ -330,10 +439,9 @@ static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep)
     fpip.ycp_edit = editp_get_ycp_edit(ep);
     fpip.ycp_temp = editp_get_ycp_temp(ep);
     editp_get_dimensions(ep, &fpip.w, &fpip.h, &fpip.max_w, &fpip.max_h);
-    fpip.frame = editp_get_frame(ep);
+    fpip.frame = (frame_num >= 0) ? frame_num : editp_get_frame(ep);
     fpip.frame_n = editp_get_frame_n(ep);
-    fpip.org_w = fpip.w;
-    fpip.org_h = fpip.h;
+    editp_get_org_dimensions(ep, &fpip.org_w, &fpip.org_h);
     fpip.audiop = NULL;
     fpip.audio_n = 0;
     fpip.audio_ch = editp_get_audio_ch(ep);
@@ -352,7 +460,7 @@ static void apply_single_native_video_entry(PluginEntry *e, EDITP *ep)
     if (fpip.w > 0 && fpip.h > 0 &&
         fpip.w <= fpip.max_w && fpip.h <= fpip.max_h)
     {
-        editp_set_dimensions(ep, fpip.w, fpip.h);
+        editp_set_frame_dimensions(ep, fpip.w, fpip.h);
     }
 }
 
@@ -390,7 +498,7 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
                 editp_load_frame(ep, frame_num);
                 host_loaded = TRUE;
             }
-            apply_single_native_video_entry(e, ep);
+            apply_single_native_video_entry(e, ep, frame_num);
         }
         else if (plugin_bridge_is_active())
         {
@@ -477,6 +585,10 @@ static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
     {
         editp_swap_ycp(ep, saved_edit, saved_temp);
     }
+    if (saved_w > 0 && saved_h > 0)
+    {
+        editp_set_frame_dimensions(ep, saved_w, saved_h);
+    }
     free(tmp_edit);
     free(tmp_temp);
 
@@ -493,7 +605,7 @@ static int cb_host_render_audio_up_to(FILTER *stop_before_fp, EDITP *ep,
     int samples;
     if (!ep || !editp_is_editing(ep))
         return 0;
-    samples = editp_read_audio_frame(ep, frame_num, out_pcm);
+    samples = read_source_audio_with_delay(ep, frame_num, out_pcm, TRUE);
     if (!out_pcm || samples <= 0)
         return samples;
     return plugin_manager_apply_audio_filters(ep, frame_num, out_pcm, samples, stop_before_fp);
@@ -1230,32 +1342,42 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
             e->hwnd = create_filter_window(e, owner_hwnd);
             plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
             fl = e->runtime.flag;
-            if (fl & FILTER_FLAG_PRIORITY_HIGHEST)
+            if (fl & FILTER_FLAG_INTERLACE_FILTER)
             {
-                def_prio = 0;
-            }
-            else if (fl & FILTER_FLAG_PRIORITY_LOWEST)
-            {
-                def_prio = 127;
-            }
-            else if (fl & FILTER_FLAG_AUDIO_FILTER)
-            {
-                def_prio = (next_aud_prio < 126) ? next_aud_prio++ : 126;
+                def_prio = -1;
+                e->priority = -1;
             }
             else
             {
-                def_prio = (next_vid_prio < 126) ? next_vid_prio++ : 126;
+                char sec[256];
+                if (fl & FILTER_FLAG_PRIORITY_HIGHEST)
+                {
+                    def_prio = 0;
+                }
+                else if (fl & FILTER_FLAG_PRIORITY_LOWEST)
+                {
+                    def_prio = 127;
+                }
+                else if (fl & FILTER_FLAG_AUDIO_FILTER)
+                {
+                    def_prio = (next_aud_prio < 126) ? next_aud_prio++ : 126;
+                }
+                else
+                {
+                    def_prio = (next_vid_prio < 126) ? next_vid_prio++ : 126;
+                }
+                sanitize_ini_section(e->name, sec, sizeof(sec));
+                if (sec[0])
+                {
+                    e->priority = (int)GetPrivateProfileIntA(sec, "priority", def_prio, ini);
+                }
+                else
+                {
+                    e->priority = def_prio;
+                }
             }
-            if (e->name[0])
-            {
-                e->priority = (int)GetPrivateProfileIntA(e->name, "priority", def_prio, ini);
-            }
-            else
-            {
-                e->priority = def_prio;
-            }
-            dbg_plugin("Filter[%d] '%s' | HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X prio=%d",
-                       i, e->name, (void *)e->module, (void *)&e->runtime,
+            dbg_plugin("Filter[%d] '%s' | slot=%d HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X prio=%d",
+                       i, e->name, e->cmd_slot, (void *)e->module, (void *)&e->runtime,
                        (void *)e->hwnd, (unsigned)e->runtime.flag, e->priority);
         }
     }
@@ -1310,6 +1432,66 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                        g_menu_item_count - menus_before);
         }
         e->stage2_initialized = TRUE;
+    }
+
+    // restore saved window positions & visibility from aviutl.ini (0x0042c930)
+    {
+        char ini[MAX_PATH];
+        int vx0 = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy0 = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (vw <= 0)
+            vw = GetSystemMetrics(SM_CXSCREEN);
+        if (vh <= 0)
+            vh = GetSystemMetrics(SM_CYSCREEN);
+        get_plugin_ini_path(ini, sizeof(ini));
+
+        for (i = 0; i < g_plugin_count; i++)
+        {
+            PluginEntry *e = &g_plugins[i];
+            char sec[256];
+            int wx, wy, ww = 0, wh = 0, disp;
+            UINT swp = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
+
+            if (!e->stage1_initialized || !e->hwnd || !IsWindow(e->hwnd))
+                continue;
+            sanitize_ini_section(e->name, sec, sizeof(sec));
+            if (!sec[0])
+                continue;
+
+            wx = (int)GetPrivateProfileIntA(sec, "x", -32000, ini);
+            wy = (int)GetPrivateProfileIntA(sec, "y", -32000, ini);
+            if (GetWindowLongA(e->hwnd, GWL_STYLE) & WS_THICKFRAME)
+            {
+                ww = (int)GetPrivateProfileIntA(sec, "w", 0, ini);
+                wh = (int)GetPrivateProfileIntA(sec, "h", 0, ini);
+                if (ww >= 128 && wh >= 96)
+                    swp &= ~SWP_NOSIZE;
+            }
+            if (wx != -32000 && wy != -32000)
+            {
+                if (wx < vx0 - 64)
+                    wx = vx0;
+                if (wy < vy0 - 16)
+                    wy = vy0;
+                if (wx > vx0 + vw - 48)
+                    wx = vx0 + vw - 128;
+                if (wy > vy0 + vh - 48)
+                    wy = vy0 + vh - 96;
+                SetWindowPos(e->hwnd, NULL, wx, wy, ww, wh, swp);
+            }
+            else if (swp == (SWP_NOZORDER | SWP_NOACTIVATE))
+            {
+                SetWindowPos(e->hwnd, NULL, 0, 0, ww, wh, swp | SWP_NOMOVE);
+            }
+
+            disp = (int)GetPrivateProfileIntA(sec, "disp", 0, ini);
+            if (disp != 0)
+            {
+                plugin_manager_show_window(i, TRUE);
+            }
+        }
     }
 
     // if a project/video is already open in editp, notify newly initialized filters
@@ -1410,12 +1592,19 @@ static void scan_auf_directory(const char *dir, BOOL *saw_32bit_plugin_on_x64)
                       sizeof(e->name));
             e->module = (HMODULE)rep.module;
             e->src_dll = rep.filters[i];
-            e->cmd_id = PLUGIN_CMD_WINDOW_BASE + g_plugin_count;
+            e->is_builtin = FALSE;
+            e->cmd_slot = g_next_seq_cmd_slot++;
+            e->cmd_id = PLUGIN_CMD_WINDOW_BASE + e->cmd_slot;
             g_plugin_count++;
         }
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
+}
+
+void plugin_manager_set_builtins_enabled(BOOL enabled)
+{
+    g_builtins_enabled = enabled ? TRUE : FALSE;
 }
 
 BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp)
@@ -1433,9 +1622,37 @@ BOOL plugin_manager_init_ex(const char *plugin_dir, HWND main_hwnd, EDITP *editp
 
     g_main_hwnd = main_hwnd;
     owner_hwnd = ensure_owner_hwnd(main_hwnd);
+    g_next_seq_cmd_slot = 21;
 
     if (!plugin_dir || !plugin_dir[0])
         return FALSE;
+
+    if (g_builtins_enabled)
+    {
+        int b, bcnt;
+        builtin_filters_prepare_tables(owner_hwnd);
+        bcnt = builtin_filters_get_count();
+        for (b = 0; b < bcnt && g_plugin_count < MAX_PLUGINS; b++)
+        {
+            FILTER_DLL *bf = builtin_filters_get_dll(b);
+            PluginEntry *e;
+            int fixed;
+            if (!bf)
+                continue;
+            e = &g_plugins[g_plugin_count];
+            ZeroMemory(e, sizeof(*e));
+            e->index = g_plugin_count;
+            e->path[0] = '\0';
+            lstrcpynA(e->name, bf->name ? bf->name : "Builtin", sizeof(e->name));
+            e->module = NULL;
+            e->src_dll = bf;
+            e->is_builtin = TRUE;
+            fixed = builtin_filters_get_fixed_cmd_slot(b);
+            e->cmd_slot = (fixed >= 0) ? fixed : g_next_seq_cmd_slot++;
+            e->cmd_id = PLUGIN_CMD_WINDOW_BASE + e->cmd_slot;
+            g_plugin_count++;
+        }
+    }
 
     // match aviutl 1.10 0x0042c930: scan both <exe_dir>\*.auf and <exe_dir>\plugins\*.auf
     {
@@ -1539,7 +1756,9 @@ BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP 
                   sizeof(e->name));
         e->module = (HMODULE)rep.module;
         e->src_dll = rep.filters[i];
-        e->cmd_id = PLUGIN_CMD_WINDOW_BASE + g_plugin_count;
+        e->is_builtin = FALSE;
+        e->cmd_slot = g_next_seq_cmd_slot++;
+        e->cmd_id = PLUGIN_CMD_WINDOW_BASE + e->cmd_slot;
         g_plugin_count++;
     }
 
@@ -1557,9 +1776,49 @@ void plugin_manager_shutdown(void)
     HMODULE unloaded[MAX_PLUGINS];
     int unloaded_count = 0;
 
+    if (g_builtins_enabled)
+    {
+        builtin_filters_stop_playback();
+    }
+
     if (plugin_bridge_is_active())
     {
         plugin_bridge_shutdown();
+    }
+
+    // save filter window positions & visibility before tearing down HWNDs
+    if (g_plugin_count > 0)
+    {
+        char ini[MAX_PATH];
+        get_plugin_ini_path(ini, sizeof(ini));
+        for (i = 0; i < g_plugin_count; i++)
+        {
+            PluginEntry *e = &g_plugins[i];
+            char sec[256], vbuf[32];
+            RECT wrc;
+            if (!e->stage1_initialized || !e->hwnd || !IsWindow(e->hwnd))
+                continue;
+            sanitize_ini_section(e->name, sec, sizeof(sec));
+            if (!sec[0])
+                continue;
+            if (!IsIconic(e->hwnd) && GetWindowRect(e->hwnd, &wrc))
+            {
+                wsprintfA(vbuf, "%d", (int)wrc.left);
+                WritePrivateProfileStringA(sec, "x", vbuf, ini);
+                wsprintfA(vbuf, "%d", (int)wrc.top);
+                WritePrivateProfileStringA(sec, "y", vbuf, ini);
+                if (GetWindowLongA(e->hwnd, GWL_STYLE) & WS_THICKFRAME)
+                {
+                    wsprintfA(vbuf, "%d", (int)(wrc.right - wrc.left));
+                    WritePrivateProfileStringA(sec, "w", vbuf, ini);
+                    wsprintfA(vbuf, "%d", (int)(wrc.bottom - wrc.top));
+                    WritePrivateProfileStringA(sec, "h", vbuf, ini);
+                }
+            }
+            WritePrivateProfileStringA(
+                sec, "disp",
+                (e->runtime.flag & FILTER_FLAG_WINDOW_DISP) ? "1" : "0", ini);
+        }
     }
 
     // stage 2 teardown, send WM_FILTER_EXIT (0x0468) while HWNDs & EDITP live
@@ -1623,6 +1882,8 @@ void plugin_manager_shutdown(void)
 
     g_plugin_count = 0;
     g_menu_item_count = 0;
+    g_config_cmd_count = 0;
+    g_next_seq_cmd_slot = 21;
     aup_clear_preserved_chunks();
     editp_set_registered_filter_count(0);
 
@@ -1641,6 +1902,46 @@ BOOL plugin_manager_is_bridged(void)
 int plugin_manager_get_count(void)
 {
     return g_plugin_count + (plugin_bridge_is_active() ? plugin_bridge_get_filter_count() : 0);
+}
+
+BOOL plugin_manager_is_builtin(int index)
+{
+    if (index < 0 || index >= g_plugin_count)
+        return FALSE;
+    return g_plugins[index].is_builtin;
+}
+
+int plugin_manager_get_cmd_slot(int index)
+{
+    if (index < 0)
+        return -1;
+    if (index < g_plugin_count)
+        return g_plugins[index].cmd_slot;
+    if (plugin_bridge_is_active() && index < plugin_manager_get_count())
+        return g_next_seq_cmd_slot + (index - g_plugin_count);
+    return -1;
+}
+
+int plugin_manager_find_by_cmd_slot(int cmd_slot)
+{
+    int i, total;
+    if (cmd_slot < 0)
+        return -1;
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        if (g_plugins[i].cmd_slot == cmd_slot)
+            return i;
+    }
+    if (plugin_bridge_is_active())
+    {
+        total = plugin_manager_get_count();
+        for (i = g_plugin_count; i < total; i++)
+        {
+            if (plugin_manager_get_cmd_slot(i) == cmd_slot)
+                return i;
+        }
+    }
+    return -1;
 }
 
 const char *plugin_manager_get_name(int index)
@@ -1730,10 +2031,14 @@ BOOL plugin_manager_set_priority(int index, int priority, BOOL save_ini)
         e->priority = priority;
         if (save_ini && e->name[0])
         {
-            char ini[MAX_PATH], val[32];
+            char ini[MAX_PATH], sec[256], val[32];
             get_plugin_ini_path(ini, sizeof(ini));
-            wsprintfA(val, "%d", priority);
-            WritePrivateProfileStringA(e->name, "priority", val, ini);
+            sanitize_ini_section(e->name, sec, sizeof(sec));
+            if (sec[0])
+            {
+                wsprintfA(val, "%d", priority);
+                WritePrivateProfileStringA(sec, "priority", val, ini);
+            }
         }
         exfunc_invalidate_all_caches();
         return TRUE;
@@ -1749,6 +2054,8 @@ BOOL plugin_manager_set_priority(int index, int priority, BOOL save_ini)
 
 static int filter_priority_tier(int flags)
 {
+    if (flags & FILTER_FLAG_INTERLACE_FILTER)
+        return -1;
     if (flags & FILTER_FLAG_PRIORITY_HIGHEST)
         return 0;
     if (flags & FILTER_FLAG_PRIORITY_LOWEST)
@@ -1895,6 +2202,10 @@ BOOL plugin_manager_run_priority_dialog(HWND owner, BOOL audio_mode)
     if (plugin_bridge_is_active())
     {
         plugin_bridge_invalidate_caches();
+    }
+    if (g_builtins_enabled)
+    {
+        builtin_filters_refresh_tool_window();
     }
     return TRUE;
 }
@@ -2074,6 +2385,10 @@ BOOL plugin_manager_set_active(int index, BOOL active)
     }
     post_host_redraw(3);
     post_host_redraw(1);
+    if (g_builtins_enabled)
+    {
+        builtin_filters_refresh_tool_window();
+    }
     return TRUE;
 }
 
@@ -2091,6 +2406,8 @@ BOOL plugin_manager_toggle_active(int index)
                 invalidate_downstream_from_entry(index);
                 post_host_redraw(3);
                 post_host_redraw(1);
+                if (g_builtins_enabled)
+                    builtin_filters_refresh_tool_window();
             }
             return ok;
         }
@@ -2118,6 +2435,158 @@ void plugin_manager_disable_all_filters(void)
         plugin_bridge_invalidate_caches();
         post_host_redraw(3);
         post_host_redraw(1);
+        if (g_builtins_enabled)
+            builtin_filters_refresh_tool_window();
+    }
+}
+
+int plugin_manager_get_config_check_count(int index)
+{
+    if (index < 0 || index >= g_plugin_count)
+        return 0;
+    sync_dynamic_config_check_arrays(&g_plugins[index]);
+    return g_plugins[index].runtime.check_n;
+}
+
+const char *plugin_manager_get_config_check_name(int index, int check_idx)
+{
+    PluginEntry *e;
+    if (index < 0 || index >= g_plugin_count)
+        return NULL;
+    e = &g_plugins[index];
+    sync_dynamic_config_check_arrays(e);
+    if (check_idx < 0 || check_idx >= e->runtime.check_n || !e->runtime.check_name)
+        return NULL;
+    return e->runtime.check_name[check_idx];
+}
+
+int plugin_manager_get_config_check_default(int index, int check_idx)
+{
+    PluginEntry *e;
+    if (index < 0 || index >= g_plugin_count)
+        return 0;
+    e = &g_plugins[index];
+    sync_dynamic_config_check_arrays(e);
+    if (check_idx < 0 || check_idx >= e->runtime.check_n || !e->runtime.check_default)
+        return 0;
+    return e->runtime.check_default[check_idx];
+}
+
+int plugin_manager_get_config_check_value(int index, int check_idx)
+{
+    PluginEntry *e;
+    if (index < 0 || index >= g_plugin_count)
+        return 0;
+    e = &g_plugins[index];
+    sync_dynamic_config_check_arrays(e);
+    if (check_idx < 0 || check_idx >= e->runtime.check_n || !e->runtime.check)
+        return 0;
+    return e->runtime.check[check_idx];
+}
+
+BOOL plugin_manager_select_config_check(int index, int check_idx)
+{
+    PluginEntry *e;
+    int k;
+
+    if (index < 0 || index >= g_plugin_count)
+        return FALSE;
+    e = &g_plugins[index];
+    sync_dynamic_config_check_arrays(e);
+    if (!e->runtime.check || check_idx < 0 || check_idx >= e->runtime.check_n)
+        return FALSE;
+    if (e->runtime.check_default && e->runtime.check_default[check_idx] < 0)
+        return FALSE;
+
+    if (e->runtime.flag & (FILTER_FLAG_CONFIG_RADIO | FILTER_FLAG_RADIO_BUTTON))
+    {
+        for (k = 0; k < e->runtime.check_n; k++)
+        {
+            int kdef = e->runtime.check_default ? e->runtime.check_default[k] : 0;
+            if (kdef >= 0)
+                e->runtime.check[k] = (k == check_idx) ? 1 : 0;
+        }
+    }
+    else
+    {
+        e->runtime.check[check_idx] = e->runtime.check[check_idx] ? 0 : 1;
+    }
+
+    sync_filter_entry_controls(e);
+    if (e->stage1_initialized && e->runtime.func_update)
+    {
+        e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_CHECK + check_idx);
+        sync_dynamic_config_check_arrays(e);
+    }
+    if (e->stage2_initialized && e->runtime.func_WndProc)
+    {
+        safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                          exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
+    }
+    invalidate_downstream_from_entry(index);
+    exfunc_invalidate_all_caches();
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_invalidate_caches();
+    }
+    post_host_redraw(3);
+    post_host_redraw(1);
+    return TRUE;
+}
+
+void plugin_manager_clear_config_cmd_map(void)
+{
+    g_config_cmd_count = 0;
+}
+
+int plugin_manager_register_config_cmd(int filter_index, int check_idx)
+{
+    int id;
+    if (g_config_cmd_count >= MAX_CONFIG_CMD_ITEMS)
+        return 0;
+    id = PLUGIN_CMD_CONFIG_ITEM_BASE + g_config_cmd_count;
+    g_config_cmds[g_config_cmd_count].filter_index = filter_index;
+    g_config_cmds[g_config_cmd_count].check_idx = check_idx;
+    g_config_cmd_count++;
+    return id;
+}
+
+void plugin_manager_reset_window_positions(HWND main_hwnd)
+{
+    RECT wa, mrc;
+    int base_x = 64, base_y = 64;
+    int step = 0, i;
+
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0))
+    {
+        SetRect(&wa, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    }
+    if (main_hwnd && IsWindow(main_hwnd) && GetWindowRect(main_hwnd, &mrc))
+    {
+        base_x = mrc.right + 8;
+        base_y = mrc.top;
+        if (base_x + 240 > wa.right)
+        {
+            base_x = wa.left + 32;
+            base_y = wa.top + 32;
+        }
+    }
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        int x, y;
+        if (!e->hwnd || !IsWindow(e->hwnd))
+            continue;
+        x = base_x + (step % 8) * 24;
+        y = base_y + (step % 8) * 24;
+        if (x + 160 > wa.right)
+            x = wa.left + 24;
+        if (y + 120 > wa.bottom)
+            y = wa.top + 24;
+        SetWindowPos(e->hwnd, NULL, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        step++;
     }
 }
 
@@ -2187,7 +2656,13 @@ HMENU plugin_manager_build_menu(void)
         {
             uFlags |= MF_CHECKED;
         }
-        AppendMenuW(menu, uFlags, (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), wlabel);
+        {
+            int slot = plugin_manager_get_cmd_slot(i);
+            if (slot >= 0)
+            {
+                AppendMenuW(menu, uFlags, (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + slot), wlabel);
+            }
+        }
     }
 
     if (mcount > 0)
@@ -2253,24 +2728,35 @@ BOOL plugin_manager_exec_menu_item_index(int menu_index)
 
 BOOL plugin_manager_handle_command(HWND hwnd, int cmd_id)
 {
-    int count = plugin_manager_get_count();
+    int idx;
     (void)hwnd;
 
-    if (cmd_id >= PLUGIN_CMD_TOGGLE_BASE && cmd_id < PLUGIN_CMD_TOGGLE_BASE + count)
+    if (cmd_id >= PLUGIN_CMD_TOGGLE_BASE && cmd_id < PLUGIN_CMD_TOGGLE_BASE + 900)
     {
-        return plugin_manager_toggle_active(cmd_id - PLUGIN_CMD_TOGGLE_BASE);
+        idx = plugin_manager_find_by_cmd_slot(cmd_id - PLUGIN_CMD_TOGGLE_BASE);
+        return (idx >= 0) ? plugin_manager_toggle_active(idx) : FALSE;
     }
-    if (cmd_id >= PLUGIN_CMD_WINDOW_BASE && cmd_id < PLUGIN_CMD_WINDOW_BASE + count)
+    if (cmd_id >= PLUGIN_CMD_WINDOW_BASE && cmd_id < 11998)
     {
-        return plugin_manager_toggle_window(cmd_id - PLUGIN_CMD_WINDOW_BASE);
+        idx = plugin_manager_find_by_cmd_slot(cmd_id - PLUGIN_CMD_WINDOW_BASE);
+        return (idx >= 0) ? plugin_manager_toggle_window(idx) : FALSE;
     }
-    if (cmd_id >= PLUGIN_CMD_IMPORT_BASE && cmd_id < PLUGIN_CMD_IMPORT_BASE + count)
+    if (cmd_id >= PLUGIN_CMD_CONFIG_ITEM_BASE &&
+        cmd_id < PLUGIN_CMD_CONFIG_ITEM_BASE + g_config_cmd_count)
     {
-        return plugin_manager_exec_import_export(cmd_id - PLUGIN_CMD_IMPORT_BASE, FALSE);
+        int ci = cmd_id - PLUGIN_CMD_CONFIG_ITEM_BASE;
+        return plugin_manager_select_config_check(
+            g_config_cmds[ci].filter_index, g_config_cmds[ci].check_idx);
     }
-    if (cmd_id >= PLUGIN_CMD_EXPORT_BASE && cmd_id < PLUGIN_CMD_EXPORT_BASE + count)
+    if (cmd_id >= PLUGIN_CMD_IMPORT_BASE && cmd_id < PLUGIN_CMD_IMPORT_BASE + 900)
     {
-        return plugin_manager_exec_import_export(cmd_id - PLUGIN_CMD_EXPORT_BASE, TRUE);
+        idx = plugin_manager_find_by_cmd_slot(cmd_id - PLUGIN_CMD_IMPORT_BASE);
+        return (idx >= 0) ? plugin_manager_exec_import_export(idx, FALSE) : FALSE;
+    }
+    if (cmd_id >= PLUGIN_CMD_EXPORT_BASE && cmd_id < PLUGIN_CMD_EXPORT_BASE + 900)
+    {
+        idx = plugin_manager_find_by_cmd_slot(cmd_id - PLUGIN_CMD_EXPORT_BASE);
+        return (idx >= 0) ? plugin_manager_exec_import_export(idx, TRUE) : FALSE;
     }
     if (cmd_id >= PLUGIN_CMD_MENU_ITEM_BASE &&
         cmd_id < PLUGIN_CMD_MENU_ITEM_BASE + plugin_manager_get_menu_item_count())
@@ -2509,7 +2995,7 @@ int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL
 
     if (!ep || !editp_is_editing(ep))
         return 0;
-    samples = editp_read_audio_frame(ep, frame_num, buf);
+    samples = read_source_audio_with_delay(ep, frame_num, buf, !nofilter);
     if (!buf || samples <= 0 || nofilter)
     {
         return samples;
@@ -2805,9 +3291,26 @@ BOOL plugin_manager_sync_from_bridge(EDITP *ep)
 
 BOOL plugin_manager_render_video_frame(EDITP *ep, int frame_num)
 {
+    int i;
     if (!ep || !editp_is_editing(ep))
         return FALSE;
-    return render_pipeline_range(ep, frame_num, NULL);
+    if (!render_pipeline_range(ep, frame_num, NULL))
+        return FALSE;
+
+    // run active display filters (e.g. Histogram) after the video pipeline completes
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+        if (!e->stage1_initialized || e->faulted || !fp->func_proc)
+            continue;
+        if (!(fp->flag & FILTER_FLAG_DISP_FILTER))
+            continue;
+        if (!(fp->flag & FILTER_FLAG_WINDOW_DISP))
+            continue;
+        apply_single_native_video_entry(e, ep, frame_num);
+    }
+    return TRUE;
 }
 
 BOOL plugin_manager_apply_filter(int filter_id, void *editp_ptr)
@@ -2823,7 +3326,7 @@ BOOL plugin_manager_apply_filter(int filter_id, void *editp_ptr)
     if (e->runtime.flag & FILTER_FLAG_AUDIO_FILTER)
         return FALSE;
 
-    apply_single_native_video_entry(e, ep);
+    apply_single_native_video_entry(e, ep, editp_get_frame(ep));
     return TRUE;
 }
 

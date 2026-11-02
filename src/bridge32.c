@@ -597,7 +597,7 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
                 PIXEL_YC *dst = editp_get_ycp_edit(g_editp);
                 if (g_shm->w > 0 && g_shm->h > 0)
                 {
-                    editp_set_dimensions(g_editp, g_shm->w, g_shm->h);
+                    editp_set_frame_dimensions(g_editp, g_shm->w, g_shm->h);
                 }
                 editp_set_frame(g_editp, req->arg0);
                 editp_get_dimensions(g_editp, &w, &h, &max_w, &max_h);

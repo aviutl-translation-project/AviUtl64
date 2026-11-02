@@ -791,15 +791,22 @@ BOOL plugin_bridge_sync_from_bridge(EDITP *ep)
 
     if (g_shm->is_editing && g_shm->edit_path[0])
     {
+        BOOL opened_new = FALSE;
+        const char *dot = strrchr(g_shm->edit_path, '.');
+        BOOL is_exedit_canvas = (dot && lstrcmpiA(dot, ".exedit") == 0);
         // if exedit opened a new project (e.g. "1280x720_30fps_44100Hz.exedit") or loaded an .aup inside the 32-bit bridge, mirror it in the 64-bit EDITP
         if (!editp_is_editing(ep) ||
             lstrcmpiA(editp_get_edit_path(ep), g_shm->edit_path) != 0)
         {
             editp_open_video(ep, g_shm->edit_path);
+            opened_new = TRUE;
         }
         if (g_shm->w > 0 && g_shm->h > 0)
         {
-            editp_set_dimensions(ep, g_shm->w, g_shm->h);
+            if (opened_new || is_exedit_canvas)
+                editp_set_dimensions(ep, g_shm->w, g_shm->h);
+            else
+                editp_set_frame_dimensions(ep, g_shm->w, g_shm->h);
         }
         if (g_shm->fps_rate > 0 && g_shm->fps_scale > 0)
         {

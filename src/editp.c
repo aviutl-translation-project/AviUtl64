@@ -592,6 +592,15 @@ BOOL editp_load_frame(EDITP *ep, int frame_num)
 
     ep->frame = frame_num;
     ep->abi.frame = frame_num;
+    if (ep->org_w > 0 && ep->org_h > 0)
+    {
+        ep->w = ep->org_w;
+        ep->h = ep->org_h;
+        ep->abi.w = ep->w;
+        ep->abi.h = ep->h;
+        ep->abi.vram_cur_w = ep->w;
+        ep->abi.vram_cur_h = ep->h;
+    }
 
     if (ep->video_source)
     {
@@ -910,7 +919,15 @@ const char *editp_get_edit_path(EDITP *ep)
     return ep->abi.edit_name;
 }
 
-void editp_set_dimensions(EDITP *ep, int w, int h)
+void editp_get_org_dimensions(EDITP *ep, int *org_w, int *org_h)
+{
+    if (org_w)
+        *org_w = (ep && ep->org_w > 0) ? ep->org_w : (ep ? ep->w : 0);
+    if (org_h)
+        *org_h = (ep && ep->org_h > 0) ? ep->org_h : (ep ? ep->h : 0);
+}
+
+void editp_set_frame_dimensions(EDITP *ep, int w, int h)
 {
     if (!ep || w <= 0 || h <= 0)
         return;
@@ -925,6 +942,15 @@ void editp_set_dimensions(EDITP *ep, int w, int h)
     ep->abi.h = h;
     ep->abi.vram_cur_w = w;
     ep->abi.vram_cur_h = h;
+}
+
+void editp_set_dimensions(EDITP *ep, int w, int h)
+{
+    if (!ep || w <= 0 || h <= 0)
+        return;
+    editp_set_frame_dimensions(ep, w, h);
+    ep->org_w = ep->w;
+    ep->org_h = ep->h;
 }
 
 void editp_set_display_size(EDITP *ep, int disp_w, int disp_h)

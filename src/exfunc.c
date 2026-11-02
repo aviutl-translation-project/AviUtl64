@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "exfunc.h"
+#include "profile_cfg.h"
 #include "yc48_convert.h"
 #include "vfw_input.h"
 #include "input_plugin.h"
@@ -653,9 +654,17 @@ static BOOL __cdecl impl_get_file_info(void *editp, FILE_INFO *fip)
 // +0x060
 static LPSTR __cdecl impl_get_config_name(void *editp, int n)
 {
-    static char s_cfg[] = "Standard";
-    (void)editp;
-    (void)n;
+    static char s_cfg[260];
+    EDITP *ep = resolve_ep(editp);
+    const char *nm;
+
+    if (!ep || !editp_is_editing(ep))
+        return NULL;
+    if (n < 0 || n >= editp_get_frame_n(ep))
+        return NULL;
+
+    nm = profile_cfg_get_slot_name((int)editp_get_frame_config(ep, n));
+    lstrcpynA(s_cfg, (nm && nm[0]) ? nm : "Default", sizeof(s_cfg));
     return s_cfg;
 }
 
@@ -1876,9 +1885,24 @@ static BOOL __cdecl impl_edit_output(void *editp, LPSTR file, int flag, LPSTR ty
 // +0x120
 static BOOL __cdecl impl_set_config(void *editp, int n, LPSTR name)
 {
-    (void)editp;
-    (void)n;
-    (void)name;
+    EDITP *ep = resolve_ep(editp);
+    int idx;
+
+    if (name && name[0])
+    {
+        idx = profile_cfg_find_by_name(name);
+    }
+    else
+    {
+        idx = n;
+    }
+    if (idx < 0 || idx >= profile_cfg_get_count())
+        return FALSE;
+    if (!profile_cfg_select(idx, TRUE))
+        return FALSE;
+
+    if (g_on_state_changed)
+        g_on_state_changed(ep);
     return TRUE;
 }
 

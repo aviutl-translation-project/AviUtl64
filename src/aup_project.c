@@ -4,6 +4,7 @@
 #include <string.h>
 #include "aup_project.h"
 #include "plugin_manager.h"
+#include "profile_cfg.h"
 #include "debug_console.h"
 
 #define AUP_IO_BUF_SIZE 65536u
@@ -571,6 +572,28 @@ static BOOL open_aup_media_or_canvas(EDITP *ep, const char *aup_abs,
 
 // 0x00423560, load .aup project
 
+static void get_aup_ini_path(char *out_path, size_t out_cap)
+{
+    char mod[MAX_PATH];
+    char *slash;
+    if (!out_path || out_cap == 0)
+        return;
+    if (GetModuleFileNameA(NULL, mod, MAX_PATH) > 0)
+    {
+        slash = strrchr(mod, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod[0] = '\0';
+        _snprintf(out_path, out_cap, "%saviutl.ini", mod);
+        out_path[out_cap - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.ini", (int)out_cap);
+    }
+}
+
 BOOL aup_load_local(const char *aup_path, EDITP *ep)
 {
     char abs_aup[MAX_PATH];
@@ -586,6 +609,8 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     uint8_t *u8_3 = NULL;
     uint8_t *chunk_buf = NULL;
     size_t chunk_cap = 0;
+    uint8_t *emb_cfg_blobs[PROFILE_MAX_COUNT];
+    uint32_t emb_cfg_sizes[PROFILE_MAX_COUNT];
     char magic1[AUP_MAGIC_LEN + 1];
     char magic2[AUP_MAGIC_LEN + 1];
     uint32_t eh_size = 0;
@@ -599,6 +624,9 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     BOOL has_audio;
     int i, s;
     BOOL ok = FALSE;
+
+    ZeroMemory(emb_cfg_blobs, sizeof(emb_cfg_blobs));
+    ZeroMemory(emb_cfg_sizes, sizeof(emb_cfg_sizes));
 
     if (!aup_path || !aup_path[0] || !ep)
         return FALSE;
@@ -714,16 +742,21 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
         }
     }
 
-    // skip embedded profile blobs (96 slots @ +0x20D18) & HGLOBAL blobs (256 slots @ +0x4BBD98)
-    for (i = 0; i < 96; i++)
+    // read embedded profile blobs (96 slots @ +0x20D18) & skip HGLOBAL blobs (256 slots @ +0x4BBD98)
+    for (i = 0; i < PROFILE_MAX_COUNT; i++)
     {
         if (eh[0x020D18u + (size_t)i * 0x104u] != 0)
         {
             uint32_t blob_sz = 0;
-            if (!ar_read_u32(&rd, &blob_sz))
+            if (!ar_read_u32(&rd, &blob_sz) || blob_sz > (64u * 1024u * 1024u))
                 goto cleanup;
-            if (blob_sz > 0 && !ar_skip(&rd, (size_t)blob_sz))
-                goto cleanup;
+            if (blob_sz > 0)
+            {
+                emb_cfg_blobs[i] = (uint8_t *)malloc((size_t)blob_sz);
+                if (!emb_cfg_blobs[i] || !ar_read_exact(&rd, emb_cfg_blobs[i], (size_t)blob_sz))
+                    goto cleanup;
+                emb_cfg_sizes[i] = blob_sz;
+            }
         }
     }
     for (i = 0; i < 256; i++)
@@ -759,6 +792,28 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
                                   w, h, video_rate, video_scale, audio_rate))
     {
         goto cleanup;
+    }
+
+    profile_cfg_clear_project_slots();
+    if (emb_cfg_blobs[0] && emb_cfg_sizes[0] >= PROFILE_CFG_HEADER_SIZE)
+    {
+        char ini_path[MAX_PATH];
+        get_aup_ini_path(ini_path, sizeof(ini_path));
+        if (GetPrivateProfileIntA("system", "loadprojectprofile", 0, ini_path) == 0)
+        {
+            plugin_manager_apply_cfg_blob(emb_cfg_blobs[0], (size_t)emb_cfg_sizes[0], TRUE);
+        }
+    }
+    for (i = 1; i < PROFILE_MAX_COUNT; i++)
+    {
+        if (eh[0x020D18u + (size_t)i * 0x104u] != 0 &&
+            emb_cfg_blobs[i] && emb_cfg_sizes[i] >= PROFILE_CFG_HEADER_SIZE)
+        {
+            char pname[260];
+            memcpy(pname, eh + 0x020D18u + (size_t)i * 0x104u, 260);
+            pname[259] = '\0';
+            profile_cfg_set_project_slot(i, pname, emb_cfg_blobs[i], (size_t)emb_cfg_sizes[i]);
+        }
     }
 
     // open secondary multi-source slots 1..63 stored at +0x026E98 + slot * 0xC4BC
@@ -938,6 +993,10 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
     ok = TRUE;
 
 cleanup:
+    for (i = 0; i < PROFILE_MAX_COUNT; i++)
+    {
+        free(emb_cfg_blobs[i]);
+    }
     free(chunk_buf);
     free(u8_3);
     free(u8_2);
@@ -1111,6 +1170,24 @@ static void populate_aviutl_edit_handle(uint8_t *eh, EDITP *ep, const char *abs_
                                         s);
         }
     }
+
+    // embedded profile names table at +0x020D18 (96 slots * 260 bytes, 0x00424475)
+    {
+        const char *p0 = profile_cfg_get_slot_name(0);
+        lstrcpynA((char *)(eh + 0x020D18u),
+                  (p0 && p0[0]) ? p0 : "Default", 260);
+        for (s = 1; s < PROFILE_MAX_COUNT; s++)
+        {
+            if (profile_cfg_has_project_slot(s))
+            {
+                const char *ps = profile_cfg_get_slot_name(s);
+                if (ps && ps[0])
+                {
+                    lstrcpynA((char *)(eh + 0x020D18u + (size_t)s * 0x104u), ps, 260);
+                }
+            }
+        }
+    }
 }
 
 BOOL aup_save_local(const char *aup_path, EDITP *ep)
@@ -1229,6 +1306,25 @@ BOOL aup_save_local(const char *aup_path, EDITP *ep)
         !aw_rle_write(&wr, u8_zeros, (size_t)frame_n))
     {
         goto cleanup_file;
+    }
+
+    // embedded profile .cfg blobs for populated slots 0..95 (0x00424475)
+    for (i = 0; i < PROFILE_MAX_COUNT; i++)
+    {
+        if (eh[0x020D18u + (size_t)i * 0x104u] != 0)
+        {
+            const uint8_t *pblob = NULL;
+            size_t psz = 0;
+            profile_cfg_get_slot_blob(i, &pblob, &psz);
+            if (!aw_write_u32(&wr, (uint32_t)psz))
+            {
+                goto cleanup_file;
+            }
+            if (psz > 0 && pblob && !aw_write(&wr, pblob, psz))
+            {
+                goto cleanup_file;
+            }
+        }
     }
 
     // magic #2 ("AviUtl ProjectFile version 0.18")

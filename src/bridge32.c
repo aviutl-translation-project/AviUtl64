@@ -4,6 +4,7 @@
 #include <string.h>
 #include "plugin_bridge.h"
 #include "plugin_manager.h"
+#include "profile_cfg.h"
 #include "video_export.h"
 #include "color_plugin.h"
 #include "input_plugin.h"
@@ -286,6 +287,7 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
     case BRIDGE_CMD_LOAD_DIR:
     {
         BOOL f_ok = plugin_manager_init_ex(req->str, g_bridge_hwnd, g_editp);
+        profile_cfg_init();
         resp->val0 = plugin_manager_get_count();
         resp->ok = f_ok ? 1 : 0;
         break;
@@ -910,6 +912,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    profile_cfg_shutdown();
     video_export_shutdown();
     plugin_manager_shutdown();
     input_plugin_shutdown();

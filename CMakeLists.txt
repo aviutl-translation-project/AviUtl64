@@ -16,6 +16,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # core sources shared with 32-bit bridge
 set(REAVIUTL_CORE_SOURCES
 	src/plugin_manager.c
+	src/profile_cfg.c
 	src/plugin_loader.c
 	src/plugin_bridge_client.c
 	src/builtin_filters.c

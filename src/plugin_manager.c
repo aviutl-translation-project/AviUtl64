@@ -7,6 +7,7 @@
 #include "plugin_loader.h"
 #include "plugin_bridge.h"
 #include "builtin_filters.h"
+#include "profile_cfg.h"
 #include "aup_project.h"
 #include "editp.h"
 #include "exfunc.h"
@@ -44,6 +45,8 @@ typedef struct
     int cmd_slot;
     int cmd_id;
     int priority;
+    int default_flag;
+    int default_priority;
     BOOL is_builtin;
     BOOL stage1_initialized;
     BOOL stage2_initialized;
@@ -503,6 +506,7 @@ static BOOL render_pipeline_range(EDITP *ep, int frame_num, const FILTER *stop_b
     if (!ep || !editp_is_editing(ep))
         return FALSE;
 
+    profile_cfg_apply_for_frame(ep, frame_num);
     cur_inter = editp_get_frame_inter(ep, frame_num);
     cnt = plugin_manager_get_execution_order(FALSE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
     for (k = 0; k < cnt; k++)
@@ -613,7 +617,11 @@ static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
         editp_swap_ycp(ep, tmp_edit, tmp_temp);
     }
 
-    render_pipeline_range(ep, frame_num, stop_before_fp);
+    {
+        int prev_cfg_slot = profile_cfg_get_applied_slot();
+        render_pipeline_range(ep, frame_num, stop_before_fp);
+        profile_cfg_apply_slot(prev_cfg_slot);
+    }
 
     editp_get_dimensions(ep, &w, &h, &max_w, &max_h);
     memcpy(out_ycp, editp_get_ycp_edit(ep),
@@ -640,13 +648,16 @@ static BOOL cb_host_render_up_to(FILTER *stop_before_fp, EDITP *ep,
 static int cb_host_render_audio_up_to(FILTER *stop_before_fp, EDITP *ep,
                                       int frame_num, short *out_pcm)
 {
-    int samples;
+    int samples, prev_cfg_slot, res;
     if (!ep || !editp_is_editing(ep))
         return 0;
     samples = read_source_audio_with_delay(ep, frame_num, out_pcm, TRUE);
     if (!out_pcm || samples <= 0)
         return samples;
-    return plugin_manager_apply_audio_filters(ep, frame_num, out_pcm, samples, stop_before_fp);
+    prev_cfg_slot = profile_cfg_get_applied_slot();
+    res = plugin_manager_apply_audio_filters(ep, frame_num, out_pcm, samples, stop_before_fp);
+    profile_cfg_apply_slot(prev_cfg_slot);
+    return res;
 }
 
 // 0x00431390 & 0x00431560: synchronize standard host controls from e->runtime
@@ -1380,6 +1391,7 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
             e->hwnd = create_filter_window(e, owner_hwnd);
             plugin_setup_runtime_filter(&e->runtime, e->src_dll, e->module, e->path, e->hwnd);
             fl = e->runtime.flag;
+            e->default_flag = fl;
             if (fl & FILTER_FLAG_INTERLACE_FILTER)
             {
                 def_prio = -1;
@@ -1414,6 +1426,7 @@ static void initialize_registered_plugins(HWND owner_hwnd, EDITP *editp)
                     e->priority = def_prio;
                 }
             }
+            e->default_priority = def_prio;
             dbg_plugin("Filter[%d] '%s' | slot=%d HMODULE=0x%p FILTER=0x%p HWND=0x%p flag=0x%08X prio=%d",
                        i, e->name, e->cmd_slot, (void *)e->module, (void *)&e->runtime,
                        (void *)e->hwnd, (unsigned)e->runtime.flag, e->priority);
@@ -2478,6 +2491,514 @@ void plugin_manager_disable_all_filters(void)
     }
 }
 
+static uint32_t cfg_rd_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void cfg_wr_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+// 0x0042f5f0: serialize "AviUtl FilterConfigFile version 0.1" binary state blob
+BOOL plugin_manager_serialize_cfg_blob(uint8_t **out_buf, size_t *out_size)
+{
+    size_t total_sz = PROFILE_CFG_HEADER_SIZE;
+    uint8_t *buf;
+    size_t pos;
+    int i, t, c;
+
+    if (!out_buf || !out_size)
+        return FALSE;
+    *out_buf = NULL;
+    *out_size = 0;
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+        uint32_t name_bytes, num_fields, fsz2, fsz3, fsz4;
+        BOOL has_ex;
+
+        if (!e->stage1_initialized || !fp->name || !fp->name[0])
+            continue;
+        sync_dynamic_config_check_arrays(e);
+
+        name_bytes = (uint32_t)strlen(fp->name) + 1u;
+        has_ex = ((fp->flag & FILTER_FLAG_EX_DATA) != 0 &&
+                  fp->ex_data_size > 0 && fp->ex_data_ptr != NULL);
+        num_fields = has_ex ? 5u : 4u;
+        fsz2 = (fp->track_n > 0 && fp->track != NULL) ? ((uint32_t)fp->track_n * 4u) : 0u;
+        fsz3 = (fp->check_n > 0 && fp->check != NULL) ? ((uint32_t)fp->check_n * 4u) : 0u;
+        fsz4 = has_ex ? (uint32_t)fp->ex_data_size : 0u;
+
+        total_sz += (size_t)(4u + name_bytes + 4u + num_fields * 4u +
+                             4u + 4u + fsz2 + fsz3 + fsz4);
+    }
+
+    buf = (uint8_t *)calloc(1, total_sz);
+    if (!buf)
+        return FALSE;
+
+    memcpy(buf, PROFILE_CFG_MAGIC, strlen(PROFILE_CFG_MAGIC));
+    pos = PROFILE_CFG_HEADER_SIZE;
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        FILTER *fp = &e->runtime;
+        uint32_t name_bytes, num_fields, fsz[5], rec_total;
+        BOOL has_ex;
+
+        if (!e->stage1_initialized || !fp->name || !fp->name[0])
+            continue;
+
+        name_bytes = (uint32_t)strlen(fp->name) + 1u;
+        has_ex = ((fp->flag & FILTER_FLAG_EX_DATA) != 0 &&
+                  fp->ex_data_size > 0 && fp->ex_data_ptr != NULL);
+        num_fields = has_ex ? 5u : 4u;
+        fsz[0] = 4u;
+        fsz[1] = 4u;
+        fsz[2] = (fp->track_n > 0 && fp->track != NULL) ? ((uint32_t)fp->track_n * 4u) : 0u;
+        fsz[3] = (fp->check_n > 0 && fp->check != NULL) ? ((uint32_t)fp->check_n * 4u) : 0u;
+        fsz[4] = has_ex ? (uint32_t)fp->ex_data_size : 0u;
+
+        rec_total = 4u + name_bytes + 4u + num_fields * 4u +
+                    fsz[0] + fsz[1] + fsz[2] + fsz[3] + (has_ex ? fsz[4] : 0u);
+
+        cfg_wr_u32(buf + pos, rec_total);
+        pos += 4u;
+        memcpy(buf + pos, fp->name, (size_t)name_bytes);
+        pos += (size_t)name_bytes;
+        cfg_wr_u32(buf + pos, num_fields);
+        pos += 4u;
+        for (t = 0; t < (int)num_fields; t++)
+        {
+            cfg_wr_u32(buf + pos, fsz[t]);
+            pos += 4u;
+        }
+
+        cfg_wr_u32(buf + pos, (uint32_t)fp->flag);
+        pos += 4u;
+        cfg_wr_u32(buf + pos, (uint32_t)e->priority);
+        pos += 4u;
+
+        if (fsz[2] > 0)
+        {
+            for (t = 0; t < fp->track_n; t++)
+            {
+                cfg_wr_u32(buf + pos, (uint32_t)fp->track[t]);
+                pos += 4u;
+            }
+        }
+        if (fsz[3] > 0)
+        {
+            for (c = 0; c < fp->check_n; c++)
+            {
+                cfg_wr_u32(buf + pos, (uint32_t)fp->check[c]);
+                pos += 4u;
+            }
+        }
+        if (has_ex && fsz[4] > 0)
+        {
+            memcpy(buf + pos, fp->ex_data_ptr, (size_t)fsz[4]);
+            pos += (size_t)fsz[4];
+        }
+    }
+
+    *out_buf = buf;
+    *out_size = pos;
+    return TRUE;
+}
+
+static PluginEntry *find_plugin_entry_for_cfg_name(const char *rec_name)
+{
+    int i;
+    const char *gt;
+
+    if (!rec_name || !rec_name[0])
+        return NULL;
+
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (!e->stage1_initialized)
+            continue;
+        if ((e->runtime.name && lstrcmpA(e->runtime.name, rec_name) == 0) ||
+            lstrcmpA(e->name, rec_name) == 0)
+        {
+            return e;
+        }
+    }
+
+    if (rec_name[0] == '<')
+    {
+        gt = strchr(rec_name, '>');
+        if (gt && gt[1])
+        {
+            const char *sub = gt + 1;
+            for (i = 0; i < g_plugin_count; i++)
+            {
+                PluginEntry *e = &g_plugins[i];
+                if (!e->stage1_initialized)
+                    continue;
+                if ((e->runtime.name && lstrcmpA(e->runtime.name, sub) == 0) ||
+                    lstrcmpA(e->name, sub) == 0)
+                {
+                    return e;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+BOOL plugin_manager_apply_cfg_blob(const uint8_t *buf, size_t size, BOOL update_ui)
+{
+    size_t pos;
+
+    if (!buf || size < PROFILE_CFG_HEADER_SIZE)
+        return FALSE;
+    if (memcmp(buf, PROFILE_CFG_MAGIC, strlen(PROFILE_CFG_MAGIC)) != 0)
+        return FALSE;
+
+    pos = PROFILE_CFG_HEADER_SIZE;
+    while (pos + 12u <= size)
+    {
+        uint32_t rec_total = cfg_rd_u32(buf + pos);
+        const uint8_t *rec_start = buf + pos;
+        const uint8_t *rec_end;
+        const uint8_t *nul_p;
+        const char *rec_name;
+        const uint8_t *p;
+        uint32_t num_fields;
+        uint32_t fsz[16];
+        const uint8_t *fptr[16];
+        uint32_t f;
+        PluginEntry *e;
+
+        if (rec_total < 12u || pos + (size_t)rec_total > size)
+            break;
+        rec_end = rec_start + rec_total;
+        pos += (size_t)rec_total;
+
+        nul_p = (const uint8_t *)memchr(rec_start + 4u, 0, (size_t)(rec_end - (rec_start + 4u)));
+        if (!nul_p)
+            continue;
+        rec_name = (const char *)(rec_start + 4u);
+        p = nul_p + 1;
+        if (p + 4u > rec_end)
+            continue;
+
+        num_fields = cfg_rd_u32(p);
+        p += 4u;
+        if (num_fields == 0 || num_fields > 16u || p + (size_t)num_fields * 4u > rec_end)
+            continue;
+
+        for (f = 0; f < num_fields; f++)
+        {
+            fsz[f] = cfg_rd_u32(p);
+            p += 4u;
+        }
+        for (f = 0; f < num_fields; f++)
+        {
+            if ((size_t)fsz[f] > (size_t)(rec_end - p))
+                break;
+            fptr[f] = p;
+            p += (size_t)fsz[f];
+        }
+        if (f < num_fields)
+            continue;
+
+        e = find_plugin_entry_for_cfg_name(rec_name);
+        if (!e || e->faulted)
+            continue;
+
+        sync_dynamic_config_check_arrays(e);
+
+        if (num_fields >= 1u && fsz[0] >= 4u)
+        {
+            int32_t saved_flag = (int32_t)cfg_rd_u32(fptr[0]);
+            if (!(e->runtime.flag & (FILTER_FLAG_ALWAYS_ACTIVE | FILTER_FLAG_DISP_FILTER)))
+            {
+                if (saved_flag & FILTER_FLAG_ACTIVE)
+                    e->runtime.flag |= FILTER_FLAG_ACTIVE;
+                else
+                    e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+                if (e->src_dll)
+                    e->src_dll->flag = e->runtime.flag;
+            }
+        }
+
+        if (num_fields >= 2u && fsz[1] >= 4u)
+        {
+            int32_t saved_prio = (int32_t)cfg_rd_u32(fptr[1]);
+            if (!(e->runtime.flag & FILTER_FLAG_INTERLACE_FILTER))
+            {
+                e->priority = saved_prio;
+            }
+        }
+
+        if (num_fields >= 3u && e->runtime.track && e->runtime.track_n > 0)
+        {
+            int cnt = (int)(fsz[2] / 4u);
+            int t;
+            if (cnt > e->runtime.track_n)
+                cnt = e->runtime.track_n;
+            for (t = 0; t < cnt; t++)
+            {
+                int val = (int)(int32_t)cfg_rd_u32(fptr[2] + (size_t)t * 4u);
+                if (e->runtime.track_s && val < e->runtime.track_s[t])
+                    val = e->runtime.track_s[t];
+                if (e->runtime.track_e && val > e->runtime.track_e[t])
+                    val = e->runtime.track_e[t];
+                e->runtime.track[t] = val;
+            }
+        }
+
+        if (num_fields >= 4u && e->runtime.check && e->runtime.check_n > 0)
+        {
+            int cnt = (int)(fsz[3] / 4u);
+            int c;
+            if (cnt > e->runtime.check_n)
+                cnt = e->runtime.check_n;
+            for (c = 0; c < cnt; c++)
+            {
+                int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+                if (cdef >= 0)
+                {
+                    e->runtime.check[c] = (int)(int32_t)cfg_rd_u32(fptr[3] + (size_t)c * 4u);
+                }
+            }
+        }
+
+        if (num_fields >= 5u && fsz[4] > 0 &&
+            (e->runtime.flag & FILTER_FLAG_EX_DATA) &&
+            e->runtime.ex_data_ptr && e->runtime.ex_data_size > 0)
+        {
+            size_t cp = (size_t)fsz[4];
+            if (cp > (size_t)e->runtime.ex_data_size)
+                cp = (size_t)e->runtime.ex_data_size;
+            memcpy(e->runtime.ex_data_ptr, fptr[4], cp);
+        }
+
+        if (e->runtime.func_update)
+        {
+            e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
+            sync_dynamic_config_check_arrays(e);
+        }
+
+        if (update_ui)
+        {
+            sync_filter_entry_controls(e);
+            if (e->stage2_initialized && e->runtime.func_WndProc)
+            {
+                safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
+                                  exfunc_get_editp(), "WM_FILTER_CHANGE_ACTIVE");
+                safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                                  exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
+            }
+            if (e->hwnd && IsWindow(e->hwnd))
+            {
+                InvalidateRect(e->hwnd, NULL, FALSE);
+            }
+        }
+    }
+
+    exfunc_invalidate_all_caches();
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_invalidate_caches();
+    }
+    if (update_ui)
+    {
+        if (g_builtins_enabled)
+            builtin_filters_refresh_tool_window();
+        post_host_redraw(3);
+        post_host_redraw(1);
+    }
+    return TRUE;
+}
+
+BOOL plugin_manager_save_cfg_file(const char *cfg_path)
+{
+    uint8_t *blob = NULL;
+    size_t sz = 0;
+    HANDLE hFile;
+    DWORD written = 0;
+    BOOL ok;
+
+    if (!cfg_path || !cfg_path[0])
+        return FALSE;
+    if (!plugin_manager_serialize_cfg_blob(&blob, &sz) || !blob || sz == 0)
+        return FALSE;
+
+    hFile = CreateFileA(cfg_path, GENERIC_WRITE, 0, NULL,
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        free(blob);
+        return FALSE;
+    }
+    ok = WriteFile(hFile, blob, (DWORD)sz, &written, NULL) && (size_t)written == sz;
+    CloseHandle(hFile);
+    free(blob);
+    if (!ok)
+        DeleteFileA(cfg_path);
+    return ok;
+}
+
+BOOL plugin_manager_load_cfg_file(const char *cfg_path, BOOL update_ui)
+{
+    HANDLE hFile;
+    DWORD sz_lo, sz_hi = 0, got = 0;
+    uint8_t *buf;
+    BOOL ok;
+
+    if (!cfg_path || !cfg_path[0])
+        return FALSE;
+    hFile = CreateFileA(cfg_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    sz_lo = GetFileSize(hFile, &sz_hi);
+    if (sz_lo == INVALID_FILE_SIZE || sz_hi != 0 || sz_lo < PROFILE_CFG_HEADER_SIZE ||
+        sz_lo > (64u * 1024u * 1024u))
+    {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    buf = (uint8_t *)malloc((size_t)sz_lo);
+    if (!buf)
+    {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    if (!ReadFile(hFile, buf, sz_lo, &got, NULL) || got != sz_lo)
+    {
+        free(buf);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    CloseHandle(hFile);
+
+    ok = plugin_manager_apply_cfg_blob(buf, (size_t)sz_lo, update_ui);
+    free(buf);
+    return ok;
+}
+
+void plugin_manager_reset_all_filters_to_defaults(void)
+{
+    int i, t, c;
+    for (i = 0; i < g_plugin_count; i++)
+    {
+        PluginEntry *e = &g_plugins[i];
+        if (!e->stage1_initialized || e->faulted)
+            continue;
+
+        sync_dynamic_config_check_arrays(e);
+
+        if (!(e->runtime.flag & (FILTER_FLAG_ALWAYS_ACTIVE | FILTER_FLAG_DISP_FILTER)))
+        {
+            if (e->default_flag & FILTER_FLAG_ACTIVE)
+                e->runtime.flag |= FILTER_FLAG_ACTIVE;
+            else
+                e->runtime.flag &= ~FILTER_FLAG_ACTIVE;
+            if (e->src_dll)
+                e->src_dll->flag = e->runtime.flag;
+        }
+
+        if (!(e->runtime.flag & FILTER_FLAG_INTERLACE_FILTER))
+        {
+            e->priority = e->default_priority;
+        }
+
+        if (e->runtime.track)
+        {
+            for (t = 0; t < e->runtime.track_n; t++)
+            {
+                e->runtime.track[t] = e->runtime.track_default ? e->runtime.track_default[t] : 0;
+            }
+        }
+
+        if (e->runtime.check)
+        {
+            int first_radio_checked = -1;
+            for (c = 0; c < e->runtime.check_n; c++)
+            {
+                int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+                if (cdef >= 0)
+                {
+                    e->runtime.check[c] = cdef;
+                    if ((e->runtime.flag & (FILTER_FLAG_RADIO_BUTTON | FILTER_FLAG_CONFIG_RADIO)) &&
+                        cdef > 0 && first_radio_checked < 0)
+                    {
+                        first_radio_checked = c;
+                    }
+                }
+            }
+            if ((e->runtime.flag & (FILTER_FLAG_RADIO_BUTTON | FILTER_FLAG_CONFIG_RADIO)) &&
+                e->runtime.check_n > 0)
+            {
+                if (first_radio_checked < 0)
+                    first_radio_checked = 0;
+                for (c = 0; c < e->runtime.check_n; c++)
+                {
+                    int cdef = e->runtime.check_default ? e->runtime.check_default[c] : 0;
+                    if (cdef >= 0)
+                        e->runtime.check[c] = (c == first_radio_checked) ? 1 : 0;
+                }
+            }
+        }
+
+        if ((e->runtime.flag & FILTER_FLAG_EX_DATA) &&
+            e->runtime.ex_data_ptr && e->runtime.ex_data_def && e->runtime.ex_data_size > 0)
+        {
+            memcpy(e->runtime.ex_data_ptr, e->runtime.ex_data_def, (size_t)e->runtime.ex_data_size);
+        }
+
+        sync_filter_entry_controls(e);
+        if (e->runtime.func_update)
+        {
+            e->runtime.func_update(&e->runtime, FILTER_UPDATE_STATUS_ALL);
+            sync_dynamic_config_check_arrays(e);
+        }
+        if (e->stage2_initialized && e->runtime.func_WndProc)
+        {
+            safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_ACTIVE, 0, 0,
+                              exfunc_get_editp(), "WM_FILTER_CHANGE_ACTIVE");
+            safe_call_wndproc(e, e->hwnd, WM_FILTER_CHANGE_PARAM, 0, 0,
+                              exfunc_get_editp(), "WM_FILTER_CHANGE_PARAM");
+        }
+        if (e->hwnd && IsWindow(e->hwnd))
+        {
+            InvalidateRect(e->hwnd, NULL, FALSE);
+        }
+    }
+
+    if (plugin_bridge_is_active())
+    {
+        plugin_bridge_set_filter_active(0, 3);
+        plugin_bridge_invalidate_caches();
+    }
+    exfunc_invalidate_all_caches();
+    if (g_builtins_enabled)
+    {
+        builtin_filters_refresh_tool_window();
+    }
+    post_host_redraw(3);
+    post_host_redraw(1);
+}
+
 int plugin_manager_get_config_check_count(int index)
 {
     if (index < 0 || index >= g_plugin_count)
@@ -2981,6 +3502,7 @@ int plugin_manager_apply_audio_filters(EDITP *ep, int frame_num, short *buf,
         return samples;
     }
 
+    profile_cfg_apply_for_frame(ep, frame_num);
     cnt = plugin_manager_get_execution_order(TRUE, order, MAX_PLUGINS + BRIDGE_MAX_FILTERS);
     for (k = 0; k < cnt; k++)
     {
@@ -3029,16 +3551,23 @@ int plugin_manager_apply_audio_filters(EDITP *ep, int frame_num, short *buf,
 
 int plugin_manager_render_audio_frame(EDITP *ep, int frame_num, short *buf, BOOL nofilter)
 {
-    int samples;
+    int samples, out_smp;
 
     if (!ep || !editp_is_editing(ep))
         return 0;
+    if (!nofilter)
+        profile_cfg_apply_for_frame(ep, frame_num);
     samples = read_source_audio_with_delay(ep, frame_num, buf, !nofilter);
     if (!buf || samples <= 0 || nofilter)
     {
+        if (!nofilter && !editp_is_saving(ep))
+            profile_cfg_restore_active();
         return samples;
     }
-    return plugin_manager_apply_audio_filters(ep, frame_num, buf, samples, NULL);
+    out_smp = plugin_manager_apply_audio_filters(ep, frame_num, buf, samples, NULL);
+    if (!editp_is_saving(ep))
+        profile_cfg_restore_active();
+    return out_smp;
 }
 
 BOOL plugin_manager_send_filter_command(int filter_index, int filter_cmd_id)
@@ -3193,6 +3722,7 @@ void plugin_manager_notify_file_close(EDITP *ep)
     int i;
     exfunc_invalidate_all_caches();
     aup_clear_preserved_chunks();
+    profile_cfg_clear_project_slots();
     if (plugin_bridge_is_active() && !g_suppress_bridge_file_notify)
     {
         plugin_bridge_close_video(ep);
@@ -3310,6 +3840,7 @@ void plugin_manager_notify_save_end(EDITP *ep, int out_flags)
     {
         editp_set_saving(target_ep, FALSE);
     }
+    profile_cfg_restore_active();
 }
 
 BOOL plugin_manager_has_active_audio_filter(void)
@@ -3357,6 +3888,8 @@ BOOL plugin_manager_render_video_frame(EDITP *ep, int frame_num)
             continue;
         apply_single_native_video_entry(e, ep, frame_num);
     }
+    if (!editp_is_saving(ep))
+        profile_cfg_restore_active();
     return TRUE;
 }
 

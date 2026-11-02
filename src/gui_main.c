@@ -18,6 +18,7 @@
 #include "exfunc.h"
 #include "yc48_convert.h"
 #include "plugin_manager.h"
+#include "profile_cfg.h"
 #include "plugin_bridge.h"
 #include "builtin_filters.h"
 #include "color_plugin.h"
@@ -798,11 +799,45 @@ static void apply_menu(HWND hwnd)
         }
     }
 
-    // [プロファイル] -> 8005 ("デフォルト")
+    // [編集] -> [現在のフレームのプロファイル] (5207..5215)
+    for (i = 1; i <= 9; i++)
+    {
+        if (profile_cfg_has_project_slot(i))
+        {
+            const char *snm = profile_cfg_get_slot_name(i);
+            wchar_t wsnm[260], wlbl[300];
+            sjis_to_wide_str((snm && snm[0]) ? snm : "Profile", wsnm, 260);
+            wsprintfW(wlbl, L"%s (%d)", wsnm, i);
+            ModifyMenuW(bar, (UINT)(5206 + i), MF_BYCOMMAND | MF_STRING,
+                        (UINT_PTR)(5206 + i), wlbl);
+        }
+    }
+
+    // [プロファイル] -> 8006+ (0x0041465d)
     if (prof_sub)
     {
-        ModifyMenuW(prof_sub, 8005, MF_BYCOMMAND | MF_STRING | MF_CHECKED,
-                    8005, w_default[0] ? w_default : L"\x30c7\x30d5\x30a9\x30eb\x30c8");
+        int pcount = profile_cfg_get_count();
+        int pactive = profile_cfg_get_active();
+        for (i = 0; i < pcount; i++)
+        {
+            const char *pnm = profile_cfg_get_name(i);
+            wchar_t wpnm[260];
+            UINT pfl = MF_BYCOMMAND | MF_STRING |
+                       ((i == pactive) ? MF_CHECKED : MF_UNCHECKED);
+            if (i == 0 && (!pnm || !pnm[0]))
+            {
+                lstrcpynW(wpnm, w_default[0] ? w_default : L"\x30c7\x30d5\x30a9\x30eb\x30c8", 260);
+            }
+            else
+            {
+                sjis_to_wide_str((pnm && pnm[0]) ? pnm : "Default", wpnm, 260);
+            }
+            InsertMenuW(prof_sub, 8005, pfl,
+                        (UINT_PTR)(PROFILE_CMD_SELECT_BASE + i), wpnm);
+        }
+        DeleteMenu(prof_sub, 8005, MF_BYCOMMAND);
+        EnableMenuItem(prof_sub, PROFILE_CMD_DELETE,
+                       MF_BYCOMMAND | ((pactive > 0) ? MF_ENABLED : (MF_GRAYED | MF_DISABLED)));
     }
 
     {
@@ -949,6 +984,11 @@ static void shutdown_main_window(HWND hwnd)
         plugin_manager_notify_file_close(g_editp);
         editp_close_video(g_editp);
     }
+    if (!g_smoke_exit)
+    {
+        profile_cfg_save_active();
+    }
+    profile_cfg_shutdown();
     // shut down plugins BEFORE DestroyWindow(hwnd) so owned plugin windows remain valid during WM_FILTER_EXIT when exedit calls GetWindowRect() to save its own layout
     video_export_shutdown();
     plugin_manager_shutdown();
@@ -2039,6 +2079,24 @@ static void seek_frame_discontinuity(HWND hwnd, int dir)
     seek_to_frame_ex(hwnd, (dir > 0) ? (fn - 1) : 0, TRUE);
 }
 
+static void seek_profile_change_frame(HWND hwnd, int dir)
+{
+    int cur, fn, f;
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    cur = editp_get_frame(g_editp);
+    fn = editp_get_frame_n(g_editp);
+    for (f = cur + dir; f > 0 && f < fn; f += dir)
+    {
+        if (editp_get_frame_config(g_editp, f) != editp_get_frame_config(g_editp, f - 1))
+        {
+            seek_to_frame_ex(hwnd, f, TRUE);
+            return;
+        }
+    }
+    seek_to_frame_ex(hwnd, (dir > 0) ? (fn - 1) : 0, TRUE);
+}
+
 static void run_inter_dialog(HWND hwnd)
 {
     AviUtlDlgState st;
@@ -2937,9 +2995,21 @@ static void sync_edit_menu_states(HMENU hMenu)
     }
     EnableMenuItem(hMenu, 1009,
                    MF_BYCOMMAND | ((g_editp && editp_is_saving(g_editp)) ? MF_ENABLED : (MF_GRAYED | MF_DISABLED)));
+    EnableMenuItem(hMenu, PROFILE_CMD_DELETE,
+                   MF_BYCOMMAND | ((profile_cfg_get_active() > 0 && !(g_editp && editp_is_saving(g_editp)))
+                                       ? MF_ENABLED
+                                       : (MF_GRAYED | MF_DISABLED)));
 
     if (!active_edit)
         return;
+
+    for (k = 1; k <= 9; k++)
+    {
+        if (!profile_cfg_has_project_slot(k))
+        {
+            EnableMenuItem(hMenu, (UINT)(5206 + k), MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
+        }
+    }
 
     if (!editp_can_undo(g_editp))
         EnableMenuItem(hMenu, 5147, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED);
@@ -3469,6 +3539,20 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             apply_menu(hwnd);
             return 0;
         }
+        if (id >= PROFILE_CMD_SELECT_BASE &&
+            id < PROFILE_CMD_SELECT_BASE + PROFILE_MAX_COUNT)
+        {
+            if (profile_cfg_select(id - PROFILE_CMD_SELECT_BASE, TRUE))
+            {
+                exfunc_invalidate_all_caches();
+                if (plugin_manager_is_bridged())
+                    plugin_bridge_invalidate_caches();
+                apply_menu(hwnd);
+                plugin_manager_notify_update(g_editp);
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+        }
 
         switch (id)
         {
@@ -3605,6 +3689,37 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             {
                 plugin_manager_notify_file_close(g_editp);
                 editp_close_video(g_editp);
+                apply_menu(hwnd);
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+
+        case PROFILE_CMD_CREATE: // 8001: Make a new profile
+            if (profile_cfg_create_interactive(hwnd, NULL) >= 0)
+            {
+                apply_menu(hwnd);
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+        case PROFILE_CMD_DELETE: // 8002: Delete current profile
+            if (profile_cfg_delete_active(g_editp))
+            {
+                exfunc_invalidate_all_caches();
+                if (plugin_manager_is_bridged())
+                    plugin_bridge_invalidate_caches();
+                apply_menu(hwnd);
+                plugin_manager_notify_update(g_editp);
+                refresh_current_frame(hwnd);
+            }
+            return 0;
+        case PROFILE_CMD_RESET: // 8000: Reset current profile to defaults
+            if (profile_cfg_reset_active())
+            {
+                exfunc_invalidate_all_caches();
+                if (plugin_manager_is_bridged())
+                    plugin_bridge_invalidate_caches();
+                apply_menu(hwnd);
+                plugin_manager_notify_update(g_editp);
                 refresh_current_frame(hwnd);
             }
             return 0;
@@ -3627,6 +3742,12 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case 5142: // down: Next frame skipping deleted frames
             seek_skipping_deleted_frames(hwnd, +1);
+            return 0;
+        case 5176: // next profile change frame
+            seek_profile_change_frame(hwnd, +1);
+            return 0;
+        case 5177: // prev profile change frame
+            seek_profile_change_frame(hwnd, -1);
             return 0;
         case 5170: // next frame discontinuity
             seek_frame_discontinuity(hwnd, +1);
@@ -3804,6 +3925,70 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 stop_playback(hwnd);
                 if (editp_undo(g_editp))
                 {
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5109: // make selection a new profile (0x00413ba4)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                if (profile_cfg_bind_selection_new_profile(hwnd, g_editp) >= 1)
+                {
+                    exfunc_invalidate_all_caches();
+                    if (plugin_manager_is_bridged())
+                        plugin_bridge_invalidate_caches();
+                    apply_menu(hwnd);
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5126: // make selection a new compression setting (0x00413db6)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                if (video_export_choose_video_codec(hwnd, g_editp))
+                {
+                    int s = 0, e = 0, fn = editp_get_frame_n(g_editp);
+                    BYTE st = 0;
+                    editp_get_select_frame(g_editp, &s, &e);
+                    editp_push_undo(g_editp);
+                    if (s >= 0 && s < fn)
+                    {
+                        editp_get_frame_status(g_editp, s, &st);
+                        editp_set_frame_status(g_editp, s, (BYTE)(st | EDIT_FRAME_EDIT_FLAG_KEYFRAME));
+                    }
+                    if (e + 1 >= 0 && e + 1 < fn)
+                    {
+                        st = 0;
+                        editp_get_frame_status(g_editp, e + 1, &st);
+                        editp_set_frame_status(g_editp, e + 1, (BYTE)(st | EDIT_FRAME_EDIT_FLAG_KEYFRAME));
+                    }
+                    plugin_manager_notify_update(g_editp);
+                    refresh_current_frame(hwnd);
+                }
+            }
+            return 0;
+        case 5206:
+        case 5207:
+        case 5208:
+        case 5209:
+        case 5210:
+        case 5211:
+        case 5212:
+        case 5213:
+        case 5214:
+        case 5215: // current frame profile (0..9)
+            if (g_editp && editp_is_editing(g_editp))
+            {
+                int slot = id - 5206;
+                if (slot == 0 || profile_cfg_has_project_slot(slot))
+                {
+                    editp_push_undo(g_editp);
+                    editp_set_frame_config(g_editp, editp_get_frame(g_editp), (BYTE)slot);
+                    exfunc_invalidate_all_caches();
                     if (plugin_manager_is_bridged())
                         plugin_bridge_invalidate_caches();
                     plugin_manager_notify_update(g_editp);
@@ -4004,6 +4189,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     input_plugin_init(plugin_dir, hwnd);
     plugin_manager_set_builtins_enabled(TRUE);
     plugin_manager_init_ex(plugin_dir, hwnd, g_editp);
+    profile_cfg_init();
     video_export_set_ui_callbacks(cb_export_preview_update, cb_export_progress);
     video_export_scan_auo(plugin_dir, hwnd, g_editp);
 
@@ -4078,6 +4264,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     }
 
     debug_console_shutdown();
+    profile_cfg_shutdown();
     video_export_shutdown();
     plugin_manager_shutdown();
     input_plugin_shutdown();

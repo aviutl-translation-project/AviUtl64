@@ -4,6 +4,8 @@
 #define PLUGIN_MANAGER_H
 
 #include <windows.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "filter.h"
 #include "editp.h"
 
@@ -69,6 +71,11 @@ HMENU plugin_manager_build_menu(void);
 BOOL plugin_manager_set_active(int index, BOOL active);
 BOOL plugin_manager_toggle_active(int index);
 void plugin_manager_disable_all_filters(void);
+void plugin_manager_reset_all_filters_to_defaults(void);
+BOOL plugin_manager_serialize_cfg_blob(uint8_t **out_buf, size_t *out_size);
+BOOL plugin_manager_apply_cfg_blob(const uint8_t *buf, size_t size, BOOL update_ui);
+BOOL plugin_manager_save_cfg_file(const char *cfg_path);
+BOOL plugin_manager_load_cfg_file(const char *cfg_path, BOOL update_ui);
 BOOL plugin_manager_exec_import_export(int index, BOOL is_export);
 
 BOOL plugin_manager_show_window(int index, BOOL show);

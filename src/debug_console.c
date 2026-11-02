@@ -329,9 +329,9 @@ void debug_console_init(BOOL is_bridge_helper)
             SetConsoleCP(932);
 
 #if REAVIUTL_X64
-            SetConsoleTitleW(L"reaviutl console (x64)");
+            SetConsoleTitleW(L"AviUtl64 console (x64)");
 #else
-            SetConsoleTitleW(L"reaviutl console (x86)");
+            SetConsoleTitleW(L"AviUtl64 console (x86)");
 #endif
             // disable console close button so closing it does not kill the process
             sysm = GetSystemMenu(con_hwnd, FALSE);

@@ -460,7 +460,8 @@ BOOL preview_init_controls(HWND main_hwnd, HINSTANCE hInst)
         g_hwnd_trackbar, GWLP_WNDPROC, (LONG_PTR)AviUtlTrackbarProc);
 
     SendMessageA(g_hwnd_trackbar, TBM_SETRANGE, FALSE, MAKELONG(0, 0));
-    SendMessageA(g_hwnd_trackbar, TBM_SETPAGESIZE, 0, 1);
+    SendMessageA(g_hwnd_trackbar, TBM_SETPAGESIZE, 0,
+                 abs(g_sys_cfg.moveA) > 0 ? abs(g_sys_cfg.moveA) : 1);
     EnableWindow(g_hwnd_trackbar, FALSE);
 
     // right-aligned 24x24 AviUtlButton cluster (0x00460960)
@@ -479,6 +480,46 @@ BOOL preview_init_controls(HWND main_hwnd, HINSTANCE hInst)
     }
 
     return TRUE;
+}
+
+void preview_reload_sys_config(HWND main_hwnd)
+{
+    char ini[MAX_PATH];
+    int page_sz;
+
+    get_ini_path(ini, sizeof(ini));
+    g_sys_cfg.moveA = GetPrivateProfileIntA("system", "moveA", 5, ini);
+    g_sys_cfg.moveB = GetPrivateProfileIntA("system", "moveB", 30, ini);
+    g_sys_cfg.moveC = GetPrivateProfileIntA("system", "moveC", 899, ini);
+    g_sys_cfg.moveD = GetPrivateProfileIntA("system", "moveD", 8991, ini);
+    g_sys_cfg.startframe = GetPrivateProfileIntA("system", "startframe", 1, ini);
+    g_sys_cfg.shiftselect = GetPrivateProfileIntA("system", "shiftselect", 1, ini);
+    g_sys_cfg.dragdropactive = GetPrivateProfileIntA("system", "dragdropactive", 1, ini);
+    g_sys_cfg.movieplaymain = GetPrivateProfileIntA("system", "movieplaymain", 0, ini);
+    g_sys_cfg.trackbarclick = GetPrivateProfileIntA("system", "trackbarclick", 1, ini);
+
+    page_sz = abs(g_sys_cfg.moveA);
+    if (page_sz < 1)
+        page_sz = 1;
+    if (g_hwnd_trackbar && IsWindow(g_hwnd_trackbar))
+    {
+        SendMessageA(g_hwnd_trackbar, TBM_SETPAGESIZE, 0, page_sz);
+    }
+
+    if (main_hwnd && IsWindow(main_hwnd))
+    {
+        if (g_sys_cfg.movieplaymain != 0 && !g_hwnd_btn_play)
+        {
+            g_hwnd_btn_play = create_aviutl_button(main_hwnd, g_hinst, IDC_AVIUTL_BTN_PLAY,
+                                                   g_icon_play, 9005, 1);
+        }
+        else if (g_sys_cfg.movieplaymain == 0 && g_hwnd_btn_play)
+        {
+            DestroyWindow(g_hwnd_btn_play);
+            g_hwnd_btn_play = NULL;
+        }
+        preview_on_size(main_hwnd, g_cur_ep);
+    }
 }
 
 HWND preview_get_trackbar_hwnd(void)

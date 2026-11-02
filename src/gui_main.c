@@ -3,16 +3,21 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <objbase.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "preview.h"
 #include "i18n.h"
+#include "aviutl_dlg.h"
 #include "editp.h"
 #include "exfunc.h"
 #include "yc48_convert.h"
 #include "plugin_manager.h"
 #include "plugin_bridge.h"
+#include "color_plugin.h"
+#include "input_plugin.h"
 #include "video_export.h"
 #include "debug_console.h"
 
@@ -23,11 +28,10 @@
 #define AVIUTL_CLASS_STYLE (CS_VREDRAW | CS_HREDRAW | CS_DBLCLKS | CS_BYTEALIGNCLIENT)
 #define AVIUTL_WIN_STYLE (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN)
 
-#define IDC_LANG_EN 40001
-#define IDC_LANG_JA 40002
 #define IDC_NEW_EXEDIT_720P 40010
 #define IDC_NEW_EXEDIT_1080 40011
 #define IDC_TOGGLE_CONSOLE 40020
+#define MRU_MAX_FILES 8
 
 #define PLAY_TIMER_ID 1
 #define AUDIO_PLAY_BUF_COUNT 4
@@ -35,8 +39,7 @@
 
 static const char *CLASS_NAME = "AviUtl";
 static const char *IDLE_TITLE = "AviUtl";
-
-HMENU reaviutl_build_menu(int lang);
+static int g_priority_cmd = 1039;
 
 static EDITP *g_editp = NULL;
 static unsigned char *g_preview_bgr = NULL;
@@ -64,7 +67,7 @@ static int g_play_audio_rate = 44100;
 static int g_play_audio_ch = 2;
 static DWORD g_play_start_tick = 0;
 
-// shift-jis (CP932) to UTF-16 helper
+// shift-jis (CP932) <-> UTF-16 helpers
 static void sjis_to_wide_str(const char *src, wchar_t *dst, int dst_cch)
 {
     if (!dst || dst_cch <= 0)
@@ -75,6 +78,135 @@ static void sjis_to_wide_str(const char *src, wchar_t *dst, int dst_cch)
     if (MultiByteToWideChar(932, 0, src, -1, dst, dst_cch) > 0)
         return;
     MultiByteToWideChar(CP_ACP, 0, src, -1, dst, dst_cch);
+}
+
+static void wide_to_sjis_str(const wchar_t *src, char *dst, int dst_cap)
+{
+    if (!dst || dst_cap <= 0)
+        return;
+    dst[0] = '\0';
+    if (!src || !src[0])
+        return;
+    if (WideCharToMultiByte(932, 0, src, -1, dst, dst_cap, NULL, NULL) > 0)
+        return;
+    WideCharToMultiByte(CP_ACP, 0, src, -1, dst, dst_cap, NULL, NULL);
+}
+
+static void get_aviutl_ini_path(char *out_path, size_t out_sz)
+{
+    char mod_path[MAX_PATH];
+    char *slash;
+    if (GetModuleFileNameA(NULL, mod_path, MAX_PATH) > 0)
+    {
+        slash = strrchr(mod_path, '\\');
+        if (slash)
+            *(slash + 1) = '\0';
+        else
+            mod_path[0] = '\0';
+        _snprintf(out_path, out_sz, "%saviutl.ini", mod_path);
+        out_path[out_sz - 1] = '\0';
+    }
+    else
+    {
+        lstrcpynA(out_path, ".\\aviutl.ini", (int)out_sz);
+    }
+}
+
+static void ini_write_int(const char *section, const char *key, int val, const char *ini_path)
+{
+    char buf[32];
+    wsprintfA(buf, "%d", val);
+    WritePrivateProfileStringA(section, key, buf, ini_path);
+}
+
+static void apply_priority_command(int cmd_id, BOOL save_ini)
+{
+    DWORD cls = NORMAL_PRIORITY_CLASS;
+    switch (cmd_id)
+    {
+    case 1037:
+        cls = IDLE_PRIORITY_CLASS;
+        break;
+    case 1038:
+        cls = BELOW_NORMAL_PRIORITY_CLASS;
+        break;
+    case 1039:
+        cls = NORMAL_PRIORITY_CLASS;
+        break;
+    case 1040:
+        cls = ABOVE_NORMAL_PRIORITY_CLASS;
+        break;
+    case 1041:
+        cls = HIGH_PRIORITY_CLASS;
+        break;
+    case 1042:
+        cls = REALTIME_PRIORITY_CLASS;
+        break;
+    default:
+        cmd_id = 1039;
+        cls = NORMAL_PRIORITY_CLASS;
+        break;
+    }
+    g_priority_cmd = cmd_id;
+    SetPriorityClass(GetCurrentProcess(), cls);
+    if (save_ini)
+    {
+        char ini[MAX_PATH];
+        get_aviutl_ini_path(ini, sizeof(ini));
+        ini_write_int("system", "priority", cmd_id - 1037, ini);
+    }
+}
+
+static void mru_record_file(const char *path)
+{
+    char ini[MAX_PATH];
+    char abs_path[MAX_PATH];
+    char entries[MRU_MAX_FILES][MAX_PATH];
+    int count = 0, i;
+    const char *ext;
+
+    if (!path || !path[0])
+        return;
+    ext = strrchr(path, '.');
+    if (ext && lstrcmpiA(ext, ".exedit") == 0)
+        return;
+
+    if (GetFullPathNameA(path, MAX_PATH, abs_path, NULL) == 0)
+    {
+        lstrcpynA(abs_path, path, MAX_PATH);
+    }
+    get_aviutl_ini_path(ini, sizeof(ini));
+
+    lstrcpynA(entries[count++], abs_path, MAX_PATH);
+    for (i = 0; i < MRU_MAX_FILES && count < MRU_MAX_FILES; i++)
+    {
+        char key[16], cur[MAX_PATH];
+        wsprintfA(key, "file%d", i);
+        GetPrivateProfileStringA("recent", key, "", cur, MAX_PATH, ini);
+        if (cur[0] && lstrcmpiA(cur, abs_path) != 0)
+        {
+            lstrcpynA(entries[count++], cur, MAX_PATH);
+        }
+    }
+    for (i = 0; i < MRU_MAX_FILES; i++)
+    {
+        char key[16];
+        wsprintfA(key, "file%d", i);
+        WritePrivateProfileStringA("recent", key, (i < count) ? entries[i] : "", ini);
+    }
+}
+
+static void mru_clear_files(void)
+{
+    char ini[MAX_PATH];
+    int i;
+    get_aviutl_ini_path(ini, sizeof(ini));
+    for (i = 0; i < MRU_MAX_FILES; i++)
+    {
+        char key[16];
+        wsprintfA(key, "file%d", i);
+        WritePrivateProfileStringA("recent", key, "", ini);
+    }
 }
 
 // DBCS-aware path basename (0x0042c3d0)
@@ -334,114 +466,238 @@ static void cb_export_progress(HWND hwnd, int now, int total)
     SetWindowTextW(hwnd, wtitle);
 }
 
-// populate aviutl's dynamic 5395 (Plugin Output), 8005 (Profile), and 10998 (Filter Windows) menu slots
-static void populate_aviutl_dynamic_slots(HMENU bar, BOOL is_ja)
+static void cleanup_menu_separators(HMENU sub)
 {
-    HMENU prof_sub = GetSubMenu(bar, 4); // プロファイル / Profile
-    HMENU view_sub = GetSubMenu(bar, 5); // 表示 / View
+    int i;
+    BOOL prev_sep = TRUE;
 
-    video_export_populate_menu(bar, is_ja);
-
-    if (prof_sub)
+    if (!sub)
+        return;
+    for (i = 0; i < GetMenuItemCount(sub);)
     {
-        ModifyMenuW(prof_sub, 8005, MF_BYCOMMAND | MF_STRING | MF_CHECKED, 8005,
-                    is_ja ? L"\x6a19\x6e96\x30d7\x30ed\x30d5\x30a1\x30a4\x30eb" : L"Standard");
-    }
-
-    if (view_sub)
-    {
-        int pos = -1, cnt = GetMenuItemCount(view_sub), i;
-        for (i = 0; i < cnt; i++)
+        MENUITEMINFOW mii;
+        ZeroMemory(&mii, sizeof(mii));
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_FTYPE;
+        if (GetMenuItemInfoW(sub, (UINT)i, TRUE, &mii) && (mii.fType & MFT_SEPARATOR))
         {
-            if (GetMenuItemID(view_sub, i) == 10998)
+            if (prev_sep || i == GetMenuItemCount(sub) - 1)
             {
-                pos = i;
-                break;
+                DeleteMenu(sub, (UINT)i, MF_BYPOSITION);
+                continue;
             }
+            prev_sep = TRUE;
         }
-        if (pos >= 0)
+        else
         {
-            int fcount = plugin_manager_get_count();
-            DeleteMenu(view_sub, pos, MF_BYPOSITION);
-            for (i = 0; i < fcount; i++)
-            {
-                int flags = plugin_manager_get_flags(i);
-                const char *nm = plugin_manager_get_name(i);
-                HWND fhwnd = plugin_manager_get_window(i);
-                wchar_t wnm[256], witem[300];
-                UINT ufl = MF_BYPOSITION | MF_STRING;
-
-                if (flags & FILTER_FLAG_NO_CONFIG)
-                    continue;
-                sjis_to_wide_str(nm ? nm : "Filter", wnm, 256);
-                if (is_ja)
-                    wsprintfW(witem, L"%s\x306e\x8868\x793a", wnm);
-                else
-                    wsprintfW(witem, L"Show %s", wnm);
-
-                if ((flags & FILTER_FLAG_WINDOW_DISP) || (fhwnd && IsWindowVisible(fhwnd)))
-                {
-                    ufl |= MF_CHECKED;
-                }
-                InsertMenuW(view_sub, pos++, ufl, (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), witem);
-            }
-            InsertMenuW(view_sub, pos++, MF_BYPOSITION | MF_STRING | (debug_console_is_visible() ? MF_CHECKED : 0),
-                        IDC_TOGGLE_CONSOLE,
-                        is_ja ? L"\x30c7\x30d0\x30c3\x30b0\x30b3\x30f3\x30bd\x30fc\x30eb\x306e\x8868\x793a"
-                              : L"Show Debug Console");
-            InsertMenuW(view_sub, pos, MF_BYPOSITION | MF_STRING, 111,
-                        is_ja ? L"\x30a6\x30a3\x30f3\x30c9\x30a6\x306e\x4f4d\x7f6e\x3092\x521d\x671f\x5316"
-                              : L"Reset Window Positions");
+            prev_sep = FALSE;
+        }
+        i++;
+    }
+    while (GetMenuItemCount(sub) > 0)
+    {
+        int last = GetMenuItemCount(sub) - 1;
+        MENUITEMINFOW mii;
+        ZeroMemory(&mii, sizeof(mii));
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_FTYPE;
+        if (GetMenuItemInfoW(sub, (UINT)last, TRUE, &mii) && (mii.fType & MFT_SEPARATOR))
+        {
+            DeleteMenu(sub, (UINT)last, MF_BYPOSITION);
+        }
+        else
+        {
+            break;
         }
     }
 }
 
+// 0x0042c930 & 0x00423330: populate stock "AVIUTL" menu bar
 static void apply_menu(HWND hwnd)
 {
-    BOOL is_ja = (i18n_get_lang() == LANG_JA);
-    HMENU bar = reaviutl_build_menu((int)i18n_get_lang());
-    HMENU file_sub;
+    HMENU bar = i18n_load_menu("AVIUTL");
+    HMENU file_sub, flt_sub, set_sub, edit_sub, prof_sub, view_sub;
+    const wchar_t *w_none = i18n_get_wstr(12);
+    const wchar_t *w_default = i18n_get_wstr(10);
+    const wchar_t *w_cfg_suffix = i18n_get_wstr(107);
+    const wchar_t *w_disp_suffix = i18n_get_wstr(108);
+    int i, fcount, mcount;
 
-    populate_aviutl_dynamic_slots(bar, is_ja);
+    if (!bar)
+        return;
 
     file_sub = GetSubMenu(bar, 0);
-    if (file_sub)
+    flt_sub = GetSubMenu(bar, 1);
+    set_sub = GetSubMenu(bar, 2);
+    edit_sub = GetSubMenu(bar, 3);
+    prof_sub = GetSubMenu(bar, 4);
+    view_sub = GetSubMenu(bar, 5);
+
+    // [ファイル] -> [プラグイン出力] (5395)
+    video_export_populate_menu(bar, w_none[0] ? w_none : L"\x306a\x3057");
+
+    // [ファイル] -> [最近使ったファイル] (5596..5603)
     {
-        if (is_ja)
+        char ini[MAX_PATH];
+        int added_mru = 0;
+        get_aviutl_ini_path(ini, sizeof(ini));
+        for (i = 0; i < MRU_MAX_FILES; i++)
         {
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_STRING, IDC_NEW_EXEDIT_1080,
-                        L"\x65b0\x898f\x62e1\x5f35\x7de8\x96c6\x30d7\x30ed\x30b8\x30a7\x30af\x30c8 (1920x1080 30fps)");
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_STRING, IDC_NEW_EXEDIT_720P,
-                        L"\x65b0\x898f\x62e1\x5f35\x7de8\x96c6\x30d7\x30ed\x30b8\x30a7\x30af\x30c8 (1280x720 30fps)");
+            char key[16], mpath[MAX_PATH];
+            wchar_t wmpath[MAX_PATH], wlabel[MAX_PATH + 16];
+            wsprintfA(key, "file%d", i);
+            GetPrivateProfileStringA("recent", key, "", mpath, MAX_PATH, ini);
+            if (!mpath[0])
+                continue;
+            sjis_to_wide_str(mpath, wmpath, MAX_PATH);
+            wsprintfW(wlabel, L"&%d %s", added_mru + 1, wmpath);
+            InsertMenuW(bar, 5596, MF_BYCOMMAND | MF_STRING,
+                        (UINT_PTR)(5596 + added_mru), wlabel);
+            added_mru++;
+        }
+        if (added_mru > 0)
+        {
+            DeleteMenu(bar, 5596, MF_BYCOMMAND);
         }
         else
         {
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_STRING, IDC_NEW_EXEDIT_1080,
-                        L"New ExEdit Project (1920x1080 30fps)");
-            InsertMenuW(file_sub, 0, MF_BYPOSITION | MF_STRING, IDC_NEW_EXEDIT_720P,
-                        L"New ExEdit Project (1280x720 30fps)");
+            ModifyMenuW(bar, 5596, MF_BYCOMMAND | MF_STRING | MF_GRAYED,
+                        5596, w_none[0] ? w_none : L"\x306a\x3057");
         }
     }
 
-    // insert Plugins menu before Other/Help
+    // [ファイル] -> [環境設定] -> [優先度] (1037..1042) & [入力プラグインの設定] (5595)
+    CheckMenuRadioItem(bar, 1037, 1042, (UINT)g_priority_cmd, MF_BYCOMMAND);
     {
-        HMENU filters = plugin_manager_build_menu();
-        const wchar_t *filters_label = is_ja ? L"\x30d7\x30e9\x30b0\x30a4\x30f3" : L"Plugins";
-        int insert_pos = GetMenuItemCount(bar) - 1;
-        if (insert_pos < 0)
-            insert_pos = 0;
-        InsertMenuW(bar, insert_pos, MF_BYPOSITION | MF_POPUP,
-                    (UINT_PTR)filters, filters_label);
+        int icount = input_plugin_get_count();
+        int added_inp = 0;
+        for (i = 0; i < icount; i++)
+        {
+            InputPluginSummary isum;
+            wchar_t wnm[256];
+            if (!input_plugin_get_summary(i, &isum) || !isum.has_config)
+                continue;
+            sjis_to_wide_str(isum.name[0] ? isum.name : "Input", wnm, 256);
+            InsertMenuW(bar, 5595, MF_BYCOMMAND | MF_STRING,
+                        (UINT_PTR)(INPUT_PLUGIN_CMD_CFG_BASE + i), wnm);
+            added_inp++;
+        }
+        if (added_inp > 0)
+        {
+            DeleteMenu(bar, 5595, MF_BYCOMMAND);
+        }
+        else
+        {
+            ModifyMenuW(bar, 5595, MF_BYCOMMAND | MF_STRING | MF_GRAYED,
+                        5595, w_none[0] ? w_none : L"\x306a\x3057");
+        }
     }
 
-    // append Language submenu
+    // [フィルタ], [設定], [表示], [インポート], [エクスポート]
+    fcount = plugin_manager_get_count();
+    for (i = 0; i < fcount; i++)
     {
-        HMENU lang = CreatePopupMenu();
-        AppendMenuW(lang, MF_STRING, IDC_LANG_EN, TW(STR_MENU_LANG_EN));
-        AppendMenuW(lang, MF_STRING, IDC_LANG_JA, TW(STR_MENU_LANG_JA));
-        AppendMenuW(bar, MF_POPUP, (UINT_PTR)lang, TW(STR_MENU_LANGUAGE));
+        int flags = plugin_manager_get_flags(i);
+        const char *nm = plugin_manager_get_name(i);
+        HWND fhwnd = plugin_manager_get_window(i);
+        wchar_t wnm[256], witem[300];
+        BOOL is_audio = (flags & FILTER_FLAG_AUDIO_FILTER) != 0;
+        BOOL is_disp = (flags & FILTER_FLAG_DISP_FILTER) != 0;
+
+        sjis_to_wide_str((nm && nm[0]) ? nm : "Filter", wnm, 256);
+
+        if (!(flags & FILTER_FLAG_ALWAYS_ACTIVE) && !is_disp)
+        {
+            UINT ufl = MF_BYCOMMAND | MF_STRING |
+                       ((flags & FILTER_FLAG_ACTIVE) ? MF_CHECKED : MF_UNCHECKED);
+            InsertMenuW(bar, is_audio ? 10999u : 10000u, ufl,
+                        (UINT_PTR)(PLUGIN_CMD_TOGGLE_BASE + i), wnm);
+        }
+
+        if (!(flags & FILTER_FLAG_NO_CONFIG))
+        {
+            BOOL vis = ((flags & FILTER_FLAG_WINDOW_DISP) != 0) ||
+                       (fhwnd && IsWindowVisible(fhwnd));
+            UINT ufl = MF_BYCOMMAND | MF_STRING | (vis ? MF_CHECKED : MF_UNCHECKED);
+            if (is_disp)
+            {
+                wsprintfW(witem, L"%s%s", wnm, w_disp_suffix);
+                InsertMenuW(bar, 10998u, ufl,
+                            (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), witem);
+            }
+            else
+            {
+                wsprintfW(witem, L"%s%s", wnm, w_cfg_suffix);
+                InsertMenuW(bar, is_audio ? 11999u : 11000u, ufl,
+                            (UINT_PTR)(PLUGIN_CMD_WINDOW_BASE + i), witem);
+            }
+        }
+
+        if (flags & FILTER_FLAG_IMPORT)
+        {
+            InsertMenuW(bar, 14000u, MF_BYCOMMAND | MF_STRING,
+                        (UINT_PTR)(PLUGIN_CMD_IMPORT_BASE + i), wnm);
+        }
+        if (flags & FILTER_FLAG_EXPORT)
+        {
+            InsertMenuW(bar, 15000u, MF_BYCOMMAND | MF_STRING,
+                        (UINT_PTR)(PLUGIN_CMD_EXPORT_BASE + i), wnm);
+        }
+    }
+
+    DeleteMenu(bar, 10000, MF_BYCOMMAND);
+    DeleteMenu(bar, 10999, MF_BYCOMMAND);
+    DeleteMenu(bar, 11000, MF_BYCOMMAND);
+    DeleteMenu(bar, 11999, MF_BYCOMMAND);
+    DeleteMenu(bar, 11998, MF_BYCOMMAND);
+    DeleteMenu(bar, 10998, MF_BYCOMMAND);
+    DeleteMenu(bar, 14000, MF_BYCOMMAND);
+    DeleteMenu(bar, 15000, MF_BYCOMMAND);
+
+    cleanup_menu_separators(file_sub);
+    cleanup_menu_separators(flt_sub);
+    cleanup_menu_separators(set_sub);
+    cleanup_menu_separators(view_sub);
+
+    // [編集] -> plugin add_menu_item submenus (0x00423330)
+    mcount = plugin_manager_get_menu_item_count();
+    if (edit_sub && mcount > 0)
+    {
+        BOOL sep_added = FALSE;
+        for (i = 0; i < fcount; i++)
+        {
+            HMENU fsub = NULL;
+            int m;
+            for (m = 0; m < mcount; m++)
+            {
+                PluginMenuItem it;
+                wchar_t wlabel[256];
+                if (!plugin_manager_get_menu_item(m, &it) || it.filter_index != i)
+                    continue;
+                if (!fsub)
+                {
+                    wchar_t wfn[256];
+                    const char *fn = plugin_manager_get_name(i);
+                    sjis_to_wide_str((fn && fn[0]) ? fn : "Plugin", wfn, 256);
+                    fsub = CreatePopupMenu();
+                    if (!sep_added)
+                    {
+                        AppendMenuW(edit_sub, MF_SEPARATOR, 0, NULL);
+                        sep_added = TRUE;
+                    }
+                    AppendMenuW(edit_sub, MF_POPUP, (UINT_PTR)fsub, wfn);
+                }
+                sjis_to_wide_str(it.name, wlabel, 256);
+                AppendMenuW(fsub, MF_STRING, (UINT_PTR)(PLUGIN_CMD_MENU_ITEM_BASE + m), wlabel);
+            }
+        }
+    }
+
+    // [プロファイル] -> 8005 ("デフォルト")
+    if (prof_sub)
+    {
+        ModifyMenuW(prof_sub, 8005, MF_BYCOMMAND | MF_STRING | MF_CHECKED,
+                    8005, w_default[0] ? w_default : L"\x30c7\x30d5\x30a9\x30eb\x30c8");
     }
 
     {
@@ -580,9 +836,16 @@ static void shutdown_main_window(HWND hwnd)
     debug_console_shutdown();
     // persist [window] geometry & view flags while main window is still live (0x004614a0)
     preview_save_ini(hwnd);
+    if (g_editp && editp_is_editing(g_editp))
+    {
+        plugin_manager_notify_file_close(g_editp);
+        editp_close_video(g_editp);
+    }
     // shut down plugins BEFORE DestroyWindow(hwnd) so owned plugin windows remain valid during WM_FILTER_EXIT when exedit calls GetWindowRect() to save its own layout
     video_export_shutdown();
     plugin_manager_shutdown();
+    input_plugin_shutdown();
+    color_plugin_shutdown();
     DestroyWindow(hwnd);
 }
 
@@ -597,7 +860,9 @@ static void handle_debug_console_command(HWND hwnd, const char *raw_cmd)
         dbg_info("  help             Show this command reference");
         dbg_info("  status           Dump EDITP handle, ABI fields, timeline & media state");
         dbg_info("  plugins          Dump loaded .auf modules, HMODULE base, FILTER*, HWND & flags");
+        dbg_info("  auis             List registered input plugins (.aui & built-ins) by priority");
         dbg_info("  auos             List discovered .auo output plugins");
+        dbg_info("  aucs             List registered color conversion plugins (.auc & built-ins)");
         dbg_info("  menus            List registered plugin add_menu_item shortcuts");
         dbg_info("  cmd <flt> <id>   Send WM_FILTER_COMMAND <id> to filter index <flt>");
         dbg_info("  show <flt>       Show filter window <flt>");
@@ -616,6 +881,45 @@ static void handle_debug_console_command(HWND hwnd, const char *raw_cmd)
     if (lstrcmpiA(raw_cmd, "plugins") == 0)
     {
         plugin_manager_debug_dump();
+        return;
+    }
+
+    if (lstrcmpiA(raw_cmd, "auis") == 0)
+    {
+        int order[INPUT_PLUGIN_MAX];
+        int i, n = input_plugin_get_priority_order(order, INPUT_PLUGIN_MAX, TRUE);
+        dbg_plugin("input plugins (.aui + built-ins): %d", n);
+        for (i = 0; i < n; i++)
+        {
+            InputPluginSummary sum;
+            if (input_plugin_get_summary(order[i], &sum))
+            {
+                dbg_plugin("  [#%d idx=%d prio=%d] '%s' %s%s(cfg=%d flag=0x%X) info='%s'",
+                           i, order[i], sum.priority, sum.name,
+                           (sum.flag & INPUT_PLUGIN_FLAG_BUILTIN) ? "[built-in] " : "",
+                           sum.bridged_x86 ? "[x86 Bridge] " : "",
+                           sum.has_config ? 1 : 0, (unsigned)sum.flag, sum.information);
+            }
+        }
+        return;
+    }
+
+    if (lstrcmpiA(raw_cmd, "aucs") == 0)
+    {
+        int i, n = color_plugin_get_count();
+        dbg_plugin("color plugins (.auc + built-ins): %d", n);
+        for (i = 0; i < n; i++)
+        {
+            ColorPluginSummary sum;
+            if (color_plugin_get_summary(i, &sum))
+            {
+                dbg_plugin("  [%d] '%s' %s%s(flag=0x%X) info='%s'",
+                           i, sum.name,
+                           (sum.flag & COLOR_PLUGIN_FLAG_BUILTIN) ? "[built-in] " : "",
+                           sum.bridged_x86 ? "[x86 Bridge] " : "",
+                           (unsigned)sum.flag, sum.information);
+            }
+        }
         return;
     }
 
@@ -860,13 +1164,13 @@ static BOOL open_media_or_exo(HWND hwnd, const char *path)
         }
         if (!plugin_manager_load_aup(path, g_editp))
         {
-            char msg[MAX_PATH + 128];
-            wsprintfA(msg, "Failed to open AviUtl project (.aup):\n%s", path);
-            MessageBoxA(hwnd, msg, "AviUtl", MB_OK | MB_ICONWARNING);
+            aviutl_msgbox_w(hwnd, i18n_get_wstr(1000), L"AviUtl", MB_OK | MB_ICONWARNING);
             return FALSE;
         }
         g_last_auto_w = 0;
         g_last_auto_h = 0;
+        mru_record_file(path);
+        apply_menu(hwnd);
         refresh_current_frame(hwnd);
         return TRUE;
     }
@@ -889,14 +1193,14 @@ static BOOL open_media_or_exo(HWND hwnd, const char *path)
 
     if (!editp_open_video(g_editp, path))
     {
-        char msg[MAX_PATH + 128];
-        wsprintfA(msg, "Failed to open media/project:\n%s", path);
-        MessageBoxA(hwnd, msg, "AviUtl", MB_OK | MB_ICONWARNING);
+        aviutl_msgbox_w(hwnd, i18n_get_wstr(1038), L"AviUtl", MB_OK | MB_ICONWARNING);
         return FALSE;
     }
 
     g_last_auto_w = 0;
     g_last_auto_h = 0;
+    mru_record_file(path);
+    apply_menu(hwnd);
     plugin_manager_notify_file_open(g_editp);
     refresh_current_frame(hwnd);
     return TRUE;
@@ -906,20 +1210,44 @@ void reaviutl_file_open(HWND owner)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH] = {0};
-    static const char filter[] =
-        "Supported Media (*.aup;*.avi;*.mp3;*.wav;*.png;*.jpg;*.bmp;*.exo)\0"
-        "*.aup;*.avi;*.mp3;*.wav;*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.exo\0"
-        "AviUtl Project (*.aup)\0*.aup\0"
-        "ExEdit Object (*.exo)\0*.exo\0"
-        "Video (*.avi)\0*.avi\0"
-        "Audio (*.mp3;*.wav)\0*.mp3;*.wav\0"
-        "Image (*.bmp;*.jpg;*.png;*.gif)\0*.bmp;*.jpg;*.jpeg;*.png;*.gif\0"
-        "All Files (*.*)\0*.*\0";
+    char flt_buf[4096];
+    const char *base_flt = input_plugin_get_file_filter(0);
+    int p = 0;
+
+    memset(flt_buf, 0, sizeof(flt_buf));
+    if (base_flt && base_flt[0])
+    {
+        int l1 = (int)strlen(base_flt);
+        int l2 = (int)strlen(base_flt + l1 + 1);
+        if (l1 > 0 && l2 > 0 && l1 + l2 + 128 < (int)sizeof(flt_buf))
+        {
+            p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo)", base_flt);
+            if (p > 0 && p >= 13 && flt_buf[p - 12] == ')')
+            {
+                // replace trailing ')' from "VideoFile (...)" before ";*.aup;*.exo)"
+                memmove(flt_buf + p - 12, flt_buf + p - 11, 12);
+                p--;
+            }
+            p++;
+            p += _snprintf(flt_buf + p, 1900, "%s;*.aup;*.exo", base_flt + l1 + 1);
+            p++;
+        }
+    }
+    if (p == 0)
+    {
+        memcpy(flt_buf, "VideoFile (*.*)\0*.*\0", 20);
+        p = 20;
+    }
+    memcpy(flt_buf + p,
+           "AviUtl Project (*.aup)\0*.aup\0"
+           "ExEdit Object (*.exo)\0*.exo\0"
+           "AllFile (*.*)\0*.*\0\0",
+           76);
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
-    ofn.lpstrFilter = filter;
+    ofn.lpstrFilter = flt_buf;
     ofn.nFilterIndex = 1;
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file);
@@ -935,9 +1263,7 @@ static void reaviutl_audio_open(HWND owner)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH] = {0};
-    static const char filter[] =
-        "Audio Files (*.mp3;*.wav;*.avi)\0*.mp3;*.wav;*.avi\0"
-        "All Files (*.*)\0*.*\0";
+    const char *filter = input_plugin_get_file_filter(1);
 
     if (!g_editp)
         return;
@@ -1258,15 +1584,723 @@ static void reset_window_positions(HWND hwnd)
     }
 }
 
+// 0x00404b60: Browse button handler inside SYSTEM dialog (108)
+static BOOL on_system_dlg_cmd(HWND hdlg, int cmd_id, AviUtlDlgState *st, void *user)
+{
+    (void)user;
+    if (cmd_id == 32301) // 0x7e2d: browse folder for defaultsavefile
+    {
+        BROWSEINFOW bi;
+        LPITEMIDLIST pidl;
+        wchar_t dir[MAX_PATH];
+
+        dir[0] = L'\0';
+        ZeroMemory(&bi, sizeof(bi));
+        bi.hwndOwner = hdlg;
+        bi.ulFlags = BIF_RETURNONLYFSDIRS;
+        pidl = SHBrowseForFolderW(&bi);
+        if (pidl)
+        {
+            if (SHGetPathFromIDListW(pidl, dir) && dir[0])
+            {
+                int len = lstrlenW(dir);
+                if (len > 0 && dir[len - 1] != L'\\' && len + 2 < MAX_PATH)
+                {
+                    dir[len] = L'\\';
+                    dir[len + 1] = L'\0';
+                }
+                lstrcpynW(st->strs[1], dir, 260);
+                SetDlgItemTextW(hdlg, 32101, st->strs[1]);
+            }
+            CoTaskMemFree(pidl);
+        }
+    }
+    else if (cmd_id == 32302) // 0x7e2e: browse WAV for finishsound
+    {
+        OPENFILENAMEW ofn;
+        wchar_t file[MAX_PATH];
+        static const wchar_t filter[] = L"Wave File (*.wav)\0*.wav\0All Files (*.*)\0*.*\0";
+
+        lstrcpynW(file, st->strs[2], MAX_PATH);
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hdlg;
+        ofn.lpstrFilter = filter;
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameW(&ofn))
+        {
+            lstrcpynW(st->strs[2], file, 260);
+            SetDlgItemTextW(hdlg, 32102, st->strs[2]);
+        }
+    }
+    return TRUE;
+}
+
+// 0x00405450 case 0x6c (108): System Settings ("SYSTEM") dialog
+static void run_system_settings_dialog(HWND owner)
+{
+    AviUtlDlgState st;
+    char ini[MAX_PATH];
+    char sbuf[260];
+
+    get_aviutl_ini_path(ini, sizeof(ini));
+    aviutl_dlg_init(&st);
+    st.on_cmd = on_system_dlg_cmd;
+
+    st.ints[0] = GetPrivateProfileIntA("system", "width", REAVIUTL_VRAM_W, ini);
+    st.ints[1] = GetPrivateProfileIntA("system", "height", REAVIUTL_VRAM_H, ini);
+    st.ints[2] = GetPrivateProfileIntA("system", "frame", REAVIUTL_MAX_FRAME, ini);
+    st.ints[3] = GetPrivateProfileIntA("system", "sharecache", 32, ini);
+    st.ints[5] = GetPrivateProfileIntA("system", "moveA", 5, ini);
+    st.ints[6] = GetPrivateProfileIntA("system", "moveB", 30, ini);
+    st.ints[7] = GetPrivateProfileIntA("system", "moveC", 899, ini);
+    st.ints[8] = GetPrivateProfileIntA("system", "moveD", 8991, ini);
+    st.ints[9] = GetPrivateProfileIntA("system", "saveunitsize", 64, ini);
+    st.ints[10] = GetPrivateProfileIntA("system", "multithread", 0, ini);
+
+    GetPrivateProfileStringA("system", "defaultsavefile", "", sbuf, sizeof(sbuf), ini);
+    aviutl_dlg_set_str_sjis(&st, 1, sbuf);
+    GetPrivateProfileStringA("system", "finishsound", "", sbuf, sizeof(sbuf), ini);
+    aviutl_dlg_set_str_sjis(&st, 2, sbuf);
+    GetPrivateProfileStringA("system", "resizelist",
+                             "640x480,352x480,352x240,320x240", sbuf, sizeof(sbuf), ini);
+    aviutl_dlg_set_str_sjis(&st, 3, sbuf);
+    GetPrivateProfileStringA("system", "fpslist",
+                             "29.97,23.976,24,15,10", sbuf, sizeof(sbuf), ini);
+    aviutl_dlg_set_str_sjis(&st, 4, sbuf);
+
+    st.checks[1] = GetPrivateProfileIntA("system", "compprofile", 1, ini) ? 1 : 0;
+    st.checks[2] = GetPrivateProfileIntA("system", "plugincache", 0, ini) ? 1 : 0;
+    st.checks[3] = GetPrivateProfileIntA("system", "startframe", 1, ini) ? 1 : 0;
+    st.checks[4] = GetPrivateProfileIntA("system", "shiftselect", 1, ini) ? 1 : 0;
+    st.checks[5] = GetPrivateProfileIntA("system", "yuy2mode", 0, ini) ? 1 : 0;
+    st.checks[6] = GetPrivateProfileIntA("system", "sse", 1, ini) ? 1 : 0;
+    st.checks[7] = GetPrivateProfileIntA("system", "sse2", 1, ini) ? 1 : 0;
+    st.checks[8] = GetPrivateProfileIntA("system", "vfplugin", 1, ini) ? 1 : 0;
+    st.checks[9] = GetPrivateProfileIntA("system", "editresume", 0, ini) ? 1 : 0;
+    st.checks[10] = GetPrivateProfileIntA("system", "fpsnoconvert", 0, ini) ? 1 : 0;
+    st.checks[11] = GetPrivateProfileIntA("system", "tempconfig", 0, ini) ? 1 : 0;
+    st.checks[12] = GetPrivateProfileIntA("system", "load30fps", 0, ini) ? 1 : 0;
+    st.checks[13] = GetPrivateProfileIntA("system", "loadfpsadjust", 1, ini) ? 1 : 0;
+    st.checks[14] = GetPrivateProfileIntA("system", "yuy2limit", 1, ini) ? 1 : 0;
+    st.checks[15] = GetPrivateProfileIntA("system", "overwritecheck", 0, ini) ? 1 : 0;
+    st.checks[17] = GetPrivateProfileIntA("system", "threadcpuseparate", 0, ini) ? 1 : 0;
+    st.checks[18] = GetPrivateProfileIntA("system", "dragdropdialog", 0, ini) ? 1 : 0;
+    st.checks[19] = GetPrivateProfileIntA("system", "openprojectaup", 1, ini) ? 1 : 0;
+    st.checks[20] = GetPrivateProfileIntA("system", "closedialog", 0, ini) ? 1 : 0;
+    st.checks[21] = GetPrivateProfileIntA("system", "projectonfig", 0, ini) ? 1 : 0;
+    st.checks[22] = GetPrivateProfileIntA("system", "windowsnap", 1, ini) ? 1 : 0;
+    st.checks[23] = GetPrivateProfileIntA("system", "movieplaymain", 0, ini) ? 1 : 0;
+    st.checks[24] = GetPrivateProfileIntA("system", "dragdropactive", 1, ini) ? 1 : 0;
+    st.checks[25] = GetPrivateProfileIntA("system", "trackbarclick", 1, ini) ? 1 : 0;
+
+    if (aviutl_dlg_run(owner, "SYSTEM", &st) != IDOK)
+        return;
+
+    if (st.ints[10] < 0)
+        st.ints[10] = 0;
+    if (st.ints[10] > 64)
+        st.ints[10] = 64;
+
+    ini_write_int("system", "width", st.ints[0], ini);
+    ini_write_int("system", "height", st.ints[1], ini);
+    ini_write_int("system", "frame", st.ints[2], ini);
+    ini_write_int("system", "sharecache", st.ints[3], ini);
+    ini_write_int("system", "moveA", st.ints[5], ini);
+    ini_write_int("system", "moveB", st.ints[6], ini);
+    ini_write_int("system", "moveC", st.ints[7], ini);
+    ini_write_int("system", "moveD", st.ints[8], ini);
+    ini_write_int("system", "saveunitsize", st.ints[9], ini);
+    ini_write_int("system", "multithread", st.ints[10], ini);
+
+    ini_write_int("system", "compprofile", st.checks[1] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "plugincache", st.checks[2] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "startframe", st.checks[3] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "shiftselect", st.checks[4] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "yuy2mode", st.checks[5] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "sse", st.checks[6] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "sse2", st.checks[7] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "vfplugin", st.checks[8] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "editresume", st.checks[9] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "fpsnoconvert", st.checks[10] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "tempconfig", st.checks[11] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "load30fps", st.checks[12] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "loadfpsadjust", st.checks[13] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "yuy2limit", st.checks[14] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "overwritecheck", st.checks[15] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "threadcpuseparate", st.checks[17] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "dragdropdialog", st.checks[18] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "openprojectaup", st.checks[19] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "closedialog", st.checks[20] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "projectonfig", st.checks[21] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "windowsnap", st.checks[22] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "movieplaymain", st.checks[23] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "dragdropactive", st.checks[24] > 0 ? 1 : 0, ini);
+    ini_write_int("system", "trackbarclick", st.checks[25] > 0 ? 1 : 0, ini);
+
+    aviutl_dlg_get_str_sjis(&st, 1, sbuf, sizeof(sbuf));
+    WritePrivateProfileStringA("system", "defaultsavefile", sbuf, ini);
+    aviutl_dlg_get_str_sjis(&st, 2, sbuf, sizeof(sbuf));
+    WritePrivateProfileStringA("system", "finishsound", sbuf, ini);
+    aviutl_dlg_get_str_sjis(&st, 3, sbuf, sizeof(sbuf));
+    WritePrivateProfileStringA("system", "resizelist", sbuf, ini);
+    aviutl_dlg_get_str_sjis(&st, 4, sbuf, sizeof(sbuf));
+    WritePrivateProfileStringA("system", "fpslist", sbuf, ini);
+
+    preview_reload_sys_config(owner);
+    update_window_title(owner);
+    InvalidateRect(owner, NULL, FALSE);
+}
+
+static BOOL on_exout_dlg_cmd(HWND hdlg, int cmd_id, AviUtlDlgState *st, void *user)
+{
+    (void)user;
+    if (cmd_id == AVIUTL_DLG_CMD_INIT || cmd_id == 32500)
+    {
+        AuoPluginSummary sum;
+        BOOL en = FALSE;
+        if (st->combo_sel[0] >= 0 && video_export_get_auo_summary(st->combo_sel[0], &sum))
+        {
+            en = sum.has_config;
+        }
+        EnableWindow(GetDlgItem(hdlg, 32300), en);
+    }
+    else if (cmd_id == 32300) // "設定" button
+    {
+        if (st->combo_sel[0] >= 0)
+        {
+            video_export_auo_config_dialog(hdlg, st->combo_sel[0]);
+        }
+    }
+    return TRUE;
+}
+
+// 5399: Plugin Output Settings ("EXOUT") dialog
+static void run_exout_config_dialog(HWND owner)
+{
+    int count = video_export_get_auo_count();
+    wchar_t names[AUO_MAX_PLUGINS][256];
+    const wchar_t *ptrs[AUO_MAX_PLUGINS + 1];
+    AviUtlDlgState st;
+    int i, n = 0;
+
+    if (count <= 0)
+    {
+        aviutl_msgbox_w(owner, i18n_get_wstr(1026), L"AviUtl", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    for (i = 0; i < count && n < AUO_MAX_PLUGINS; i++)
+    {
+        AuoPluginSummary sum;
+        if (!video_export_get_auo_summary(i, &sum))
+            continue;
+        sjis_to_wide_str(sum.name, names[n], 256);
+        ptrs[n] = names[n];
+        n++;
+    }
+    ptrs[n] = NULL;
+    if (n <= 0)
+        return;
+
+    aviutl_dlg_init(&st);
+    st.combo_items[0] = ptrs;
+    st.combo_sel[0] = video_export_get_last_auo_index();
+    st.on_cmd = on_exout_dlg_cmd;
+
+    if (aviutl_dlg_run(owner, "EXOUT", &st) == IDOK && st.combo_sel[0] >= 0)
+    {
+        video_export_set_last_auo_index(st.combo_sel[0]);
+    }
+}
+
+// 5131: Jump to Frame ("MOVE") dialog (Ctrl+G)
+static void run_move_dialog(HWND owner)
+{
+    AviUtlDlgState st;
+    const AviUtlSystemConfig *scfg;
+    int sf;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    scfg = preview_get_sys_config();
+    sf = scfg ? scfg->startframe : 1;
+
+    aviutl_dlg_init(&st);
+    st.ints[0] = editp_get_frame(g_editp) + sf;
+    if (aviutl_dlg_run(owner, "MOVE", &st) == IDOK)
+    {
+        seek_to_frame_ex(owner, st.ints[0] - sf, FALSE);
+    }
+}
+
+// 5115: Specify Selection Range ("SELECT") dialog
+static void run_select_dialog(HWND owner)
+{
+    AviUtlDlgState st;
+    const AviUtlSystemConfig *scfg;
+    int sf, s = 0, e = 0, fn;
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+    fn = editp_get_frame_n(g_editp);
+    if (fn <= 0)
+        return;
+    scfg = preview_get_sys_config();
+    sf = scfg ? scfg->startframe : 1;
+
+    if (!editp_get_select_frame(g_editp, &s, &e) || s < 0 || e < s)
+    {
+        s = 0;
+        e = fn - 1;
+    }
+
+    aviutl_dlg_init(&st);
+    st.ints[0] = s + sf;
+    st.ints[1] = e + sf;
+    if (aviutl_dlg_run(owner, "SELECT", &st) == IDOK)
+    {
+        int ns = st.ints[0] - sf;
+        int ne = st.ints[1] - sf;
+        if (ns < 0)
+            ns = 0;
+        if (ne >= fn)
+            ne = fn - 1;
+        if (ns <= ne)
+        {
+            editp_set_select_frame(g_editp, ns, ne);
+            plugin_manager_notify_update(g_editp);
+            refresh_current_frame(owner);
+        }
+    }
+}
+
+// 5398: Change Playback Speed Info ("FILE_INFO") dialog
+static void run_playback_speed_dialog(HWND owner)
+{
+    AviUtlDlgState st;
+    int rate = 30, scale = 1, arate = 0, ach = 2;
+    double fps;
+    char buf[64];
+
+    if (!g_editp || !editp_is_editing(g_editp))
+        return;
+
+    editp_get_fps(g_editp, &rate, &scale);
+    if (rate <= 0)
+        rate = 30;
+    if (scale <= 0)
+        scale = 1;
+    fps = (double)rate / (double)scale;
+    arate = editp_get_audio_rate(g_editp);
+    ach = editp_get_audio_ch(g_editp);
+
+    aviutl_dlg_init(&st);
+    _snprintf(buf, sizeof(buf), "%.4f", fps);
+    buf[sizeof(buf) - 1] = '\0';
+    // trim trailing zeros after decimal
+    {
+        char *dot = strchr(buf, '.');
+        if (dot)
+        {
+            char *end = buf + strlen(buf) - 1;
+            while (end > dot && *end == '0')
+                *end-- = '\0';
+            if (end == dot)
+                *end = '\0';
+        }
+    }
+    aviutl_dlg_set_str_sjis(&st, 0, buf);
+    {
+        char disp_buf[64];
+        _snprintf(disp_buf, sizeof(disp_buf), "(%s fps)", buf);
+        disp_buf[sizeof(disp_buf) - 1] = '\0';
+        aviutl_dlg_set_str_sjis(&st, 2, disp_buf);
+    }
+
+    wsprintfA(buf, "%d", arate);
+    aviutl_dlg_set_str_sjis(&st, 1, buf);
+    wsprintfA(buf, "(%d Hz)", arate);
+    aviutl_dlg_set_str_sjis(&st, 3, buf);
+
+    if (aviutl_dlg_run(owner, "FILE_INFO", &st) == IDOK)
+    {
+        double nfps;
+        int narate;
+        aviutl_dlg_get_str_sjis(&st, 0, buf, sizeof(buf));
+        nfps = atof(buf);
+        if (nfps > 0.001 && nfps <= 10000.0)
+        {
+            // preserve exact NTSC rationals when close to 29.97 / 59.94 / 23.976
+            if (nfps > 29.969 && nfps < 29.971)
+                editp_set_fps(g_editp, 30000, 1001);
+            else if (nfps > 59.939 && nfps < 59.941)
+                editp_set_fps(g_editp, 60000, 1001);
+            else if (nfps > 23.975 && nfps < 23.977)
+                editp_set_fps(g_editp, 24000, 1001);
+            else
+                editp_set_fps(g_editp, (int)(nfps * 10000.0 + 0.5), 10000);
+        }
+        aviutl_dlg_get_str_sjis(&st, 1, buf, sizeof(buf));
+        narate = atoi(buf);
+        if (narate > 0 && editp_has_audio(g_editp))
+        {
+            editp_set_audio_format(g_editp, narate, ach > 0 ? ach : 2, TRUE);
+        }
+        plugin_manager_notify_update(g_editp);
+        refresh_current_frame(owner);
+    }
+}
+
+// 101: Filter Plugin Information (0x00405450 case 0x65)
+static void show_filter_plugin_info(HWND owner)
+{
+    wchar_t buf[8192];
+    int i, fcount = plugin_manager_get_count();
+    int added = 0;
+
+    buf[0] = L'\0';
+    for (i = 0; i < fcount; i++)
+    {
+        const char *inf = plugin_manager_get_information(i);
+        const char *nm = plugin_manager_get_name(i);
+        const char *pth = plugin_manager_get_path(i);
+        const char *base = aviutl_basename(pth);
+        wchar_t winf[256], wbase[256], line[600];
+
+        sjis_to_wide_str((inf && inf[0]) ? inf : (nm ? nm : ""), winf, 256);
+        sjis_to_wide_str(base, wbase, 256);
+        if (wbase[0])
+            wsprintfW(line, L"%s ( %s )\n", winf, wbase);
+        else
+            wsprintfW(line, L"%s\n", winf);
+        if (lstrlenW(buf) + lstrlenW(line) + 2 < 8190)
+        {
+            lstrcatW(buf, line);
+            added++;
+        }
+    }
+    if (added == 0)
+    {
+        lstrcpynW(buf, i18n_get_wstr(1020), 256);
+    }
+    aviutl_msgbox_w(owner, buf, i18n_get_wstr(1029), MB_OK | MB_ICONINFORMATION);
+}
+
+// "WAV_OPTION" dialog callback
+static BOOL run_wav_option_dialog(HWND owner, int *inout_w, int *inout_h)
+{
+    AviUtlDlgState st;
+    if (!inout_w || !inout_h)
+        return FALSE;
+    aviutl_dlg_init(&st);
+    st.ints[0] = *inout_w;
+    st.ints[1] = *inout_h;
+    if (aviutl_dlg_run(owner, "WAV_OPTION", &st) != IDOK)
+        return FALSE;
+    *inout_w = (st.ints[0] > 0) ? st.ints[0] : 0;
+    *inout_h = (st.ints[1] > 0) ? st.ints[1] : 0;
+    return TRUE;
+}
+
+typedef struct InputListDlgCtx
+{
+    int reg_idx[INPUT_PLUGIN_MAX];
+    int ord[INPUT_PLUGIN_MAX];
+    int count;
+} InputListDlgCtx;
+
+static int input_list_selected_plugin(HWND hdlg, const InputListDlgCtx *ctx)
+{
+    int sel, k;
+    if (!ctx || ctx->count <= 0)
+        return -1;
+    sel = (int)SendDlgItemMessageW(hdlg, 32600, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= ctx->count)
+        return -1;
+    for (k = 0; k < ctx->count; k++)
+    {
+        if (ctx->ord[k] == sel)
+            return ctx->reg_idx[k];
+    }
+    return -1;
+}
+
+static BOOL on_input_list_dlg_cmd(HWND hdlg, int cmd_id, AviUtlDlgState *st, void *user)
+{
+    InputListDlgCtx *ctx = (InputListDlgCtx *)user;
+    (void)st;
+    if (!ctx)
+        return TRUE;
+
+    if (cmd_id == 32708) // "設定" button
+    {
+        int pidx = input_list_selected_plugin(hdlg, ctx);
+        if (pidx >= 0)
+        {
+            input_plugin_config(pidx, hdlg);
+        }
+        return TRUE;
+    }
+
+    {
+        InputPluginSummary sum;
+        int pidx = input_list_selected_plugin(hdlg, ctx);
+        BOOL en = (pidx >= 0 && input_plugin_get_summary(pidx, &sum) && sum.has_config);
+        EnableWindow(GetDlgItem(hdlg, 32708), en);
+    }
+    return TRUE;
+}
+
+// 1086: Input Plugin Priority ("INPUTLIST") dialog (0x00405a60)
+static void run_input_priority_dialog(HWND owner)
+{
+    InputListDlgCtx ctx;
+    wchar_t names[INPUT_PLUGIN_MAX][256];
+    const wchar_t *ptrs[INPUT_PLUGIN_MAX + 1];
+    int prio_order[INPUT_PLUGIN_MAX];
+    int prio_n;
+    AviUtlDlgState st;
+    int i, k, total;
+
+    ZeroMemory(&ctx, sizeof(ctx));
+    total = input_plugin_get_count();
+    for (i = 0; i < total && ctx.count < INPUT_PLUGIN_MAX; i++)
+    {
+        InputPluginSummary sum;
+        if (!input_plugin_get_summary(i, &sum))
+            continue;
+        if (sum.flag & INPUT_PLUGIN_FLAG_HIDE_LIST)
+            continue;
+        sjis_to_wide_str(sum.name[0] ? sum.name : "Input", names[ctx.count], 256);
+        ptrs[ctx.count] = names[ctx.count];
+        ctx.reg_idx[ctx.count] = i;
+        ctx.ord[ctx.count] = ctx.count;
+        ctx.count++;
+    }
+    ptrs[ctx.count] = NULL;
+    if (ctx.count <= 0)
+        return;
+
+    prio_n = input_plugin_get_priority_order(prio_order, INPUT_PLUGIN_MAX, FALSE);
+    for (i = 0; i < prio_n; i++)
+    {
+        for (k = 0; k < ctx.count; k++)
+        {
+            if (ctx.reg_idx[k] == prio_order[i])
+            {
+                ctx.ord[k] = i;
+                break;
+            }
+        }
+    }
+
+    aviutl_dlg_init(&st);
+    st.list_items[0] = ptrs;
+    st.list_order[0] = ctx.ord;
+    st.list_count[0] = ctx.count;
+    st.on_cmd = on_input_list_dlg_cmd;
+    st.user = &ctx;
+
+    if (aviutl_dlg_run(owner, "INPUTLIST", &st) == IDOK)
+    {
+        int new_order[INPUT_PLUGIN_MAX];
+        for (i = 0; i < ctx.count; i++)
+        {
+            new_order[i] = ctx.reg_idx[i];
+            for (k = 0; k < ctx.count; k++)
+            {
+                if (ctx.ord[k] == i)
+                {
+                    new_order[i] = ctx.reg_idx[k];
+                    break;
+                }
+            }
+        }
+        input_plugin_apply_priority_order(new_order, ctx.count, TRUE);
+    }
+}
+
+// 103: Input Plugin Information (0x00405450 case 0x67)
+static void show_input_plugin_info(HWND owner)
+{
+    wchar_t buf[8192];
+    int i, count = input_plugin_get_ext_count();
+    int added = 0;
+
+    buf[0] = L'\0';
+    for (i = 0; i < count; i++)
+    {
+        InputPluginSummary sum;
+        const char *base;
+        wchar_t winf[256], wbase[256], line[600];
+        if (!input_plugin_get_ext_summary(i, &sum))
+            continue;
+        base = aviutl_basename(sum.path);
+        sjis_to_wide_str(sum.information[0] ? sum.information : sum.name, winf, 256);
+        sjis_to_wide_str(base, wbase, 256);
+        if (wbase[0])
+            wsprintfW(line, L"%s ( %s )\n", winf, wbase);
+        else
+            wsprintfW(line, L"%s\n", winf);
+        if (lstrlenW(buf) + lstrlenW(line) + 2 < 8190)
+        {
+            lstrcatW(buf, line);
+            added++;
+        }
+    }
+    if (added == 0)
+    {
+        lstrcpynW(buf, i18n_get_wstr(1020), 256);
+    }
+    aviutl_msgbox_w(owner, buf, i18n_get_wstr(1030), MB_OK | MB_ICONINFORMATION);
+}
+
+// 110: Color Conversion Plugin Information (0x00405450 case 0x6e)
+static void show_color_plugin_info(HWND owner)
+{
+    wchar_t buf[8192];
+    int i, count = color_plugin_get_ext_count();
+    int added = 0;
+
+    buf[0] = L'\0';
+    for (i = 0; i < count; i++)
+    {
+        ColorPluginSummary sum;
+        const char *base;
+        wchar_t winf[256], wbase[256], line[600];
+        if (!color_plugin_get_ext_summary(i, &sum))
+            continue;
+        base = aviutl_basename(sum.path);
+        sjis_to_wide_str(sum.information[0] ? sum.information : sum.name, winf, 256);
+        sjis_to_wide_str(base, wbase, 256);
+        if (wbase[0])
+            wsprintfW(line, L"%s ( %s )\n", winf, wbase);
+        else
+            wsprintfW(line, L"%s\n", winf);
+        if (lstrlenW(buf) + lstrlenW(line) + 2 < 8190)
+        {
+            lstrcatW(buf, line);
+            added++;
+        }
+    }
+    if (added == 0)
+    {
+        lstrcpynW(buf, i18n_get_wstr(1020), 256);
+    }
+    aviutl_msgbox_w(owner, buf, i18n_get_wstr(1044), MB_OK | MB_ICONINFORMATION);
+}
+
+// 105: Output Plugin Information (0x00405450 case 0x69)
+static void show_output_plugin_info(HWND owner)
+{
+    wchar_t buf[8192];
+    int i, count = video_export_get_auo_count();
+    int added = 0;
+
+    buf[0] = L'\0';
+    for (i = 0; i < count; i++)
+    {
+        AuoPluginSummary sum;
+        const char *base;
+        wchar_t winf[256], wbase[256], line[600];
+        if (!video_export_get_auo_summary(i, &sum))
+            continue;
+        base = aviutl_basename(sum.path);
+        sjis_to_wide_str(sum.information[0] ? sum.information : sum.name, winf, 256);
+        sjis_to_wide_str(base, wbase, 256);
+        if (wbase[0])
+            wsprintfW(line, L"%s ( %s )\n", winf, wbase);
+        else
+            wsprintfW(line, L"%s\n", winf);
+        if (lstrlenW(buf) + lstrlenW(line) + 2 < 8190)
+        {
+            lstrcatW(buf, line);
+            added++;
+        }
+    }
+    if (added == 0)
+    {
+        lstrcpynW(buf, i18n_get_wstr(1020), 256);
+    }
+    aviutl_msgbox_w(owner, buf, i18n_get_wstr(1031), MB_OK | MB_ICONINFORMATION);
+}
+
+// 1006: Current File Information
+static void show_current_file_info(HWND owner)
+{
+    wchar_t buf[2048];
+    int w = 0, h = 0, mw = 0, mh = 0, rate = 30, scale = 1, fn = 0;
+    wchar_t wpath[MAX_PATH], wfps[64];
+    int cs;
+
+    if (!g_editp || !editp_is_editing(g_editp) || editp_get_frame_n(g_editp) <= 0)
+    {
+        aviutl_msgbox_w(owner, i18n_get_wstr(1021), i18n_get_wstr(1028), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    editp_get_dimensions(g_editp, &w, &h, &mw, &mh);
+    editp_get_fps(g_editp, &rate, &scale);
+    fn = editp_get_frame_n(g_editp);
+    if (rate <= 0)
+        rate = 30;
+    if (scale <= 0)
+        scale = 1;
+    cs = (int)(((double)scale * (double)fn * 100.0) / (double)rate);
+    {
+        char fbuf[64];
+        _snprintf(fbuf, sizeof(fbuf), "%.3f", (double)rate / (double)scale);
+        fbuf[sizeof(fbuf) - 1] = '\0';
+        sjis_to_wide_str(fbuf, wfps, 64);
+    }
+    sjis_to_wide_str(editp_get_edit_path(g_editp), wpath, MAX_PATH);
+
+    if (editp_has_audio(g_editp))
+    {
+        _snwprintf(buf, 2048,
+                   L"%s\n\n"
+                   L"%s : %dx%d\n"
+                   L"%s : %02d:%02d:%02d.%02d\n"
+                   L"%s : %s fps\n"
+                   L"%s : %d\n"
+                   L"%s : %d Hz\n"
+                   L"%s : %d ch",
+                   wpath,
+                   i18n_get_wstr(34), w, h,
+                   i18n_get_wstr(35), cs / 360000, (cs / 6000) % 60, (cs / 100) % 60, cs % 100,
+                   i18n_get_wstr(36), wfps,
+                   i18n_get_wstr(37), fn,
+                   i18n_get_wstr(39), editp_get_audio_rate(g_editp),
+                   i18n_get_wstr(40), editp_get_audio_ch(g_editp));
+    }
+    else
+    {
+        _snwprintf(buf, 2048,
+                   L"%s\n\n"
+                   L"%s : %dx%d\n"
+                   L"%s : %02d:%02d:%02d.%02d\n"
+                   L"%s : %s fps\n"
+                   L"%s : %d",
+                   wpath,
+                   i18n_get_wstr(34), w, h,
+                   i18n_get_wstr(35), cs / 360000, (cs / 6000) % 60, (cs / 100) % 60, cs % 100,
+                   i18n_get_wstr(36), wfps,
+                   i18n_get_wstr(37), fn);
+    }
+    buf[2047] = L'\0';
+    aviutl_msgbox_w(owner, buf, i18n_get_wstr(1028), MB_OK | MB_ICONINFORMATION);
+}
+
 // show aviutl right-click "CONTEXT" popup menu (0x00412300)
 static void show_preview_context_menu(HWND hwnd, int screen_x, int screen_y)
 {
-    const char *res_name = (i18n_get_lang() == LANG_EN) ? "CONTEXT_EN" : "CONTEXT";
-    HMENU hMenu = LoadMenuA(GetModuleHandleA(NULL), res_name);
+    HMENU hMenu = i18n_load_menu("CONTEXT");
     HMENU hSub;
 
-    if (!hMenu)
-        hMenu = LoadMenuA(GetModuleHandleA(NULL), "CONTEXT");
     if (!hMenu)
         return;
 
@@ -1625,6 +2659,16 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageA(hwnd, WM_COMMAND, 5112, 0);
             return 0;
         }
+        if (ctrl && wp == 'G')
+        {
+            SendMessageA(hwnd, WM_COMMAND, 5131, 0);
+            return 0;
+        }
+        if (wp == VK_F12)
+        {
+            SendMessageA(hwnd, WM_COMMAND, IDC_TOGGLE_CONSOLE, 0);
+            return 0;
+        }
         if (wp == VK_SPACE)
         {
             toggle_playback(hwnd);
@@ -1751,6 +2795,12 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             return 0;
         }
+        if (id >= INPUT_PLUGIN_CMD_CFG_BASE &&
+            id < INPUT_PLUGIN_CMD_CFG_BASE + input_plugin_get_count())
+        {
+            input_plugin_config(id - INPUT_PLUGIN_CMD_CFG_BASE, hwnd);
+            return 0;
+        }
         if (id >= AUO_CMD_BASE && id < AUO_CMD_BASE + video_export_get_auo_count())
         {
             stop_playback(hwnd);
@@ -1767,17 +2817,44 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
 
+        if (id >= 5596 && id < 5596 + MRU_MAX_FILES)
+        {
+            char ini[MAX_PATH], key[16], mpath[MAX_PATH];
+            get_aviutl_ini_path(ini, sizeof(ini));
+            wsprintfA(key, "file%d", id - 5596);
+            GetPrivateProfileStringA("recent", key, "", mpath, MAX_PATH, ini);
+            if (mpath[0])
+            {
+                open_media_or_exo(hwnd, mpath);
+            }
+            return 0;
+        }
+        if (id >= 1037 && id <= 1042)
+        {
+            apply_priority_command(id, TRUE);
+            apply_menu(hwnd);
+            return 0;
+        }
+
         switch (id)
         {
         case IDC_TOGGLE_CONSOLE:
             debug_console_toggle_visible();
-            apply_menu(hwnd);
             return 0;
         case IDC_NEW_EXEDIT_720P:
             open_media_or_exo(hwnd, "1280x720_30fps_44100Hz.exedit");
             return 0;
         case IDC_NEW_EXEDIT_1080:
             open_media_or_exo(hwnd, "1920x1080_30fps_48000Hz.exedit");
+            return 0;
+        case 1073: // file -> Clear Recent Files
+            mru_clear_files();
+            apply_menu(hwnd);
+            return 0;
+        case 5183: // filter -> Disable All Filters
+            plugin_manager_disable_all_filters();
+            apply_menu(hwnd);
+            refresh_current_frame(hwnd);
             return 0;
         case 5097: // file -> Open (Ctrl+O)
             reaviutl_file_open(hwnd);
@@ -1803,10 +2880,52 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             video_export_choose_audio_codec(hwnd, g_editp);
             return 0;
         case 5399: // settings -> compression -> Plugin Output Settings
-            video_export_auo_config_dialog(hwnd, -1);
+            run_exout_config_dialog(hwnd);
+            return 0;
+        case 5131: // edit -> Jump to Frame (Ctrl+G)
+            run_move_dialog(hwnd);
+            return 0;
+        case 5115: // edit -> Specify Selection Range
+            run_select_dialog(hwnd);
+            return 0;
+        case 5398: // edit -> Change Playback Speed Info
+            run_playback_speed_dialog(hwnd);
+            return 0;
+        case 1086: // file -> settings -> Input Plugin Priority
+            run_input_priority_dialog(hwnd);
+            return 0;
+        case 106: // file -> settings -> Language
+            if (i18n_show_lang_dialog(hwnd))
+            {
+                apply_menu(hwnd);
+                update_window_title(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case 107: // other -> Language Extension Resource Info
+            i18n_show_lang_info(hwnd);
+            return 0;
+        case 108: // file -> settings -> System Settings
+            run_system_settings_dialog(hwnd);
+            return 0;
+        case 1006: // other -> File Information
+            show_current_file_info(hwnd);
+            return 0;
+        case 101: // other -> Filter Plugin Information
+            show_filter_plugin_info(hwnd);
+            return 0;
+        case 103: // other -> Input Plugin Information
+            show_input_plugin_info(hwnd);
+            return 0;
+        case 104: // other -> Overlay Information
+            aviutl_msgbox_w(hwnd, i18n_get_wstr(1021), i18n_get_wstr(1032),
+                            MB_OK | MB_ICONINFORMATION);
             return 0;
         case 105: // other -> Output Plugin Information
-            video_export_show_auo_info(hwnd, i18n_get_lang() == LANG_JA);
+            show_output_plugin_info(hwnd);
+            return 0;
+        case 110: // other -> Color Conversion Plugin Information
+            show_color_plugin_info(hwnd);
             return 0;
         case 5118: // file -> Open Edit Project (.aup)
             reaviutl_project_open(hwnd);
@@ -1980,20 +3099,9 @@ static LRESULT CALLBACK AviUtlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             reset_window_positions(hwnd);
             return 0;
         case 100:
-            MessageBoxA(hwnd,
-                        "AviUtl version 1.10 (reaviutl)\r\nbuild 11003",
-                        "Version Information", MB_OK | MB_ICONINFORMATION);
-            return 0;
-
-        case IDC_LANG_EN:
-            i18n_set_lang(LANG_EN);
-            apply_menu(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        case IDC_LANG_JA:
-            i18n_set_lang(LANG_JA);
-            apply_menu(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
+            aviutl_msgbox_w(hwnd,
+                            L"AviUtl64 version 1.10\n\nBy \xff2b\xff25\xff2e\x304f\x3093 ( Kenkun )\nhttps://github.com/aviutl-translation-project/aviutl64",
+                            i18n_get_wstr(1033), MB_OK | MB_ICONINFORMATION);
             return 0;
         default:
             return 0;
@@ -2044,7 +3152,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
 
     // init console before loading plugins so early stdout/lua output is visible
     debug_console_init(FALSE);
-    dbg_info("reaviutl %s starting (PID=%lu, AviUtl 1.10 Build 11003 ABI, VRAM=%dx%d)",
+    dbg_info("AviUtl64 %s starting (PID=%lu, AviUtl 1.10 Build 11003 ABI, VRAM=%dx%d)",
              REAVIUTL_X64 ? "64-bit (x64)" : "32-bit (x86)",
              (unsigned long)GetCurrentProcessId(),
              REAVIUTL_VRAM_W, REAVIUTL_VRAM_H);
@@ -2053,6 +3161,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     {
         MessageBoxA(NULL, "Failed to register window class.", "AviUtl", MB_ICONERROR);
         return 1;
+    }
+
+    i18n_init(hInst);
+    {
+        char ini[MAX_PATH];
+        int prio;
+        get_aviutl_ini_path(ini, sizeof(ini));
+        prio = GetPrivateProfileIntA("system", "priority", 2, ini);
+        if (prio < 0 || prio > 5)
+            prio = 2;
+        apply_priority_command(1037 + prio, FALSE);
     }
 
     preview_load_ini(&win_x, &win_y, &win_w, &win_h, &win_max);
@@ -2086,6 +3205,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
         lstrcatA(plugin_dir, "\\plugins");
     }
     dbg_info("Scanning plugins directory: %s", plugin_dir);
+    input_plugin_set_wav_config_handler(run_wav_option_dialog);
+    color_plugin_init(plugin_dir, hwnd);
+    input_plugin_init(plugin_dir, hwnd);
     plugin_manager_init_ex(plugin_dir, hwnd, g_editp);
     video_export_set_ui_callbacks(cb_export_preview_update, cb_export_progress);
     video_export_scan_auo(plugin_dir, hwnd, g_editp);
@@ -2162,7 +3284,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     debug_console_shutdown();
     video_export_shutdown();
     plugin_manager_shutdown();
+    input_plugin_shutdown();
+    color_plugin_shutdown();
     exfunc_shutdown();
+    i18n_shutdown();
     if (g_editp)
     {
         editp_destroy(g_editp);

@@ -18,6 +18,8 @@ set(REAVIUTL_CORE_SOURCES
 	src/plugin_manager.c
 	src/plugin_loader.c
 	src/plugin_bridge_client.c
+	src/color_plugin.c
+	src/input_plugin.c
 	src/video_export.c
 	src/aup_project.c
 	src/debug_console.c
@@ -32,7 +34,7 @@ add_executable(reaviutl
 	src/gui_main.c
 	src/preview.c
 	src/i18n.c
-	src/aviutl_menu.c
+	src/aviutl_dlg.c
 	src/aviutl_resources.rc
 	${REAVIUTL_CORE_SOURCES}
 )
@@ -70,6 +72,8 @@ target_link_libraries(reaviutl
 		comdlg32
 		comctl32
 		shell32
+		ole32
+		version
 		vfw32
 		msacm32
 		winmm
@@ -100,6 +104,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 			comdlg32
 			comctl32
 			shell32
+			ole32
 			vfw32
 			msacm32
 			winmm

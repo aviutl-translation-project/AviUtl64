@@ -62,6 +62,7 @@ typedef struct AviUtlSystemConfig
 BOOL preview_register_classes(HINSTANCE hInst);
 void preview_load_ini(int *out_x, int *out_y, int *out_w, int *out_h, BOOL *out_maximize);
 void preview_save_ini(HWND main_hwnd);
+void preview_reload_sys_config(HWND main_hwnd);
 BOOL preview_init_controls(HWND main_hwnd, HINSTANCE hInst);
 
 HWND preview_get_trackbar_hwnd(void);

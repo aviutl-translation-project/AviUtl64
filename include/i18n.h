@@ -3,27 +3,21 @@
 #ifndef I18N_H
 #define I18N_H
 
-typedef enum ReLang
-{
-    LANG_EN = 0,
-    LANG_JA = 1
-} ReLang;
+#include <windows.h>
 
-typedef enum ReStrId
-{
-    STR_STATUS_READY = 0,
-    STR_PREVIEW_EMPTY,
-    STR_LOAD_PENDING,
-    STR_MENU_LANG_EN,
-    STR_MENU_LANG_JA,
-    STR_MENU_LANGUAGE,
-    STR__COUNT
-} ReStrId;
+void i18n_init(HINSTANCE hInst);
+void i18n_shutdown(void);
 
-ReLang i18n_get_lang(void);
-void i18n_set_lang(ReLang lang);
+LANGID i18n_get_active_langid(void);
+BOOL i18n_is_japanese(void);
 
-const char *T(ReStrId id);
-const wchar_t *TW(ReStrId id);
+const wchar_t *i18n_get_wstr(UINT id);
+const char *i18n_get_str(UINT id);
+
+HMENU i18n_load_menu(const char *res_name);
+const DLGTEMPLATE *i18n_load_dialog_template(const char *res_name);
+
+BOOL i18n_show_lang_dialog(HWND owner);
+void i18n_show_lang_info(HWND owner);
 
 #endif

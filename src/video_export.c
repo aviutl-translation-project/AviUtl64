@@ -2112,7 +2112,7 @@ BOOL video_export_write_riff_info_tags(const char *avi_path, const AviExInfoTags
     LARGE_INTEGER fsz;
     unsigned char list_buf[1600];
     size_t payload_off = 12;
-    uint32_t list_sz, new_riff_sz;
+    uint32_t list_sz, old_riff_sz = 0, new_riff_sz;
 
     if (!avi_path || !avi_path[0] || !tags)
         return FALSE;
@@ -2135,12 +2135,20 @@ BOOL video_export_write_riff_info_tags(const char *avi_path, const AviExInfoTags
     if (hf == INVALID_HANDLE_VALUE)
         return FALSE;
 
-    if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart < 12 || fsz.QuadPart > 0xFFF00000LL ||
+    if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart < 12 ||
         !ReadFile(hf, hdr, 12, &got, NULL) || got != 12 ||
         memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "AVI ", 4) != 0)
     {
         CloseHandle(hf);
         return FALSE;
+    }
+    memcpy(&old_riff_sz, hdr + 4, 4);
+    // do not append to EOF if multi-segment OpenDML AVIX or near 2 GB RIFF boundary (muxer writes INFO in-header)
+    if ((LONGLONG)old_riff_sz + 8LL + 1LL < fsz.QuadPart ||
+        fsz.QuadPart + (LONGLONG)payload_off > 0x7FF00000LL)
+    {
+        CloseHandle(hf);
+        return TRUE;
     }
 
     SetFilePointer(hf, 0, NULL, FILE_END);
@@ -2229,6 +2237,719 @@ static void write_avi_export_log(const char *avi_path, EDITP *ep,
     fclose(fp);
 }
 
+#define ODML_MAX_SUPER_ENTRIES 512
+#define ODML_DEFAULT_SEG_LIMIT 0x3FE00000ULL // ~1 GiB per RIFF AVI / AVIX segment
+
+#pragma pack(push, 1)
+typedef struct
+{
+    uint32_t dwMicroSecPerFrame;
+    uint32_t dwMaxBytesPerSec;
+    uint32_t dwPaddingGranularity;
+    uint32_t dwFlags;
+    uint32_t dwTotalFrames;
+    uint32_t dwInitialFrames;
+    uint32_t dwStreams;
+    uint32_t dwSuggestedBufferSize;
+    uint32_t dwWidth;
+    uint32_t dwHeight;
+    uint32_t dwReserved[4];
+} OdmlMainAviHeader;
+
+typedef struct
+{
+    uint32_t fccType;
+    uint32_t fccHandler;
+    uint32_t dwFlags;
+    uint16_t wPriority;
+    uint16_t wLanguage;
+    uint32_t dwInitialFrames;
+    uint32_t dwScale;
+    uint32_t dwRate;
+    uint32_t dwStart;
+    uint32_t dwLength;
+    uint32_t dwSuggestedBufferSize;
+    uint32_t dwQuality;
+    uint32_t dwSampleSize;
+    int16_t rcLeft;
+    int16_t rcTop;
+    int16_t rcRight;
+    int16_t rcBottom;
+} OdmlAviStreamHeader;
+
+typedef struct
+{
+    uint16_t wLongsPerEntry;
+    uint8_t bIndexSubType;
+    uint8_t bIndexType;
+    uint32_t nEntriesInUse;
+    uint32_t dwChunkId;
+    uint32_t dwReserved[3];
+} OdmlSuperIndexHeader;
+
+typedef struct
+{
+    uint64_t qwOffset;
+    uint32_t dwSize;
+    uint32_t dwDuration;
+} OdmlSuperIndexEntry;
+
+typedef struct
+{
+    uint16_t wLongsPerEntry;
+    uint8_t bIndexSubType;
+    uint8_t bIndexType;
+    uint32_t nEntriesInUse;
+    uint32_t dwChunkId;
+    uint64_t qwBaseOffset;
+    uint32_t dwReserved3;
+} OdmlStdIndexHeader;
+
+typedef struct
+{
+    uint32_t dwOffset;
+    uint32_t dwSize;
+} OdmlStdIndexEntry;
+
+typedef struct
+{
+    uint32_t ckid;
+    uint32_t dwFlags;
+    uint32_t dwChunkOffset;
+    uint32_t dwChunkLength;
+} OdmlIdx1Entry;
+#pragma pack(pop)
+
+typedef struct
+{
+    HANDLE hf;
+    uint64_t cur_pos;
+    uint64_t seg_limit;
+    int seg_idx;
+    BOOL has_audio;
+    BOOL io_err;
+
+    uint32_t vid_ckid;
+    uint32_t aud_ckid;
+    uint32_t aud_block_align;
+
+    uint64_t avih_pos;
+    uint64_t vstrh_pos;
+    uint64_t vindx_pos;
+    uint64_t astrh_pos;
+    uint64_t aindx_pos;
+    uint64_t dmlh_pos;
+
+    OdmlMainAviHeader avih;
+    OdmlAviStreamHeader vstrh;
+    OdmlAviStreamHeader astrh;
+
+    OdmlSuperIndexEntry vindx_entries[ODML_MAX_SUPER_ENTRIES];
+    int vindx_n;
+    OdmlSuperIndexEntry aindx_entries[ODML_MAX_SUPER_ENTRIES];
+    int aindx_n;
+
+    uint64_t seg_riff_pos;
+    uint64_t seg_movi_pos;
+    uint64_t seg_base_offset;
+
+    OdmlStdIndexEntry *seg_vid_idx;
+    int seg_vid_n;
+    int seg_vid_cap;
+
+    OdmlStdIndexEntry *seg_aud_idx;
+    int seg_aud_n;
+    int seg_aud_cap;
+    uint32_t seg_aud_duration;
+
+    OdmlIdx1Entry *idx1_entries;
+    int idx1_n;
+    int idx1_cap;
+
+    uint32_t seg0_vid_frames;
+    uint32_t total_vid_frames;
+    uint32_t total_aud_blocks;
+    uint32_t max_vid_chunk;
+    uint32_t max_aud_chunk;
+} OdmlAviWriter;
+
+static BOOL odml_write_raw(OdmlAviWriter *w, const void *buf, DWORD len)
+{
+    DWORD wr = 0;
+    if (w->io_err)
+        return FALSE;
+    if (len == 0)
+        return TRUE;
+    if (!WriteFile(w->hf, buf, len, &wr, NULL) || wr != len)
+    {
+        w->io_err = TRUE;
+        return FALSE;
+    }
+    w->cur_pos += (uint64_t)len;
+    return TRUE;
+}
+
+static BOOL odml_pwrite_at(OdmlAviWriter *w, uint64_t pos, const void *buf, DWORD len)
+{
+    LARGE_INTEGER li, restore;
+    DWORD wr = 0;
+    if (w->io_err)
+        return FALSE;
+    li.QuadPart = (LONGLONG)pos;
+    if (!SetFilePointerEx(w->hf, li, NULL, FILE_BEGIN))
+    {
+        w->io_err = TRUE;
+        return FALSE;
+    }
+    if (!WriteFile(w->hf, buf, len, &wr, NULL) || wr != len)
+    {
+        w->io_err = TRUE;
+        return FALSE;
+    }
+    restore.QuadPart = (LONGLONG)w->cur_pos;
+    if (!SetFilePointerEx(w->hf, restore, NULL, FILE_BEGIN))
+    {
+        w->io_err = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL odml_write_fourcc_sz(OdmlAviWriter *w, const char fcc[4], uint32_t sz)
+{
+    unsigned char hdr[8];
+    memcpy(hdr, fcc, 4);
+    memcpy(hdr + 4, &sz, 4);
+    return odml_write_raw(w, hdr, 8);
+}
+
+static BOOL odml_write_list_hdr(OdmlAviWriter *w, const char kind[4], uint32_t sz, const char list_type[4])
+{
+    unsigned char hdr[12];
+    memcpy(hdr, kind, 4);
+    memcpy(hdr + 4, &sz, 4);
+    memcpy(hdr + 8, list_type, 4);
+    return odml_write_raw(w, hdr, 12);
+}
+
+static BOOL odml_finish_segment(OdmlAviWriter *w)
+{
+    uint32_t movi_sz, riff_sz;
+
+    if (w->io_err)
+        return FALSE;
+
+    if (w->seg_vid_n > 0 && w->vindx_n < ODML_MAX_SUPER_ENTRIES)
+    {
+        uint64_t ix_pos = w->cur_pos;
+        uint32_t ix_cb = 24u + (uint32_t)w->seg_vid_n * 8u;
+        OdmlStdIndexHeader shdr;
+        unsigned char chdr[8];
+
+        memcpy(chdr, "ix00", 4);
+        memcpy(chdr + 4, &ix_cb, 4);
+        ZeroMemory(&shdr, sizeof(shdr));
+        shdr.wLongsPerEntry = 2;
+        shdr.bIndexSubType = 0;
+        shdr.bIndexType = 0x01; // AVI_INDEX_OF_CHUNKS
+        shdr.nEntriesInUse = (uint32_t)w->seg_vid_n;
+        shdr.dwChunkId = w->vid_ckid;
+        shdr.qwBaseOffset = w->seg_base_offset;
+
+        if (!odml_write_raw(w, chdr, 8) ||
+            !odml_write_raw(w, &shdr, sizeof(shdr)) ||
+            !odml_write_raw(w, w->seg_vid_idx, (DWORD)((size_t)w->seg_vid_n * sizeof(OdmlStdIndexEntry))))
+        {
+            return FALSE;
+        }
+        w->vindx_entries[w->vindx_n].qwOffset = ix_pos;
+        w->vindx_entries[w->vindx_n].dwSize = 8u + ix_cb;
+        w->vindx_entries[w->vindx_n].dwDuration = (uint32_t)w->seg_vid_n;
+        w->vindx_n++;
+    }
+
+    if (w->has_audio && w->seg_aud_n > 0 && w->aindx_n < ODML_MAX_SUPER_ENTRIES)
+    {
+        uint64_t ix_pos = w->cur_pos;
+        uint32_t ix_cb = 24u + (uint32_t)w->seg_aud_n * 8u;
+        OdmlStdIndexHeader shdr;
+        unsigned char chdr[8];
+
+        memcpy(chdr, "ix01", 4);
+        memcpy(chdr + 4, &ix_cb, 4);
+        ZeroMemory(&shdr, sizeof(shdr));
+        shdr.wLongsPerEntry = 2;
+        shdr.bIndexSubType = 0;
+        shdr.bIndexType = 0x01;
+        shdr.nEntriesInUse = (uint32_t)w->seg_aud_n;
+        shdr.dwChunkId = w->aud_ckid;
+        shdr.qwBaseOffset = w->seg_base_offset;
+
+        if (!odml_write_raw(w, chdr, 8) ||
+            !odml_write_raw(w, &shdr, sizeof(shdr)) ||
+            !odml_write_raw(w, w->seg_aud_idx, (DWORD)((size_t)w->seg_aud_n * sizeof(OdmlStdIndexEntry))))
+        {
+            return FALSE;
+        }
+        w->aindx_entries[w->aindx_n].qwOffset = ix_pos;
+        w->aindx_entries[w->aindx_n].dwSize = 8u + ix_cb;
+        w->aindx_entries[w->aindx_n].dwDuration = w->seg_aud_duration;
+        w->aindx_n++;
+    }
+
+    movi_sz = (uint32_t)(w->cur_pos - (w->seg_movi_pos + 8ULL));
+    if (!odml_pwrite_at(w, w->seg_movi_pos + 4ULL, &movi_sz, 4))
+        return FALSE;
+
+    if (w->seg_idx == 0)
+    {
+        w->seg0_vid_frames = (uint32_t)w->seg_vid_n;
+        if (w->idx1_n > 0)
+        {
+            uint32_t idx1_cb = (uint32_t)w->idx1_n * (uint32_t)sizeof(OdmlIdx1Entry);
+            if (!odml_write_fourcc_sz(w, "idx1", idx1_cb) ||
+                !odml_write_raw(w, w->idx1_entries, idx1_cb))
+            {
+                return FALSE;
+            }
+        }
+    }
+
+    riff_sz = (uint32_t)(w->cur_pos - (w->seg_riff_pos + 8ULL));
+    if (!odml_pwrite_at(w, w->seg_riff_pos + 4ULL, &riff_sz, 4))
+        return FALSE;
+
+    return TRUE;
+}
+
+static BOOL odml_ensure_segment_space(OdmlAviWriter *w, uint32_t payload_bytes)
+{
+    uint64_t est_idx_bytes = 64ULL + (uint64_t)(w->seg_vid_n + w->seg_aud_n + 2) * 8ULL;
+    uint64_t est_idx1_bytes = (w->seg_idx == 0) ? (8ULL + (uint64_t)(w->idx1_n + 1) * 16ULL) : 0ULL;
+    uint64_t need = 8ULL + (uint64_t)((payload_bytes + 1u) & ~1u) + est_idx_bytes + est_idx1_bytes;
+
+    if (w->seg_vid_n > 0 &&
+        (w->cur_pos - w->seg_riff_pos) + need > w->seg_limit &&
+        w->vindx_n + 1 < ODML_MAX_SUPER_ENTRIES)
+    {
+        if (!odml_finish_segment(w))
+            return FALSE;
+        w->seg_idx++;
+        w->seg_riff_pos = w->cur_pos;
+        if (!odml_write_list_hdr(w, "RIFF", 0, "AVIX"))
+            return FALSE;
+        w->seg_movi_pos = w->cur_pos;
+        if (!odml_write_list_hdr(w, "LIST", 0, "movi"))
+            return FALSE;
+        w->seg_base_offset = w->seg_movi_pos + 8ULL;
+        w->seg_vid_n = 0;
+        w->seg_aud_n = 0;
+        w->seg_aud_duration = 0;
+    }
+    return TRUE;
+}
+
+static BOOL odml_write_video_chunk(OdmlAviWriter *w, const void *data, uint32_t bytes, BOOL is_keyframe)
+{
+    uint64_t hdr_pos;
+    unsigned char chdr[8];
+    unsigned char pad = 0;
+
+    if (!odml_ensure_segment_space(w, bytes))
+        return FALSE;
+
+    if (w->seg_vid_n >= w->seg_vid_cap)
+    {
+        int ncap = (w->seg_vid_cap == 0) ? 4096 : (w->seg_vid_cap * 2);
+        OdmlStdIndexEntry *nb = (OdmlStdIndexEntry *)realloc(
+            w->seg_vid_idx, (size_t)ncap * sizeof(OdmlStdIndexEntry));
+        if (!nb)
+        {
+            w->io_err = TRUE;
+            return FALSE;
+        }
+        w->seg_vid_idx = nb;
+        w->seg_vid_cap = ncap;
+    }
+
+    if (w->seg_idx == 0 && w->idx1_n >= w->idx1_cap)
+    {
+        int ncap = (w->idx1_cap == 0) ? 4096 : (w->idx1_cap * 2);
+        OdmlIdx1Entry *nb = (OdmlIdx1Entry *)realloc(
+            w->idx1_entries, (size_t)ncap * sizeof(OdmlIdx1Entry));
+        if (!nb)
+        {
+            w->io_err = TRUE;
+            return FALSE;
+        }
+        w->idx1_entries = nb;
+        w->idx1_cap = ncap;
+    }
+
+    hdr_pos = w->cur_pos;
+    memcpy(chdr, &w->vid_ckid, 4);
+    memcpy(chdr + 4, &bytes, 4);
+    if (!odml_write_raw(w, chdr, 8) ||
+        (bytes > 0 && !odml_write_raw(w, data, bytes)) ||
+        ((bytes & 1u) && !odml_write_raw(w, &pad, 1)))
+    {
+        return FALSE;
+    }
+
+    w->seg_vid_idx[w->seg_vid_n].dwOffset = (uint32_t)((hdr_pos + 8ULL) - w->seg_base_offset);
+    w->seg_vid_idx[w->seg_vid_n].dwSize = (bytes & 0x7FFFFFFFu) | (is_keyframe ? 0u : 0x80000000u);
+    w->seg_vid_n++;
+
+    if (w->seg_idx == 0)
+    {
+        w->idx1_entries[w->idx1_n].ckid = w->vid_ckid;
+        w->idx1_entries[w->idx1_n].dwFlags = is_keyframe ? AVIIF_KEYFRAME : 0u;
+        w->idx1_entries[w->idx1_n].dwChunkOffset = (uint32_t)(hdr_pos - w->seg_base_offset);
+        w->idx1_entries[w->idx1_n].dwChunkLength = bytes;
+        w->idx1_n++;
+    }
+
+    w->total_vid_frames++;
+    if (bytes > w->max_vid_chunk)
+        w->max_vid_chunk = bytes;
+    return TRUE;
+}
+
+static BOOL odml_write_audio_chunk(OdmlAviWriter *w, const void *data, uint32_t bytes, uint32_t nblocks)
+{
+    uint64_t hdr_pos;
+    unsigned char chdr[8];
+    unsigned char pad = 0;
+
+    if (!w->has_audio || bytes == 0)
+        return TRUE;
+
+    if (!odml_ensure_segment_space(w, bytes))
+        return FALSE;
+
+    if (w->seg_aud_n >= w->seg_aud_cap)
+    {
+        int ncap = (w->seg_aud_cap == 0) ? 4096 : (w->seg_aud_cap * 2);
+        OdmlStdIndexEntry *nb = (OdmlStdIndexEntry *)realloc(
+            w->seg_aud_idx, (size_t)ncap * sizeof(OdmlStdIndexEntry));
+        if (!nb)
+        {
+            w->io_err = TRUE;
+            return FALSE;
+        }
+        w->seg_aud_idx = nb;
+        w->seg_aud_cap = ncap;
+    }
+
+    if (w->seg_idx == 0 && w->idx1_n >= w->idx1_cap)
+    {
+        int ncap = (w->idx1_cap == 0) ? 4096 : (w->idx1_cap * 2);
+        OdmlIdx1Entry *nb = (OdmlIdx1Entry *)realloc(
+            w->idx1_entries, (size_t)ncap * sizeof(OdmlIdx1Entry));
+        if (!nb)
+        {
+            w->io_err = TRUE;
+            return FALSE;
+        }
+        w->idx1_entries = nb;
+        w->idx1_cap = ncap;
+    }
+
+    hdr_pos = w->cur_pos;
+    memcpy(chdr, &w->aud_ckid, 4);
+    memcpy(chdr + 4, &bytes, 4);
+    if (!odml_write_raw(w, chdr, 8) ||
+        !odml_write_raw(w, data, bytes) ||
+        ((bytes & 1u) && !odml_write_raw(w, &pad, 1)))
+    {
+        return FALSE;
+    }
+
+    w->seg_aud_idx[w->seg_aud_n].dwOffset = (uint32_t)((hdr_pos + 8ULL) - w->seg_base_offset);
+    w->seg_aud_idx[w->seg_aud_n].dwSize = bytes & 0x7FFFFFFFu;
+    w->seg_aud_n++;
+    w->seg_aud_duration += nblocks;
+
+    if (w->seg_idx == 0)
+    {
+        w->idx1_entries[w->idx1_n].ckid = w->aud_ckid;
+        w->idx1_entries[w->idx1_n].dwFlags = AVIIF_KEYFRAME;
+        w->idx1_entries[w->idx1_n].dwChunkOffset = (uint32_t)(hdr_pos - w->seg_base_offset);
+        w->idx1_entries[w->idx1_n].dwChunkLength = bytes;
+        w->idx1_n++;
+    }
+
+    w->total_aud_blocks += nblocks;
+    if (bytes > w->max_aud_chunk)
+        w->max_aud_chunk = bytes;
+    return TRUE;
+}
+
+static BOOL odml_writer_open(OdmlAviWriter *w, const char *path,
+                             int width, int height, int fps_r, int fps_s,
+                             uint32_t vid_handler, uint32_t vid_ckid, uint32_t vid_quality,
+                             const BITMAPINFOHEADER *vid_bih, uint32_t vid_bih_bytes,
+                             const WAVEFORMATEX *aud_wfx, uint32_t aud_wfx_bytes,
+                             const AviExInfoTags *tags)
+{
+    uint64_t hdrl_pos, vstrl_pos, astrl_pos;
+    uint32_t hdrl_sz, vstrl_sz, astrl_sz;
+    uint32_t super_cb = (uint32_t)(sizeof(OdmlSuperIndexHeader) +
+                                   ODML_MAX_SUPER_ENTRIES * sizeof(OdmlSuperIndexEntry));
+    OdmlSuperIndexHeader s_hdr;
+    unsigned char dmlh_zero[248];
+    unsigned char pad = 0;
+    char env_lim[64];
+
+    ZeroMemory(w, sizeof(*w));
+    w->hf = INVALID_HANDLE_VALUE;
+    w->seg_limit = ODML_DEFAULT_SEG_LIMIT;
+    if (GetEnvironmentVariableA("REAVIUTL_ODML_SEG_LIMIT_BYTES", env_lim, sizeof(env_lim)) > 0)
+    {
+        uint64_t v = _strtoui64(env_lim, NULL, 10);
+        if (v >= 32768ULL && v <= 0x7E000000ULL)
+            w->seg_limit = v;
+    }
+
+    w->hf = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (w->hf == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    w->has_audio = (aud_wfx != NULL && aud_wfx_bytes >= sizeof(WAVEFORMATEX));
+    w->vid_ckid = vid_ckid;
+    w->aud_ckid = mmioFOURCC('0', '1', 'w', 'b');
+    w->aud_block_align = (w->has_audio && aud_wfx->nBlockAlign > 0) ? aud_wfx->nBlockAlign : 1u;
+
+    w->seg_riff_pos = 0;
+    if (!odml_write_list_hdr(w, "RIFF", 0, "AVI "))
+        return FALSE;
+
+    hdrl_pos = w->cur_pos;
+    if (!odml_write_list_hdr(w, "LIST", 0, "hdrl"))
+        return FALSE;
+
+    // 'avih'
+    ZeroMemory(&w->avih, sizeof(w->avih));
+    w->avih.dwMicroSecPerFrame = (uint32_t)(((uint64_t)fps_s * 1000000ULL + (uint64_t)(fps_r / 2)) /
+                                            (uint64_t)fps_r);
+    w->avih.dwFlags = 0x00000910u; // AVIF_HASINDEX | AVIF_ISINTERLEAVED | AVIF_TRUSTCKTYPE
+    w->avih.dwStreams = w->has_audio ? 2u : 1u;
+    w->avih.dwSuggestedBufferSize = vid_bih->biSizeImage;
+    w->avih.dwWidth = (uint32_t)width;
+    w->avih.dwHeight = (uint32_t)height;
+    if (!odml_write_fourcc_sz(w, "avih", sizeof(w->avih)))
+        return FALSE;
+    w->avih_pos = w->cur_pos;
+    if (!odml_write_raw(w, &w->avih, sizeof(w->avih)))
+        return FALSE;
+
+    // video 'strl'
+    vstrl_pos = w->cur_pos;
+    if (!odml_write_list_hdr(w, "LIST", 0, "strl"))
+        return FALSE;
+
+    ZeroMemory(&w->vstrh, sizeof(w->vstrh));
+    w->vstrh.fccType = streamtypeVIDEO;
+    w->vstrh.fccHandler = vid_handler;
+    w->vstrh.dwScale = (uint32_t)fps_s;
+    w->vstrh.dwRate = (uint32_t)fps_r;
+    w->vstrh.dwSuggestedBufferSize = vid_bih->biSizeImage;
+    w->vstrh.dwQuality = vid_quality;
+    w->vstrh.rcRight = (int16_t)(width > 32767 ? 32767 : width);
+    w->vstrh.rcBottom = (int16_t)(height > 32767 ? 32767 : height);
+    if (!odml_write_fourcc_sz(w, "strh", sizeof(w->vstrh)))
+        return FALSE;
+    w->vstrh_pos = w->cur_pos;
+    if (!odml_write_raw(w, &w->vstrh, sizeof(w->vstrh)))
+        return FALSE;
+
+    if (!odml_write_fourcc_sz(w, "strf", vid_bih_bytes) ||
+        !odml_write_raw(w, vid_bih, vid_bih_bytes) ||
+        ((vid_bih_bytes & 1u) && !odml_write_raw(w, &pad, 1)))
+    {
+        return FALSE;
+    }
+
+    ZeroMemory(&s_hdr, sizeof(s_hdr));
+    s_hdr.wLongsPerEntry = 4;
+    s_hdr.bIndexSubType = 0;
+    s_hdr.bIndexType = 0x00; // AVI_INDEX_OF_INDEXES
+    s_hdr.dwChunkId = w->vid_ckid;
+    if (!odml_write_fourcc_sz(w, "indx", super_cb))
+        return FALSE;
+    w->vindx_pos = w->cur_pos;
+    if (!odml_write_raw(w, &s_hdr, sizeof(s_hdr)) ||
+        !odml_write_raw(w, w->vindx_entries, sizeof(w->vindx_entries)))
+    {
+        return FALSE;
+    }
+
+    vstrl_sz = (uint32_t)(w->cur_pos - (vstrl_pos + 8ULL));
+    if (!odml_pwrite_at(w, vstrl_pos + 4ULL, &vstrl_sz, 4))
+        return FALSE;
+
+    // optional audio 'strl'
+    if (w->has_audio)
+    {
+        astrl_pos = w->cur_pos;
+        if (!odml_write_list_hdr(w, "LIST", 0, "strl"))
+            return FALSE;
+
+        ZeroMemory(&w->astrh, sizeof(w->astrh));
+        w->astrh.fccType = streamtypeAUDIO;
+        w->astrh.dwScale = w->aud_block_align;
+        w->astrh.dwRate = aud_wfx->nAvgBytesPerSec > 0
+                              ? aud_wfx->nAvgBytesPerSec
+                              : (uint32_t)aud_wfx->nSamplesPerSec * w->aud_block_align;
+        w->astrh.dwQuality = (uint32_t)-1;
+        w->astrh.dwSampleSize = w->aud_block_align;
+        w->astrh.dwSuggestedBufferSize = w->astrh.dwRate;
+        if (!odml_write_fourcc_sz(w, "strh", sizeof(w->astrh)))
+            return FALSE;
+        w->astrh_pos = w->cur_pos;
+        if (!odml_write_raw(w, &w->astrh, sizeof(w->astrh)))
+            return FALSE;
+
+        if (!odml_write_fourcc_sz(w, "strf", aud_wfx_bytes) ||
+            !odml_write_raw(w, aud_wfx, aud_wfx_bytes) ||
+            ((aud_wfx_bytes & 1u) && !odml_write_raw(w, &pad, 1)))
+        {
+            return FALSE;
+        }
+
+        ZeroMemory(&s_hdr, sizeof(s_hdr));
+        s_hdr.wLongsPerEntry = 4;
+        s_hdr.bIndexSubType = 0;
+        s_hdr.bIndexType = 0x00;
+        s_hdr.dwChunkId = w->aud_ckid;
+        if (!odml_write_fourcc_sz(w, "indx", super_cb))
+            return FALSE;
+        w->aindx_pos = w->cur_pos;
+        if (!odml_write_raw(w, &s_hdr, sizeof(s_hdr)) ||
+            !odml_write_raw(w, w->aindx_entries, sizeof(w->aindx_entries)))
+        {
+            return FALSE;
+        }
+
+        astrl_sz = (uint32_t)(w->cur_pos - (astrl_pos + 8ULL));
+        if (!odml_pwrite_at(w, astrl_pos + 4ULL, &astrl_sz, 4))
+            return FALSE;
+    }
+
+    // LIST 'odml' -> 'dmlh' (248 bytes)
+    ZeroMemory(dmlh_zero, sizeof(dmlh_zero));
+    if (!odml_write_list_hdr(w, "LIST", 4u + 8u + sizeof(dmlh_zero), "odml") ||
+        !odml_write_fourcc_sz(w, "dmlh", sizeof(dmlh_zero)))
+    {
+        return FALSE;
+    }
+    w->dmlh_pos = w->cur_pos;
+    if (!odml_write_raw(w, dmlh_zero, sizeof(dmlh_zero)))
+        return FALSE;
+
+    hdrl_sz = (uint32_t)(w->cur_pos - (hdrl_pos + 8ULL));
+    if (!odml_pwrite_at(w, hdrl_pos + 4ULL, &hdrl_sz, 4))
+        return FALSE;
+
+    // optional LIST 'INFO' tags written inside Segment 0 before 'movi'
+    if (tags && (tags->title[0] || tags->comment[0] || tags->copyright[0]))
+    {
+        unsigned char info_buf[1600];
+        size_t info_off = 12;
+        info_off += append_info_subchunk(info_buf + info_off, "INAM", tags->title);
+        info_off += append_info_subchunk(info_buf + info_off, "ICMT", tags->comment);
+        info_off += append_info_subchunk(info_buf + info_off, "ICOP", tags->copyright);
+        if (info_off > 12)
+        {
+            uint32_t info_sz = (uint32_t)(info_off - 8u);
+            memcpy(info_buf, "LIST", 4);
+            memcpy(info_buf + 4, &info_sz, 4);
+            memcpy(info_buf + 8, "INFO", 4);
+            if (!odml_write_raw(w, info_buf, (DWORD)info_off))
+                return FALSE;
+        }
+    }
+
+    w->seg_movi_pos = w->cur_pos;
+    if (!odml_write_list_hdr(w, "LIST", 0, "movi"))
+        return FALSE;
+    w->seg_base_offset = w->seg_movi_pos + 8ULL;
+    return TRUE;
+}
+
+static BOOL odml_writer_close(OdmlAviWriter *w, BOOL finalize)
+{
+    BOOL ok = FALSE;
+
+    if (w->hf != INVALID_HANDLE_VALUE)
+    {
+        if (finalize && !w->io_err)
+        {
+            OdmlSuperIndexHeader s_hdr;
+            uint32_t max_chunk = w->max_vid_chunk > w->max_aud_chunk ? w->max_vid_chunk : w->max_aud_chunk;
+
+            if (odml_finish_segment(w))
+            {
+                w->avih.dwTotalFrames = w->seg0_vid_frames;
+                if (max_chunk > w->avih.dwSuggestedBufferSize)
+                    w->avih.dwSuggestedBufferSize = max_chunk;
+                odml_pwrite_at(w, w->avih_pos, &w->avih, sizeof(w->avih));
+
+                w->vstrh.dwLength = w->total_vid_frames;
+                if (w->max_vid_chunk > w->vstrh.dwSuggestedBufferSize)
+                    w->vstrh.dwSuggestedBufferSize = w->max_vid_chunk;
+                odml_pwrite_at(w, w->vstrh_pos, &w->vstrh, sizeof(w->vstrh));
+
+                ZeroMemory(&s_hdr, sizeof(s_hdr));
+                s_hdr.wLongsPerEntry = 4;
+                s_hdr.bIndexType = 0x00;
+                s_hdr.nEntriesInUse = (uint32_t)w->vindx_n;
+                s_hdr.dwChunkId = w->vid_ckid;
+                odml_pwrite_at(w, w->vindx_pos, &s_hdr, sizeof(s_hdr));
+                if (w->vindx_n > 0)
+                {
+                    odml_pwrite_at(w, w->vindx_pos + sizeof(s_hdr), w->vindx_entries,
+                                   (DWORD)((size_t)w->vindx_n * sizeof(OdmlSuperIndexEntry)));
+                }
+
+                if (w->has_audio)
+                {
+                    w->astrh.dwLength = w->total_aud_blocks;
+                    if (w->max_aud_chunk > w->astrh.dwSuggestedBufferSize)
+                        w->astrh.dwSuggestedBufferSize = w->max_aud_chunk;
+                    odml_pwrite_at(w, w->astrh_pos, &w->astrh, sizeof(w->astrh));
+
+                    ZeroMemory(&s_hdr, sizeof(s_hdr));
+                    s_hdr.wLongsPerEntry = 4;
+                    s_hdr.bIndexType = 0x00;
+                    s_hdr.nEntriesInUse = (uint32_t)w->aindx_n;
+                    s_hdr.dwChunkId = w->aud_ckid;
+                    odml_pwrite_at(w, w->aindx_pos, &s_hdr, sizeof(s_hdr));
+                    if (w->aindx_n > 0)
+                    {
+                        odml_pwrite_at(w, w->aindx_pos + sizeof(s_hdr), w->aindx_entries,
+                                       (DWORD)((size_t)w->aindx_n * sizeof(OdmlSuperIndexEntry)));
+                    }
+                }
+
+                odml_pwrite_at(w, w->dmlh_pos, &w->total_vid_frames, sizeof(uint32_t));
+                ok = !w->io_err;
+            }
+        }
+        CloseHandle(w->hf);
+        w->hf = INVALID_HANDLE_VALUE;
+    }
+
+    free(w->seg_vid_idx);
+    free(w->seg_aud_idx);
+    free(w->idx1_entries);
+    w->seg_vid_idx = NULL;
+    w->seg_aud_idx = NULL;
+    w->idx1_entries = NULL;
+    return ok;
+}
+
 BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_path,
                                         int out_flags, const AviSaveOptions *opts)
 {
@@ -2238,18 +2959,31 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
     int w = 0, h = 0, mw = 0, mh = 0, fps_r = 30, fps_s = 1;
     int dib_stride, dib_bytes, ileave_frames;
     BOOL use_yuy2_in = FALSE;
-    BOOL include_audio, ok = FALSE;
+    BOOL include_audio, wrote_audio = FALSE, ok = FALSE;
     SYSTEMTIME st_start;
     DWORD t0_tick;
-    PAVIFILE pfile = NULL;
-    PAVISTREAM pvid = NULL;
-    PAVISTREAM pvid_cs = NULL;
-    PAVISTREAM pvid_wr = NULL;
-    PAVISTREAM paud = NULL;
-    AVISTREAMINFOA vsi;
-    BITMAPINFOHEADER bih;
+    OdmlAviWriter odml;
+    BOOL odml_opened = FALSE;
+    HIC hic_enc = NULL;
+    BOOL hic_begun = FALSE;
+    BOOL hic_temporal_only = FALSE;
+    BITMAPINFOHEADER in_bih;
+    BITMAPINFOHEADER *vid_out_bih = NULL;
+    uint32_t vid_out_bih_bytes = 0;
+    uint32_t vid_handler = mmioFOURCC('D', 'I', 'B', ' ');
+    uint32_t vid_ckid = mmioFOURCC('0', '0', 'd', 'b');
+    uint32_t vid_quality = (uint32_t)-1;
+    int key_every = 15;
+    int last_kf = -100000;
+    DWORD frame_budget = 0;
     unsigned char *dib_buf = NULL;
+    unsigned char *prev_dib_buf = NULL;
+    unsigned char *comp_buf = NULL;
+    size_t comp_buf_cap = 0;
     void *codec_par = NULL;
+    WAVEFORMATEX pcm_wfx;
+    const WAVEFORMATEX *aud_out_wfx = NULL;
+    uint32_t aud_out_wfx_bytes = 0;
     short *pcm_buf = NULL;
     int pcm_cap = 0;
     HACMSTREAM has = NULL;
@@ -2258,7 +2992,9 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
     unsigned char *acm_src = NULL;
     unsigned char *acm_dst = NULL;
     DWORD acm_dst_cap = 0;
-    LONG aud_pos = 0;
+
+    ZeroMemory(&odml, sizeof(odml));
+    odml.hf = INVALID_HANDLE_VALUE;
 
     if (!ep || !save_path || !save_path[0] || !editp_is_editing(ep) || g_enc.active)
     {
@@ -2316,7 +3052,6 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
     plugin_manager_notify_save_start(ep, s, e,
                                      OUTPUT_INFO_FLAG_VIDEO | (include_audio ? OUTPUT_INFO_FLAG_AUDIO : 0));
-    AVIFileInit();
 
     builtin_filters_adjust_export_fps(&fps_r, &fps_s);
     if (g_enc.out_n > 0)
@@ -2338,107 +3073,140 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
         goto cleanup;
     }
 
-    // delete existing target file first so AVIFileOpenA(OF_CREATE|OF_WRITE) starts fresh
-    DeleteFileA(abs_path);
+    ZeroMemory(&in_bih, sizeof(in_bih));
+    in_bih.biSize = sizeof(in_bih);
+    in_bih.biWidth = w;
+    in_bih.biHeight = h;
+    in_bih.biPlanes = 1;
+    in_bih.biBitCount = 24;
+    in_bih.biCompression = BI_RGB;
+    in_bih.biSizeImage = (DWORD)dib_bytes;
 
-    if (AVIFileOpenA(&pfile, abs_path, OF_CREATE | OF_WRITE, NULL) != 0 || !pfile)
-    {
-        dbg_error("AVIFileOpenA failed for '%s'", abs_path);
-        goto cleanup;
-    }
-
-    // create video stream ('vids')
-    ZeroMemory(&bih, sizeof(bih));
-    bih.biSize = sizeof(bih);
-    bih.biWidth = w;
-    bih.biHeight = h;
-    bih.biPlanes = 1;
-    bih.biBitCount = 24;
-    bih.biCompression = BI_RGB;
-    bih.biSizeImage = (DWORD)dib_bytes;
-
-    ZeroMemory(&vsi, sizeof(vsi));
-    vsi.fccType = streamtypeVIDEO;
-    vsi.fccHandler = (!eff_opts.no_recompress_video && g_vcodec_valid && g_vcodec.fccHandler != 0)
-                         ? g_vcodec.fccHandler
-                         : mmioFOURCC('D', 'I', 'B', ' ');
-    vsi.dwScale = (DWORD)fps_s;
-    vsi.dwRate = (DWORD)fps_r;
-    vsi.dwSuggestedBufferSize = (DWORD)dib_bytes;
-    vsi.dwQuality = (DWORD)((!eff_opts.no_recompress_video && g_vcodec_valid) ? g_vcodec.lQ : (DWORD)-1);
-    SetRect(&vsi.rcFrame, 0, 0, w, h);
-
-    if (AVIFileCreateStreamA(pfile, &pvid, &vsi) != 0 || !pvid)
-    {
-        dbg_error("AVIFileCreateStreamA(vids) failed");
-        goto cleanup;
-    }
-
-    pvid_wr = pvid;
+    // optional VFW video compressor setup (direct HIC for 64-bit OpenDML >2 GB support)
     if (!eff_opts.no_recompress_video && g_vcodec_valid && g_vcodec.fccHandler != 0 &&
         g_vcodec.fccHandler != mmioFOURCC('D', 'I', 'B', ' '))
     {
-        AVICOMPRESSOPTIONS vopts;
         char ini[MAX_PATH];
         get_export_ini_path(ini, sizeof(ini));
 
-        ZeroMemory(&vopts, sizeof(vopts));
-        vopts.fccType = streamtypeVIDEO;
-        vopts.fccHandler = g_vcodec.fccHandler;
-        vopts.dwKeyFrameEvery = (DWORD)(g_vcodec.lKey > 0 ? g_vcodec.lKey : 15);
-        vopts.dwQuality = (DWORD)g_vcodec.lQ;
-        vopts.dwBytesPerSecond = (DWORD)(g_vcodec.lDataRate > 0 ? g_vcodec.lDataRate * 1024 : 0);
-        vopts.dwFlags = AVICOMPRESSF_VALID |
-                        (g_vcodec.lKey > 0 ? AVICOMPRESSF_KEYFRAMES : 0) |
-                        (g_vcodec.lDataRate > 0 ? AVICOMPRESSF_DATARATE : 0);
-        if (g_vcodec.hic)
+        hic_enc = ICOpen(ICTYPE_VIDEO, g_vcodec.fccHandler, ICMODE_COMPRESS);
+        if (hic_enc)
         {
-            LRESULT st_sz = ICGetStateSize(g_vcodec.hic);
-            if (st_sz > 0)
+            LRESULT fmt_sz;
+            if (g_vcodec.hic)
             {
-                codec_par = malloc((size_t)st_sz);
-                if (codec_par && ICGetState(g_vcodec.hic, codec_par, (DWORD_PTR)st_sz) == ICERR_OK)
+                LRESULT st_sz = ICGetStateSize(g_vcodec.hic);
+                if (st_sz > 0)
                 {
-                    vopts.lpParms = codec_par;
-                    vopts.cbParms = (DWORD)st_sz;
+                    codec_par = malloc((size_t)st_sz);
+                    if (codec_par && ICGetState(g_vcodec.hic, codec_par, (DWORD_PTR)st_sz) == ICERR_OK)
+                    {
+                        ICSetState(hic_enc, codec_par, (DWORD_PTR)st_sz);
+                    }
                 }
             }
-        }
-        if (AVIMakeCompressedStream(&pvid_cs, pvid, &vopts, NULL) == AVIERR_OK && pvid_cs)
-        {
-            pvid_wr = pvid_cs;
+
             if ((w & 1) == 0 && (read_codec_ini_flags(g_vcodec.fccHandler, ini) & CODEC_CFG_COMPRESS_YUY2))
             {
-                BITMAPINFOHEADER yuy2_bih = bih;
+                BITMAPINFOHEADER yuy2_bih = in_bih;
                 yuy2_bih.biBitCount = 16;
                 yuy2_bih.biCompression = mmioFOURCC('Y', 'U', 'Y', '2');
                 yuy2_bih.biSizeImage = (DWORD)(w * 2 * h);
-                if (AVIStreamSetFormat(pvid_wr, 0, &yuy2_bih, (LONG)sizeof(yuy2_bih)) == 0)
+                if (ICCompressQuery(hic_enc, &yuy2_bih, NULL) == ICERR_OK)
                 {
+                    in_bih = yuy2_bih;
                     use_yuy2_in = TRUE;
                     dib_stride = w * 2;
                     dib_bytes = dib_stride * h;
                 }
             }
-        }
-        else
-        {
-            dbg_warn("AVIMakeCompressedStream failed for fcc=0x%08X -> writing uncompressed BGR24",
-                     (unsigned)g_vcodec.fccHandler);
+
+            fmt_sz = ICCompressGetFormatSize(hic_enc, &in_bih);
+            if (fmt_sz >= (LRESULT)sizeof(BITMAPINFOHEADER) && fmt_sz <= 65536)
+            {
+                vid_out_bih = (BITMAPINFOHEADER *)calloc(1, (size_t)fmt_sz + 16u);
+                if (vid_out_bih && ICCompressGetFormat(hic_enc, &in_bih, vid_out_bih) == ICERR_OK)
+                {
+                    ICINFO icinfo;
+                    ICCOMPRESSFRAMES icf;
+                    LRESULT max_comp = ICCompressGetSize(hic_enc, &in_bih, vid_out_bih);
+
+                    vid_out_bih_bytes = (uint32_t)fmt_sz;
+                    comp_buf_cap = (max_comp > (LRESULT)dib_bytes)
+                                       ? ((size_t)max_comp + 65536u)
+                                       : ((size_t)dib_bytes + 65536u);
+                    comp_buf = (unsigned char *)malloc(comp_buf_cap);
+
+                    ZeroMemory(&icinfo, sizeof(icinfo));
+                    icinfo.dwSize = sizeof(icinfo);
+                    if (ICGetInfo(hic_enc, &icinfo, sizeof(icinfo)) > 0)
+                    {
+                        if ((icinfo.dwFlags & VIDCF_TEMPORAL) && !(icinfo.dwFlags & VIDCF_FASTTEMPORALC))
+                        {
+                            hic_temporal_only = TRUE;
+                            prev_dib_buf = (unsigned char *)malloc((size_t)dib_bytes);
+                        }
+                    }
+
+                    ZeroMemory(&icf, sizeof(icf));
+                    icf.dwRate = (DWORD)fps_r;
+                    icf.dwScale = (DWORD)fps_s;
+                    icf.lFrameCount = (LONG)g_enc.out_n;
+                    icf.lQuality = g_vcodec.lQ;
+                    icf.lDataRate = g_vcodec.lDataRate > 0 ? g_vcodec.lDataRate * 1024 : 0;
+                    icf.lKeyRate = g_vcodec.lKey > 0 ? g_vcodec.lKey : 15;
+                    ICSendMessage(hic_enc, ICM_COMPRESS_FRAMES_INFO, (DWORD_PTR)&icf, sizeof(icf));
+
+                    if (comp_buf && ICCompressBegin(hic_enc, &in_bih, vid_out_bih) == ICERR_OK)
+                    {
+                        hic_begun = TRUE;
+                        vid_handler = g_vcodec.fccHandler;
+                        vid_ckid = mmioFOURCC('0', '0', 'd', 'c');
+                        vid_quality = (uint32_t)g_vcodec.lQ;
+                        key_every = g_vcodec.lKey >= 0 ? (int)g_vcodec.lKey : 15;
+                        if (g_vcodec.lDataRate > 0 && fps_r > 0)
+                        {
+                            frame_budget = (DWORD)(((uint64_t)g_vcodec.lDataRate * 1024ULL * (uint64_t)fps_s) /
+                                                   (uint64_t)fps_r);
+                        }
+                    }
+                }
+            }
+
+            if (!hic_begun)
+            {
+                dbg_warn("VFW compressor setup failed for fcc=0x%08X -> writing uncompressed BGR24",
+                         (unsigned)g_vcodec.fccHandler);
+                ICClose(hic_enc);
+                hic_enc = NULL;
+                free(vid_out_bih);
+                vid_out_bih = NULL;
+                free(comp_buf);
+                comp_buf = NULL;
+                free(prev_dib_buf);
+                prev_dib_buf = NULL;
+                use_yuy2_in = FALSE;
+                dib_stride = (w * 3 + 3) & ~3;
+                dib_bytes = dib_stride * h;
+                in_bih.biBitCount = 24;
+                in_bih.biCompression = BI_RGB;
+                in_bih.biSizeImage = (DWORD)dib_bytes;
+            }
         }
     }
 
-    if (!use_yuy2_in && AVIStreamSetFormat(pvid_wr, 0, &bih, (LONG)sizeof(bih)) != 0)
+    if (!vid_out_bih)
     {
-        dbg_error("AVIStreamSetFormat(vids) failed");
-        goto cleanup;
+        vid_out_bih = (BITMAPINFOHEADER *)calloc(1, sizeof(BITMAPINFOHEADER));
+        if (!vid_out_bih)
+            goto cleanup;
+        *vid_out_bih = in_bih;
+        vid_out_bih_bytes = sizeof(BITMAPINFOHEADER);
     }
 
-    // create audio stream ('auds') if project has audio
+    // setup audio stream format (PCM16 or ACM compressed) if project has audio
     if (include_audio && g_enc.total_audio_samples > 0)
     {
-        AVISTREAMINFOA asi;
-        WAVEFORMATEX pcm_wfx;
         int ar = g_enc.audio_rate;
         int ch = g_enc.audio_ch;
 
@@ -2450,71 +3218,59 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
         pcm_wfx.nBlockAlign = (WORD)(ch * 2);
         pcm_wfx.nAvgBytesPerSec = (DWORD)(ar * ch * 2);
 
-        ZeroMemory(&asi, sizeof(asi));
-        asi.fccType = streamtypeAUDIO;
-        asi.dwQuality = (DWORD)-1;
-
         if (!eff_opts.no_recompress_audio && g_acodec_valid && g_acodec_wfx &&
             g_acodec_wfx->wFormatTag != WAVE_FORMAT_PCM &&
             acmStreamOpen(&has, NULL, &pcm_wfx, g_acodec_wfx, NULL, 0, 0,
                           ACM_STREAMOPENF_NONREALTIME) == MMSYSERR_NOERROR &&
             has)
         {
-            LONG fmt_len = (LONG)(sizeof(WAVEFORMATEX) + g_acodec_wfx->cbSize);
             DWORD max_in_bytes = (DWORD)(16384 * ch * 2);
-            asi.dwScale = g_acodec_wfx->nBlockAlign > 0 ? g_acodec_wfx->nBlockAlign : 1;
-            asi.dwRate = g_acodec_wfx->nAvgBytesPerSec > 0 ? g_acodec_wfx->nAvgBytesPerSec : (DWORD)(ar * ch * 2);
-            asi.dwSampleSize = g_acodec_wfx->nBlockAlign;
-            if (AVIFileCreateStreamA(pfile, &paud, &asi) == 0 && paud &&
-                AVIStreamSetFormat(paud, 0, g_acodec_wfx, fmt_len) == 0)
+            acmStreamSize(has, max_in_bytes, &acm_dst_cap, ACM_STREAMSIZEF_SOURCE);
+            if (acm_dst_cap < 16384)
+                acm_dst_cap = 16384;
+            acm_src = (unsigned char *)malloc(max_in_bytes);
+            acm_dst = (unsigned char *)malloc(acm_dst_cap);
+            if (acm_src && acm_dst)
             {
-                acmStreamSize(has, max_in_bytes, &acm_dst_cap, ACM_STREAMSIZEF_SOURCE);
-                if (acm_dst_cap < 16384)
-                    acm_dst_cap = 16384;
-                acm_src = (unsigned char *)malloc(max_in_bytes);
-                acm_dst = (unsigned char *)malloc(acm_dst_cap);
-                if (acm_src && acm_dst)
+                ZeroMemory(&ash, sizeof(ash));
+                ash.cbStruct = sizeof(ash);
+                ash.pbSrc = acm_src;
+                ash.cbSrcLength = max_in_bytes;
+                ash.pbDst = acm_dst;
+                ash.cbDstLength = acm_dst_cap;
+                if (acmStreamPrepareHeader(has, &ash, 0) == MMSYSERR_NOERROR)
                 {
-                    ZeroMemory(&ash, sizeof(ash));
-                    ash.cbStruct = sizeof(ash);
-                    ash.pbSrc = acm_src;
-                    ash.cbSrcLength = max_in_bytes;
-                    ash.pbDst = acm_dst;
-                    ash.cbDstLength = acm_dst_cap;
-                    if (acmStreamPrepareHeader(has, &ash, 0) == MMSYSERR_NOERROR)
-                    {
-                        ash_prep = TRUE;
-                    }
+                    ash_prep = TRUE;
+                    aud_out_wfx = g_acodec_wfx;
+                    aud_out_wfx_bytes = (uint32_t)(sizeof(WAVEFORMATEX) + g_acodec_wfx->cbSize);
                 }
             }
             if (!ash_prep)
             {
-                if (paud)
-                {
-                    AVIStreamRelease(paud);
-                    paud = NULL;
-                }
                 acmStreamClose(has, 0);
                 has = NULL;
             }
         }
 
-        if (!paud)
+        if (!aud_out_wfx)
         {
-            asi.dwScale = (DWORD)pcm_wfx.nBlockAlign;
-            asi.dwRate = pcm_wfx.nAvgBytesPerSec;
-            asi.dwSampleSize = (DWORD)pcm_wfx.nBlockAlign;
-            asi.dwSuggestedBufferSize = (DWORD)(ar * ch * 2);
-            if (AVIFileCreateStreamA(pfile, &paud, &asi) == 0 && paud)
-            {
-                if (AVIStreamSetFormat(paud, 0, &pcm_wfx, (LONG)sizeof(pcm_wfx)) != 0)
-                {
-                    AVIStreamRelease(paud);
-                    paud = NULL;
-                }
-            }
+            aud_out_wfx = &pcm_wfx;
+            aud_out_wfx_bytes = sizeof(WAVEFORMATEX);
         }
+        wrote_audio = TRUE;
     }
+
+    DeleteFileA(abs_path);
+    if (!odml_writer_open(&odml, abs_path, w, h, fps_r, fps_s,
+                          vid_handler, vid_ckid, vid_quality,
+                          vid_out_bih, vid_out_bih_bytes,
+                          aud_out_wfx, aud_out_wfx_bytes,
+                          &eff_opts.exinfo))
+    {
+        dbg_error("OpenDML AVI writer open failed for '%s'", abs_path);
+        goto cleanup;
+    }
+    odml_opened = TRUE;
 
     // frame-by-frame render + interleave loop
     {
@@ -2534,19 +3290,15 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
             editp_get_frame_status(ep, tl_f, &st);
             if ((st & EDIT_FRAME_EDIT_FLAG_NULLFRAME) && k > 0)
             {
-                // aviutl [copy]/NULLFRAME: emit 0-byte drop sample in AVI stream
-                if (AVIStreamWrite(pvid_wr, (LONG)k, 1, NULL, 0, 0, NULL, NULL) != 0)
+                if (!odml_write_video_chunk(&odml, NULL, 0, FALSE))
                 {
-                    dbg_error("AVIStreamWrite(drop frame %d) failed", k);
+                    dbg_error("OpenDML write drop frame %d failed", k);
                     goto cleanup;
                 }
             }
             else
             {
                 int cw = 0, ch_h = 0, cmw = 0, cmh = 0;
-                DWORD vflags = (pvid_wr == pvid || (st & EDIT_FRAME_EDIT_FLAG_KEYFRAME))
-                                   ? AVIIF_KEYFRAME
-                                   : 0;
                 if (!plugin_manager_render_video_frame(ep, tl_f))
                 {
                     editp_load_frame(ep, tl_f);
@@ -2563,11 +3315,49 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
                     yc2rgb_dib24(dib_buf, dib_stride, editp_get_ycp_edit(ep),
                                  cmw, cw < w ? cw : w, ch_h < h ? ch_h : h, TRUE);
                 }
-                if (AVIStreamWrite(pvid_wr, (LONG)k, 1, dib_buf, (LONG)dib_bytes,
-                                   vflags, NULL, NULL) != 0)
+
+                if (hic_enc && hic_begun)
                 {
-                    dbg_error("AVIStreamWrite(video frame %d) failed", k);
-                    goto cleanup;
+                    DWORD ckid_out = 0;
+                    DWORD comp_flags = 0;
+                    BOOL want_kf = (k == 0) ||
+                                   ((st & EDIT_FRAME_EDIT_FLAG_KEYFRAME) != 0) ||
+                                   (key_every > 0 && (k - last_kf) >= key_every);
+                    BITMAPINFOHEADER prev_bih = in_bih;
+                    if (ICCompress(hic_enc,
+                                   want_kf ? ICCOMPRESS_KEYFRAME : 0,
+                                   vid_out_bih, comp_buf,
+                                   &in_bih, dib_buf,
+                                   &ckid_out, &comp_flags,
+                                   (LONG)k, frame_budget, g_vcodec.lQ,
+                                   (!want_kf && hic_temporal_only && prev_dib_buf) ? &prev_bih : NULL,
+                                   (!want_kf && hic_temporal_only && prev_dib_buf) ? prev_dib_buf : NULL) != ICERR_OK)
+                    {
+                        dbg_error("ICCompress(frame %d) failed", k);
+                        goto cleanup;
+                    }
+                    {
+                        BOOL is_kf = (comp_flags & AVIIF_KEYFRAME) != 0 || (k == 0);
+                        if (is_kf)
+                            last_kf = k;
+                        if (!odml_write_video_chunk(&odml, comp_buf, vid_out_bih->biSizeImage, is_kf))
+                        {
+                            dbg_error("OpenDML write compressed video frame %d failed", k);
+                            goto cleanup;
+                        }
+                    }
+                    if (prev_dib_buf)
+                    {
+                        memcpy(prev_dib_buf, dib_buf, (size_t)dib_bytes);
+                    }
+                }
+                else
+                {
+                    if (!odml_write_video_chunk(&odml, dib_buf, (uint32_t)dib_bytes, TRUE))
+                    {
+                        dbg_error("OpenDML write video frame %d failed", k);
+                        goto cleanup;
+                    }
                 }
             }
 
@@ -2576,7 +3366,7 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
                 g_on_preview_update(owner);
             }
 
-            if (paud && (((k + 1) % ileave_frames) == 0 || (k + 1) >= g_enc.out_n))
+            if (wrote_audio && (((k + 1) % ileave_frames) == 0 || (k + 1) >= g_enc.out_n))
             {
                 int target_aud_end = (k + 1 >= g_enc.out_n)
                                          ? g_enc.aud_frame_n
@@ -2610,32 +3400,33 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
                             DWORD in_bytes = (DWORD)(got * ach * 2);
                             if (in_bytes <= (DWORD)(16384 * ach * 2))
                             {
+                                memcpy(acm_src, pcm_buf, (size_t)in_bytes);
                                 ash.cbSrcLength = in_bytes;
                                 ash.cbSrcLengthUsed = 0;
                                 ash.cbDstLengthUsed = 0;
                                 if (acmStreamConvert(has, &ash, ACM_STREAMCONVERTF_BLOCKALIGN) == MMSYSERR_NOERROR &&
                                     ash.cbDstLengthUsed > 0)
                                 {
-                                    LONG blk_a = g_acodec_wfx->nBlockAlign > 0 ? g_acodec_wfx->nBlockAlign : 1;
-                                    LONG nblocks = (LONG)(ash.cbDstLengthUsed / (DWORD)blk_a);
+                                    uint32_t blk_a = odml.aud_block_align;
+                                    uint32_t nblocks = ash.cbDstLengthUsed / blk_a;
                                     if (nblocks < 1)
                                         nblocks = 1;
-                                    AVIStreamWrite(paud, aud_pos, nblocks, acm_dst,
-                                                   (LONG)ash.cbDstLengthUsed, 0, NULL, NULL);
-                                    aud_pos += nblocks;
+                                    if (!odml_write_audio_chunk(&odml, acm_dst, ash.cbDstLengthUsed, nblocks))
+                                    {
+                                        dbg_error("OpenDML write ACM audio chunk failed");
+                                        goto cleanup;
+                                    }
                                 }
                             }
                         }
                         else
                         {
-                            LONG bytes = (LONG)(got * ach * 2);
-                            if (AVIStreamWrite(paud, aud_pos, (LONG)got, pcm_buf, bytes,
-                                               AVIIF_KEYFRAME, NULL, NULL) != 0)
+                            uint32_t bytes = (uint32_t)(got * ach * 2);
+                            if (!odml_write_audio_chunk(&odml, pcm_buf, bytes, (uint32_t)got))
                             {
-                                dbg_error("AVIStreamWrite(audio frame %d) failed", aud_k - 1);
+                                dbg_error("OpenDML write PCM audio frame %d failed", aud_k - 1);
                                 goto cleanup;
                             }
-                            aud_pos += (LONG)got;
                         }
                     }
                 }
@@ -2643,7 +3434,7 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
         }
     }
 
-    if (paud && has && ash_prep && !g_enc.abort_req)
+    if (wrote_audio && has && ash_prep && !g_enc.abort_req)
     {
         ash.cbSrcLength = 0;
         ash.cbSrcLengthUsed = 0;
@@ -2651,29 +3442,43 @@ BOOL video_export_avi_file_with_options(HWND owner, EDITP *ep, const char *save_
         if (acmStreamConvert(has, &ash, ACM_STREAMCONVERTF_END) == MMSYSERR_NOERROR &&
             ash.cbDstLengthUsed > 0)
         {
-            LONG blk_a = g_acodec_wfx->nBlockAlign > 0 ? g_acodec_wfx->nBlockAlign : 1;
-            LONG nblocks = (LONG)(ash.cbDstLengthUsed / (DWORD)blk_a);
+            uint32_t blk_a = odml.aud_block_align;
+            uint32_t nblocks = ash.cbDstLengthUsed / blk_a;
             if (nblocks < 1)
                 nblocks = 1;
-            AVIStreamWrite(paud, aud_pos, nblocks, acm_dst,
-                           (LONG)ash.cbDstLengthUsed, 0, NULL, NULL);
+            odml_write_audio_chunk(&odml, acm_dst, ash.cbDstLengthUsed, nblocks);
         }
     }
 
     pump_encode_messages_and_progress(owner, g_enc.out_n, g_enc.out_n, TRUE);
-    ok = (g_enc.abort_req == 0);
+    if (odml_opened && g_enc.abort_req == 0)
+    {
+        ok = odml_writer_close(&odml, TRUE);
+        odml_opened = FALSE;
+    }
+
     if (ok)
     {
-        dbg_info("Exported AVI '%s' (%dx%d, %d frames, %d/%d fps%s)",
-                 abs_path, w, h, g_enc.out_n, fps_r, fps_s,
-                 paud ? ", with audio" : "");
+        dbg_info("Exported OpenDML AVI '%s' (%dx%d, %d frames, %d/%d fps, %d RIFF segment(s)%s)",
+                 abs_path, w, h, g_enc.out_n, fps_r, fps_s, odml.seg_idx + 1,
+                 wrote_audio ? ", with audio" : "");
     }
 
 cleanup:
     {
         int out_frames_done = g_enc.out_n;
-        BOOL had_paud = (paud != NULL);
 
+        if (odml_opened)
+        {
+            odml_writer_close(&odml, FALSE);
+        }
+
+        if (hic_enc)
+        {
+            if (hic_begun)
+                ICCompressEnd(hic_enc);
+            ICClose(hic_enc);
+        }
         if (has)
         {
             if (ash_prep)
@@ -2688,17 +3493,10 @@ cleanup:
         free(acm_dst);
         free(pcm_buf);
         free(codec_par);
+        free(comp_buf);
+        free(prev_dib_buf);
+        free(vid_out_bih);
         free(dib_buf);
-
-        if (pvid_cs)
-            AVIStreamRelease(pvid_cs);
-        if (pvid)
-            AVIStreamRelease(pvid);
-        if (paud)
-            AVIStreamRelease(paud);
-        if (pfile)
-            AVIFileRelease(pfile);
-        AVIFileExit();
 
         plugin_manager_notify_save_end(ep,
                                        OUTPUT_INFO_FLAG_VIDEO | (include_audio ? OUTPUT_INFO_FLAG_AUDIO : 0));
@@ -2709,7 +3507,6 @@ cleanup:
 
         if (ok)
         {
-            video_export_write_riff_info_tags(abs_path, &eff_opts.exinfo);
             if (eff_opts.output_wav_sidecar)
             {
                 char wav_sidecar[MAX_PATH];
@@ -2720,7 +3517,7 @@ cleanup:
             if (eff_opts.output_log)
             {
                 write_avi_export_log(abs_path, ep, w, h, fps_r, fps_s, out_frames_done,
-                                     had_paud, &st_start, GetTickCount() - t0_tick);
+                                     wrote_audio, &st_start, GetTickCount() - t0_tick);
             }
             notify_export_finished(owner, out_flags);
         }

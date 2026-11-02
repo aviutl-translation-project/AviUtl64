@@ -66,11 +66,11 @@ static void sync_shm_from_local(void)
                   sizeof(g_shm->output_path));
         if (g_shm->frame_n > 0)
         {
-            int lim = (g_shm->frame_n < REAVIUTL_MAX_FRAME) ? g_shm->frame_n : REAVIUTL_MAX_FRAME;
+            int lim = (g_shm->frame_n < g_shm->shm_max_frame) ? g_shm->frame_n : g_shm->shm_max_frame;
             const BYTE *tbl = editp_get_frame_status_table(g_editp, 0);
-            if (tbl)
+            if (tbl && lim > 0)
             {
-                memcpy(g_shm->frame_status, tbl, (size_t)lim);
+                memcpy(bridge_shm_frame_status(g_shm), tbl, (size_t)lim);
             }
         }
     }
@@ -380,11 +380,11 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
             if (g_shm && editp_get_frame_n(g_editp) > 0)
             {
                 int fn = editp_get_frame_n(g_editp);
-                int lim = (fn < REAVIUTL_MAX_FRAME) ? fn : REAVIUTL_MAX_FRAME;
+                int lim = (fn < g_shm->shm_max_frame) ? fn : g_shm->shm_max_frame;
                 BYTE *tbl = editp_get_frame_status_table(g_editp, 0);
-                if (tbl)
+                if (tbl && lim > 0)
                 {
-                    memcpy(tbl, g_shm->frame_status, (size_t)lim);
+                    memcpy(tbl, bridge_shm_frame_status(g_shm), (size_t)lim);
                 }
                 editp_set_output_path(g_editp, g_shm->output_path);
             }
@@ -522,8 +522,8 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
         {
             resp->ok = vfw_input_read_frame_stride(g_bridge_aui_handles[req->arg0],
                                                    req->arg1,
-                                                   g_shm->ycp_frame,
-                                                   REAVIUTL_VRAM_W)
+                                                   bridge_shm_ycp_frame(g_shm),
+                                                   g_shm->shm_vram_w)
                            ? 1
                            : 0;
         }
@@ -608,12 +608,13 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
                 editp_get_dimensions(g_editp, &w, &h, &max_w, &max_h);
                 if (dst && w > 0 && h > 0)
                 {
-                    int copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
-                    int copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
+                    const PIXEL_YC *shm_ycp = bridge_shm_ycp_frame(g_shm);
+                    int copy_w = (w < g_shm->shm_vram_w) ? w : g_shm->shm_vram_w;
+                    int copy_h = (h < g_shm->shm_vram_h) ? h : g_shm->shm_vram_h;
                     for (y = 0; y < copy_h; y++)
                     {
-                        memcpy(&dst[y * max_w],
-                               &g_shm->ycp_frame[y * REAVIUTL_VRAM_W],
+                        memcpy(&dst[(size_t)y * (size_t)max_w],
+                               &shm_ycp[(size_t)y * (size_t)g_shm->shm_vram_w],
                                (size_t)copy_w * sizeof(PIXEL_YC));
                     }
                 }
@@ -667,12 +668,13 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
                 editp_get_dimensions(g_editp, &w, &h, &max_w, &max_h);
                 if (src && w > 0 && h > 0)
                 {
-                    int copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
-                    int copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
+                    PIXEL_YC *shm_ycp = bridge_shm_ycp_frame(g_shm);
+                    int copy_w = (w < g_shm->shm_vram_w) ? w : g_shm->shm_vram_w;
+                    int copy_h = (h < g_shm->shm_vram_h) ? h : g_shm->shm_vram_h;
                     for (y = 0; y < copy_h; y++)
                     {
-                        memcpy(&g_shm->ycp_frame[y * REAVIUTL_VRAM_W],
-                               &src[y * max_w],
+                        memcpy(&shm_ycp[(size_t)y * (size_t)g_shm->shm_vram_w],
+                               &src[(size_t)y * (size_t)max_w],
                                (size_t)copy_w * sizeof(PIXEL_YC));
                     }
                 }
@@ -794,9 +796,11 @@ int main(int argc, char **argv)
         return 2;
 
     g_shm = (BridgeSharedMem *)MapViewOfFile(g_shm_handle, FILE_MAP_ALL_ACCESS,
-                                             0, 0, sizeof(BridgeSharedMem));
-    if (!g_shm || g_shm->magic != BRIDGE_MAGIC)
+                                             0, 0, 0);
+    if (!g_shm || g_shm->magic != BRIDGE_MAGIC || g_shm->version != BRIDGE_VERSION)
         return 3;
+    editp_set_sys_limits(g_shm->shm_vram_w, g_shm->shm_vram_h, g_shm->shm_max_frame);
+    exfunc_reload_system_settings();
     video_export_set_bridge_telemetry(&g_shm->encode_abort,
                                       &g_shm->encode_now,
                                       &g_shm->encode_total);

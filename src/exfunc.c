@@ -24,6 +24,7 @@ static ExfuncEditOutputFn g_on_edit_output = NULL;
 
 // scratch buffers lazily allocated for EXFUNC frame/pixel queries
 static PIXEL_YC *g_filtering_yc_buf = NULL;
+static size_t g_filtering_yc_cap = 0;
 static unsigned char *g_disp_bgr_buf = NULL;
 static size_t g_disp_bgr_cap = 0;
 
@@ -371,10 +372,12 @@ static const char *filter_ini_section(FILTER *fp)
 
 static PIXEL_YC *ensure_filtering_yc_buf(void)
 {
-    if (!g_filtering_yc_buf)
+    size_t need = (size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H;
+    if (!g_filtering_yc_buf || g_filtering_yc_cap < need)
     {
-        g_filtering_yc_buf = (PIXEL_YC *)calloc(
-            (size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H, sizeof(PIXEL_YC));
+        free(g_filtering_yc_buf);
+        g_filtering_yc_buf = (PIXEL_YC *)calloc(need, sizeof(PIXEL_YC));
+        g_filtering_yc_cap = g_filtering_yc_buf ? need : 0;
     }
     return g_filtering_yc_buf;
 }
@@ -1260,8 +1263,10 @@ static void *__cdecl impl_get_ycp_source_cache(void *editp, int n, int ofs)
     slot = &g_source_cache[best_idx];
     frame_bytes = (size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H * sizeof(PIXEL_YC);
 
-    if (!slot->ycp)
+    if (!slot->ycp || slot->alloc_bytes < frame_bytes)
     {
+        if (slot->ycp)
+            free_source_cache_slot_buf(slot);
         cache_enforce_budget(frame_bytes, NULL);
         slot->ycp = (PIXEL_YC *)calloc((size_t)REAVIUTL_VRAM_W * (size_t)REAVIUTL_VRAM_H,
                                        sizeof(PIXEL_YC));
@@ -2058,7 +2063,9 @@ void exfunc_reload_system_settings(void)
     const char *ini = ensure_ini_path();
     int mt = (int)GetPrivateProfileIntA("system", "multithread", 0, ini);
     BOOL sep = GetPrivateProfileIntA("system", "threadcpuseparate", 0, ini) != 0;
-    int share_mb = (int)GetPrivateProfileIntA("system", "sharecache", 32, ini);
+    int share_mb = (int)GetPrivateProfileIntA("system", "sharecache", 256, ini);
+
+    editp_reload_sys_flags_from_ini(ini);
 
     if (mt < 0)
         mt = 0;
@@ -2066,8 +2073,8 @@ void exfunc_reload_system_settings(void)
         mt = MT_MAX_THREADS;
     if (share_mb < 8)
         share_mb = 8;
-    if (share_mb > 4096)
-        share_mb = 4096;
+    if (share_mb > (REAVIUTL_X64 ? 65536 : 2048))
+        share_mb = (REAVIUTL_X64 ? 65536 : 2048);
 
     g_cfg_overwritecheck = (int)GetPrivateProfileIntA("system", "overwritecheck", 0, ini);
     g_cache_budget_bytes = (size_t)share_mb * 1024u * 1024u;
@@ -2145,6 +2152,7 @@ void exfunc_shutdown(void)
     g_cache_used_bytes = 0;
     free(g_filtering_yc_buf);
     g_filtering_yc_buf = NULL;
+    g_filtering_yc_cap = 0;
     free(g_disp_bgr_buf);
     g_disp_bgr_buf = NULL;
     g_disp_bgr_cap = 0;

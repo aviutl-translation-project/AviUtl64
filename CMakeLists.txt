@@ -59,6 +59,7 @@ if(MSVC)
 		PRIVATE
 			/SUBSYSTEM:CONSOLE
 			/ENTRY:WinMainCRTStartup
+			$<$<EQUAL:${CMAKE_SIZEOF_VOID_P},4>:/LARGEADDRESSAWARE>
 	)
 else()
 	target_compile_options(reaviutl
@@ -99,6 +100,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 				/wd4819
 				/wd5105
 				/D_CRT_SECURE_NO_WARNINGS
+		)
+		target_link_options(reaviutl_bridge32
+			PRIVATE
+				/LARGEADDRESSAWARE
 		)
 	endif()
 

@@ -252,6 +252,11 @@ static BOOL ensure_bridge_started(HWND main_hwnd)
     DWORD inst;
     OVERLAPPED ov;
     DWORD dummy = 0;
+    int bw = REAVIUTL_VRAM_W;
+    int bh = REAVIUTL_VRAM_H;
+    int bf = REAVIUTL_MAX_FRAME;
+    uint32_t status_ofs = 0, ycp_ofs = 0;
+    uint64_t shm_bytes;
 
     if (g_active)
         return TRUE;
@@ -260,6 +265,15 @@ static BOOL ensure_bridge_started(HWND main_hwnd)
         return FALSE;
     }
 
+    if ((uint64_t)bw * (uint64_t)bh * sizeof(PIXEL_YC) > 512ULL * 1024ULL * 1024ULL)
+    {
+        if (bw > 8192)
+            bw = 8192;
+        if (bh > 8192)
+            bh = 8192;
+    }
+    shm_bytes = bridge_shm_compute_layout(bw, bh, bf, &status_ofs, &ycp_ofs);
+
     inst = ++s_instance;
     wsprintfA(pipe_name, "\\\\.\\pipe\\reaviutl_bridge_%lu_%lu",
               (unsigned long)pid, (unsigned long)inst);
@@ -267,12 +281,12 @@ static BOOL ensure_bridge_started(HWND main_hwnd)
               (unsigned long)pid, (unsigned long)inst);
 
     g_shm_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
-                                      0, (DWORD)sizeof(BridgeSharedMem), shm_name);
+                                      (DWORD)(shm_bytes >> 32), (DWORD)(shm_bytes & 0xFFFFFFFFu), shm_name);
     if (!g_shm_handle)
         return FALSE;
 
     g_shm = (BridgeSharedMem *)MapViewOfFile(g_shm_handle, FILE_MAP_ALL_ACCESS,
-                                             0, 0, sizeof(BridgeSharedMem));
+                                             0, 0, (SIZE_T)shm_bytes);
     if (!g_shm)
     {
         CloseHandle(g_shm_handle);
@@ -282,6 +296,12 @@ static BOOL ensure_bridge_started(HWND main_hwnd)
     ZeroMemory(g_shm, sizeof(BridgeSharedMem));
     g_shm->magic = BRIDGE_MAGIC;
     g_shm->version = BRIDGE_VERSION;
+    g_shm->shm_total_bytes = shm_bytes;
+    g_shm->shm_vram_w = bw;
+    g_shm->shm_vram_h = bh;
+    g_shm->shm_max_frame = bf;
+    g_shm->frame_status_ofs = status_ofs;
+    g_shm->ycp_frame_ofs = ycp_ofs;
 
     g_pipe = CreateNamedPipeA(
         pipe_name,
@@ -762,11 +782,11 @@ BOOL plugin_bridge_sync_to_bridge(EDITP *ep)
     fn = editp_get_frame_n(ep);
     if (fn > 0)
     {
-        int lim = (fn < REAVIUTL_MAX_FRAME) ? fn : REAVIUTL_MAX_FRAME;
+        int lim = (fn < g_shm->shm_max_frame) ? fn : g_shm->shm_max_frame;
         const BYTE *tbl = editp_get_frame_status_table(ep, 0);
-        if (tbl)
+        if (tbl && lim > 0)
         {
-            memcpy(g_shm->frame_status, tbl, (size_t)lim);
+            memcpy(bridge_shm_frame_status(g_shm), tbl, (size_t)lim);
         }
     }
     lstrcpynA(g_shm->output_path, editp_get_output_path(ep), sizeof(g_shm->output_path));
@@ -823,11 +843,11 @@ BOOL plugin_bridge_sync_from_bridge(EDITP *ep)
         }
         if (g_shm->frame_n > 0)
         {
-            int lim = (g_shm->frame_n < REAVIUTL_MAX_FRAME) ? g_shm->frame_n : REAVIUTL_MAX_FRAME;
+            int lim = (g_shm->frame_n < g_shm->shm_max_frame) ? g_shm->frame_n : g_shm->shm_max_frame;
             BYTE *tbl = editp_get_frame_status_table(ep, 0);
-            if (tbl)
+            if (tbl && lim > 0)
             {
-                memcpy(tbl, g_shm->frame_status, (size_t)lim);
+                memcpy(tbl, bridge_shm_frame_status(g_shm), (size_t)lim);
             }
         }
         editp_set_select_frame(ep, g_shm->select_s, g_shm->select_e);
@@ -863,12 +883,13 @@ BOOL plugin_bridge_render_frame_subset(EDITP *ep, int frame_num, BOOL push_host_
     if (push_host_frame && w > 0 && h > 0)
     {
         const PIXEL_YC *src = editp_get_ycp_edit(ep);
-        int copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
-        int copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
+        PIXEL_YC *shm_ycp = bridge_shm_ycp_frame(g_shm);
+        int copy_w = (w < g_shm->shm_vram_w) ? w : g_shm->shm_vram_w;
+        int copy_h = (h < g_shm->shm_vram_h) ? h : g_shm->shm_vram_h;
         for (y = 0; y < copy_h; y++)
         {
-            memcpy(&g_shm->ycp_frame[y * REAVIUTL_VRAM_W],
-                   &src[y * max_w],
+            memcpy(&shm_ycp[(size_t)y * (size_t)g_shm->shm_vram_w],
+                   &src[(size_t)y * (size_t)max_w],
                    (size_t)copy_w * sizeof(PIXEL_YC));
         }
         g_shm->w = w;
@@ -896,12 +917,13 @@ BOOL plugin_bridge_render_frame_subset(EDITP *ep, int frame_num, BOOL push_host_
     dst = editp_get_ycp_edit(ep);
     if (dst && w > 0 && h > 0)
     {
-        int copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
-        int copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
+        const PIXEL_YC *shm_ycp = bridge_shm_ycp_frame(g_shm);
+        int copy_w = (w < g_shm->shm_vram_w) ? w : g_shm->shm_vram_w;
+        int copy_h = (h < g_shm->shm_vram_h) ? h : g_shm->shm_vram_h;
         for (y = 0; y < copy_h; y++)
         {
-            memcpy(&dst[y * max_w],
-                   &g_shm->ycp_frame[y * REAVIUTL_VRAM_W],
+            memcpy(&dst[(size_t)y * (size_t)max_w],
+                   &shm_ycp[(size_t)y * (size_t)g_shm->shm_vram_w],
                    (size_t)copy_w * sizeof(PIXEL_YC));
         }
     }
@@ -1215,13 +1237,16 @@ BOOL plugin_bridge_aui_read_video(int handle_slot, int frame_num, PIXEL_YC *ycp,
     req.arg1 = frame_num;
     if (!bridge_rpc(&req, &resp, 10000))
         return FALSE;
-    copy_w = (w < REAVIUTL_VRAM_W) ? w : REAVIUTL_VRAM_W;
-    copy_h = (h < REAVIUTL_VRAM_H) ? h : REAVIUTL_VRAM_H;
-    for (y = 0; y < copy_h; y++)
+    copy_w = (w < g_shm->shm_vram_w) ? w : g_shm->shm_vram_w;
+    copy_h = (h < g_shm->shm_vram_h) ? h : g_shm->shm_vram_h;
     {
-        memcpy(ycp + (size_t)y * (size_t)yc_stride,
-               &g_shm->ycp_frame[(size_t)y * (size_t)REAVIUTL_VRAM_W],
-               (size_t)copy_w * sizeof(PIXEL_YC));
+        const PIXEL_YC *shm_ycp = bridge_shm_ycp_frame(g_shm);
+        for (y = 0; y < copy_h; y++)
+        {
+            memcpy(ycp + (size_t)y * (size_t)yc_stride,
+                   &shm_ycp[(size_t)y * (size_t)g_shm->shm_vram_w],
+                   (size_t)copy_w * sizeof(PIXEL_YC));
+        }
     }
     return TRUE;
 }

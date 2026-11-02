@@ -6,10 +6,21 @@
 #include <stdint.h>
 #include "filter.h"
 
-#define REAVIUTL_VRAM_W 1920
-#define REAVIUTL_VRAM_H 1080
-#define REAVIUTL_MAX_FRAME 320000
+#define REAVIUTL_DEFAULT_VRAM_W 1920
+#define REAVIUTL_DEFAULT_VRAM_H 1080
+#define REAVIUTL_DEFAULT_MAX_FRAME 320000
 #define REAVIUTL_BUILD 11003 // 0x2afb
+
+void editp_init_sys_limits_from_ini(const char *ini_path);
+void editp_reload_sys_flags_from_ini(const char *ini_path);
+void editp_set_sys_limits(int max_w, int max_h, int max_frame);
+int editp_get_sys_max_w(void);
+int editp_get_sys_max_h(void);
+int editp_get_sys_max_frame(void);
+
+#define REAVIUTL_VRAM_W (editp_get_sys_max_w())
+#define REAVIUTL_VRAM_H (editp_get_sys_max_h())
+#define REAVIUTL_MAX_FRAME (editp_get_sys_max_frame())
 
 typedef struct EDITP_T EDITP;
 typedef struct EDITP_T EditpHandle;

@@ -11,7 +11,7 @@
 #include "editp.h"
 
 #define BRIDGE_MAGIC 0x52415542u // "RAUB"
-#define BRIDGE_VERSION 7u
+#define BRIDGE_VERSION 8u
 #define BRIDGE_MAX_FILTERS 64
 #define BRIDGE_MAX_MENU_ITEMS 256
 #define BRIDGE_MAX_AUOS 32
@@ -155,7 +155,13 @@ typedef struct BridgeSharedMem
     char edit_path[260];
     char project_path[260];
     char output_path[260];
-    uint8_t frame_status[REAVIUTL_MAX_FRAME];
+
+    uint64_t shm_total_bytes;
+    int32_t shm_vram_w;
+    int32_t shm_vram_h;
+    int32_t shm_max_frame;
+    uint32_t frame_status_ofs;
+    uint32_t ycp_frame_ofs;
 
     int32_t filter_count;
     BridgeFilterInfo filters[BRIDGE_MAX_FILTERS];
@@ -174,7 +180,6 @@ typedef struct BridgeSharedMem
     BridgeAucInfo aucs[BRIDGE_MAX_AUCS];
     BridgeAuiOpenInfo aui_open_info;
 
-    PIXEL_YC ycp_frame[REAVIUTL_VRAM_W * REAVIUTL_VRAM_H];
     int16_t pcm_audio[BRIDGE_MAX_AUDIO_SAMPLES * 2];
 } BridgeSharedMem;
 
@@ -199,6 +204,30 @@ typedef struct BridgeRpcResp
 } BridgeRpcResp;
 
 #pragma pack(pop)
+
+static __inline uint64_t bridge_shm_compute_layout(int vram_w, int vram_h, int max_frame,
+                                                   uint32_t *out_status_ofs, uint32_t *out_ycp_ofs)
+{
+    uint64_t ofs = ((uint64_t)sizeof(BridgeSharedMem) + 15ULL) & ~15ULL;
+    if (out_status_ofs)
+        *out_status_ofs = (uint32_t)ofs;
+    ofs += ((uint64_t)(max_frame > 0 ? max_frame : 1) + 15ULL) & ~15ULL;
+    if (out_ycp_ofs)
+        *out_ycp_ofs = (uint32_t)ofs;
+    ofs += (uint64_t)(vram_w > 0 ? vram_w : 1) * (uint64_t)(vram_h > 0 ? vram_h : 1) *
+           (uint64_t)sizeof(PIXEL_YC);
+    return ofs;
+}
+
+static __inline uint8_t *bridge_shm_frame_status(BridgeSharedMem *shm)
+{
+    return (uint8_t *)((uint8_t *)shm + shm->frame_status_ofs);
+}
+
+static __inline PIXEL_YC *bridge_shm_ycp_frame(BridgeSharedMem *shm)
+{
+    return (PIXEL_YC *)((uint8_t *)shm + shm->ycp_frame_ofs);
+}
 
 BOOL plugin_bridge_is_active(void);
 BOOL plugin_bridge_load_dir(const char *plugin_dir, HWND main_hwnd, EDITP *ep);

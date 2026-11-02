@@ -178,6 +178,71 @@ static int g_registered_filter_count = 0;
 static HFONT g_ui_font = NULL;
 static char g_version_info[] = "AviUtl version 1.10";
 static char g_empty_str[] = "";
+static int g_sys_max_w = REAVIUTL_DEFAULT_VRAM_W;
+static int g_sys_max_h = REAVIUTL_DEFAULT_VRAM_H;
+static int g_sys_max_frame = REAVIUTL_DEFAULT_MAX_FRAME;
+static BOOL g_sys_use_sse = TRUE;
+static BOOL g_sys_use_sse2 = TRUE;
+
+void editp_set_sys_limits(int max_w, int max_h, int max_frame)
+{
+    // 0x00402e70 lines 493-506: align dimensions up to 8, clamp [320x240 .. 16384x16384] and frames [1024 .. 0x7fffff]
+    max_w = (max_w + 7) & ~7;
+    max_h = (max_h + 7) & ~7;
+    if (max_w < 320)
+        max_w = 320;
+    else if (max_w > 16384)
+        max_w = 16384;
+    if (max_h < 240)
+        max_h = 240;
+    else if (max_h > 16384)
+        max_h = 16384;
+    if (max_frame < 1024)
+        max_frame = 1024;
+    else if (max_frame > 0x7fffff)
+        max_frame = 0x7fffff;
+    g_sys_max_w = max_w;
+    g_sys_max_h = max_h;
+    g_sys_max_frame = max_frame;
+}
+
+void editp_reload_sys_flags_from_ini(const char *ini_path)
+{
+    if (!ini_path || !ini_path[0])
+        return;
+    g_sys_use_sse = GetPrivateProfileIntA("system", "sse", 1, ini_path) != 0;
+    g_sys_use_sse2 = GetPrivateProfileIntA("system", "sse2", 1, ini_path) != 0;
+}
+
+void editp_init_sys_limits_from_ini(const char *ini_path)
+{
+    int w = REAVIUTL_DEFAULT_VRAM_W;
+    int h = REAVIUTL_DEFAULT_VRAM_H;
+    int f = REAVIUTL_DEFAULT_MAX_FRAME;
+    if (ini_path && ini_path[0])
+    {
+        w = (int)GetPrivateProfileIntA("system", "width", REAVIUTL_DEFAULT_VRAM_W, ini_path);
+        h = (int)GetPrivateProfileIntA("system", "height", REAVIUTL_DEFAULT_VRAM_H, ini_path);
+        f = (int)GetPrivateProfileIntA("system", "frame", REAVIUTL_DEFAULT_MAX_FRAME, ini_path);
+        editp_reload_sys_flags_from_ini(ini_path);
+    }
+    editp_set_sys_limits(w, h, f);
+}
+
+int editp_get_sys_max_w(void)
+{
+    return g_sys_max_w;
+}
+
+int editp_get_sys_max_h(void)
+{
+    return g_sys_max_h;
+}
+
+int editp_get_sys_max_frame(void)
+{
+    return g_sys_max_frame;
+}
 
 void editp_set_registered_filter_count(int count)
 {
@@ -2435,7 +2500,11 @@ void editp_get_sys_info(EDITP *ep, SYS_INFO *si)
         return;
 
     // 0x00422120, populate +0x00..+0x44 without writing past 0x48
-    si->flag = SYS_INFO_FLAG_USE_SSE | SYS_INFO_FLAG_USE_SSE2;
+    si->flag = 0;
+    if (g_sys_use_sse)
+        si->flag |= SYS_INFO_FLAG_USE_SSE;
+    if (g_sys_use_sse2)
+        si->flag |= SYS_INFO_FLAG_USE_SSE2;
     if (ep && ep->is_editing)
     {
         si->flag |= SYS_INFO_FLAG_EDIT;

@@ -2348,10 +2348,10 @@ static void run_system_settings_dialog(HWND owner)
     aviutl_dlg_init(&st);
     st.on_cmd = on_system_dlg_cmd;
 
-    st.ints[0] = GetPrivateProfileIntA("system", "width", REAVIUTL_VRAM_W, ini);
-    st.ints[1] = GetPrivateProfileIntA("system", "height", REAVIUTL_VRAM_H, ini);
-    st.ints[2] = GetPrivateProfileIntA("system", "frame", REAVIUTL_MAX_FRAME, ini);
-    st.ints[3] = GetPrivateProfileIntA("system", "sharecache", 32, ini);
+    st.ints[0] = GetPrivateProfileIntA("system", "width", REAVIUTL_DEFAULT_VRAM_W, ini);
+    st.ints[1] = GetPrivateProfileIntA("system", "height", REAVIUTL_DEFAULT_VRAM_H, ini);
+    st.ints[2] = GetPrivateProfileIntA("system", "frame", REAVIUTL_DEFAULT_MAX_FRAME, ini);
+    st.ints[3] = GetPrivateProfileIntA("system", "sharecache", 256, ini);
     st.ints[5] = GetPrivateProfileIntA("system", "moveA", 5, ini);
     st.ints[6] = GetPrivateProfileIntA("system", "moveB", 30, ini);
     st.ints[7] = GetPrivateProfileIntA("system", "moveC", 899, ini);
@@ -4189,12 +4189,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
     }
     AVIFileInit();
 
-    // init console before loading plugins so early stdout/lua output is visible
+    // init system max resolution/frame limits and console before loading plugins
+    {
+        char ini[MAX_PATH];
+        get_aviutl_ini_path(ini, sizeof(ini));
+        editp_init_sys_limits_from_ini(ini);
+    }
     debug_console_init(FALSE);
-    dbg_info("AviUtl64 %s starting (PID=%lu, AviUtl 1.10 Build 11003 ABI, VRAM=%dx%d)",
+    dbg_info("AviUtl64 %s starting (PID=%lu, AviUtl 1.10 Build 11003 ABI, VRAM=%dx%d, MaxFrame=%d)",
              REAVIUTL_X64 ? "64-bit (x64)" : "32-bit (x86)",
              (unsigned long)GetCurrentProcessId(),
-             REAVIUTL_VRAM_W, REAVIUTL_VRAM_H);
+             REAVIUTL_VRAM_W, REAVIUTL_VRAM_H, REAVIUTL_MAX_FRAME);
 
     if (!register_classes(hInst))
     {

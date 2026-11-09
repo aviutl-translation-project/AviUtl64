@@ -44,6 +44,10 @@ add_executable(reaviutl
 	${REAVIUTL_CORE_SOURCES}
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+	set_target_properties(reaviutl PROPERTIES OUTPUT_NAME "reaviutl64")
+endif()
+
 # compiler and linker flags
 if(MSVC)
 	target_compile_options(reaviutl

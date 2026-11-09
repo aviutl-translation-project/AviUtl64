@@ -5,6 +5,7 @@
 
 #include <windows.h>
 
+void i18n_set_bridge_mode(BOOL is_bridge);
 void i18n_init(HINSTANCE hInst);
 void i18n_shutdown(void);
 

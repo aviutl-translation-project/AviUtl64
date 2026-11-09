@@ -5,6 +5,7 @@
 #include <string.h>
 #include "preview.h"
 #include "builtin_filters.h"
+#include "darken_theme.h"
 
 #define AVIUTL_BUTTON_CLASS "AviUtlButton"
 #define BTN_EXTRA_HICON (0 * (int)sizeof(LONG_PTR))
@@ -281,7 +282,8 @@ static LRESULT CALLBACK AviUtlTrackbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
 
 static HICON load_icon_24(HINSTANCE hInst, const char *res_name)
 {
-    return (HICON)LoadImageA(hInst, res_name, IMAGE_ICON, 24, 24, 0);
+    HICON ic = (HICON)LoadImageA(hInst, res_name, IMAGE_ICON, 24, 24, 0);
+    return darken_theme_recolor_icon(ic, res_name);
 }
 
 BOOL preview_register_classes(HINSTANCE hInst)

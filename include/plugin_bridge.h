@@ -11,7 +11,7 @@
 #include "editp.h"
 
 #define BRIDGE_MAGIC 0x52415542u // "RAUB"
-#define BRIDGE_VERSION 8u
+#define BRIDGE_VERSION 9u
 #define BRIDGE_MAX_FILTERS 64
 #define BRIDGE_MAX_MENU_ITEMS 256
 #define BRIDGE_MAX_AUOS 32
@@ -165,6 +165,8 @@ typedef struct BridgeSharedMem
 
     int32_t filter_count;
     BridgeFilterInfo filters[BRIDGE_MAX_FILTERS];
+    int32_t host_filter_count;
+    BridgeFilterInfo host_filters[BRIDGE_MAX_FILTERS];
     int32_t menu_item_count;
     BridgeMenuItemInfo menu_items[BRIDGE_MAX_MENU_ITEMS];
 

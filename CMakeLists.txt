@@ -32,6 +32,7 @@ set(REAVIUTL_CORE_SOURCES
 	src/vfw_input.c
 	src/winsnap.c
 	src/i18n.c
+	src/darken_theme.c
 	src/aviutl_dlg.c
 	src/aviutl_resources.rc
 )

@@ -30,8 +30,44 @@ static HWND g_bridge_hwnd = NULL;
 static HWND g_host_main_hwnd = NULL;
 static EDITP *g_editp = NULL;
 static VFWInput *g_bridge_aui_handles[BRIDGE_MAX_OPEN_AUIS];
+static FILTER g_host_filter_stubs[BRIDGE_MAX_FILTERS];
 static BOOL g_in_rpc = FALSE;
 static BOOL g_running = TRUE;
+
+static FILTER *bridge_filter_lookup(int filter_id)
+{
+    int local_n = plugin_manager_get_native_count();
+    if (filter_id < 0)
+        return NULL;
+    if (filter_id < local_n)
+        return plugin_manager_get_filter(filter_id);
+    if (g_shm)
+    {
+        int hidx = filter_id - local_n;
+        if (hidx >= 0 && hidx < g_shm->host_filter_count && hidx < BRIDGE_MAX_FILTERS)
+        {
+            BridgeFilterInfo *hf = &g_shm->host_filters[hidx];
+            FILTER *st = &g_host_filter_stubs[hidx];
+            ZeroMemory(st, sizeof(*st));
+            st->flag = hf->flag;
+            st->name = hf->name;
+            st->information = hf->information;
+            st->hwnd = (HWND)(uintptr_t)hf->hwnd32;
+            st->exfunc = exfunc_get_table();
+            return st;
+        }
+    }
+    return NULL;
+}
+
+static void sync_bridge_filter_total(void)
+{
+    int total = plugin_manager_get_native_count();
+    if (g_shm && g_shm->host_filter_count > 0)
+        total += g_shm->host_filter_count;
+    editp_set_registered_filter_count(total);
+    exfunc_set_filter_lookup(bridge_filter_lookup);
+}
 
 static void sync_shm_from_local(void)
 {
@@ -290,6 +326,7 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
     case BRIDGE_CMD_LOAD_DIR:
     {
         BOOL f_ok = plugin_manager_init_ex(req->str, g_bridge_hwnd, g_editp);
+        sync_bridge_filter_total();
         profile_cfg_init();
         resp->val0 = plugin_manager_get_count();
         resp->ok = f_ok ? 1 : 0;
@@ -298,6 +335,7 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
 
     case BRIDGE_CMD_LOAD_FILE:
         resp->ok = plugin_manager_load_single_auf(req->str, g_bridge_hwnd, g_editp) ? 1 : 0;
+        sync_bridge_filter_total();
         resp->val0 = plugin_manager_get_count();
         break;
 
@@ -371,6 +409,7 @@ static void handle_rpc(const BridgeRpcReq *req, BridgeRpcResp *resp)
         break;
 
     case BRIDGE_CMD_SYNC_STATE:
+        sync_bridge_filter_total();
         if (g_editp)
         {
             if (req->arg1 > 0 && req->arg1 != editp_get_frame_n(g_editp))
@@ -813,6 +852,9 @@ int main(int argc, char **argv)
     g_read_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
     g_write_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
 
+    i18n_set_bridge_mode(TRUE);
+    i18n_init(GetModuleHandleA(NULL));
+
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = BridgeOwnerWndProc;
     wc.hInstance = GetModuleHandleA(NULL);
@@ -822,8 +864,6 @@ int main(int argc, char **argv)
     g_bridge_hwnd = CreateWindowExA(
         0, "AviUtlBridgeOwnerClass", "AviUtl", WS_OVERLAPPEDWINDOW,
         0, 0, 320, 240, NULL, NULL, GetModuleHandleA(NULL), NULL);
-
-    i18n_init(GetModuleHandleA(NULL));
 
     g_editp = editp_create_idle(g_bridge_hwnd);
     exfunc_set_editp(g_editp);
@@ -959,6 +999,7 @@ int main(int argc, char **argv)
     input_plugin_shutdown();
     color_plugin_shutdown();
     exfunc_shutdown();
+    i18n_shutdown();
     if (g_editp)
     {
         editp_destroy(g_editp);

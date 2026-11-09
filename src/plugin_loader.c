@@ -8,6 +8,7 @@
 #include "filter.h"
 #include "editp.h"
 #include "plugin_loader.h"
+#include "darken_theme.h"
 
 EXFUNC *exfunc_get_table(void);
 
@@ -125,6 +126,7 @@ int plugin_inspect_auf(const char *path, PluginReport *rep)
         return -1;
     }
 
+    darken_theme_hook_module(mod);
     rep->count = count;
     return count;
 }

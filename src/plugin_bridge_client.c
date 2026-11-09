@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "plugin_bridge.h"
+#include "plugin_manager.h"
 #include "debug_console.h"
 
 #if REAVIUTL_X64
@@ -403,6 +404,37 @@ static BOOL ensure_bridge_started(HWND main_hwnd)
     return TRUE;
 }
 
+static void sync_host_filters_to_shm(void)
+{
+    int i, n;
+    if (!g_shm)
+        return;
+    n = plugin_manager_get_native_count();
+    if (n > BRIDGE_MAX_FILTERS)
+        n = BRIDGE_MAX_FILTERS;
+    g_shm->host_filter_count = n;
+    for (i = 0; i < n; i++)
+    {
+        const char *nm = plugin_manager_get_name(i);
+        const char *inf = plugin_manager_get_information(i);
+        const char *pth = plugin_manager_get_path(i);
+        HWND hw = plugin_manager_get_window(i);
+        int fl = plugin_manager_get_flags(i);
+        lstrcpynA(g_shm->host_filters[i].name, nm ? nm : "",
+                  sizeof(g_shm->host_filters[i].name));
+        lstrcpynA(g_shm->host_filters[i].information, inf ? inf : "",
+                  sizeof(g_shm->host_filters[i].information));
+        lstrcpynA(g_shm->host_filters[i].path, pth ? pth : "",
+                  sizeof(g_shm->host_filters[i].path));
+        g_shm->host_filters[i].flag = fl;
+        g_shm->host_filters[i].has_window = (hw != NULL) ? 1 : 0;
+        g_shm->host_filters[i].window_visible = ((fl & FILTER_FLAG_WINDOW_DISP) != 0) ? 1 : 0;
+        g_shm->host_filters[i].hwnd32 = (uint32_t)(uintptr_t)hw;
+        g_shm->host_filters[i].has_func_proc = plugin_manager_has_func_proc(i) ? 1 : 0;
+        g_shm->host_filters[i].priority = plugin_manager_get_priority(i);
+    }
+}
+
 BOOL plugin_bridge_is_active(void)
 {
     return g_active;
@@ -414,6 +446,7 @@ BOOL plugin_bridge_load_dir(const char *plugin_dir, HWND main_hwnd, EDITP *ep)
     BridgeRpcResp resp;
     if (!ensure_bridge_started(main_hwnd))
         return FALSE;
+    sync_host_filters_to_shm();
     if (ep && editp_is_editing(ep) && editp_get_edit_path(ep)[0])
     {
         plugin_bridge_open_video(editp_get_edit_path(ep), ep);
@@ -434,6 +467,7 @@ BOOL plugin_bridge_load_file(const char *auf_path, HWND main_hwnd, EDITP *ep)
     BridgeRpcResp resp;
     if (!ensure_bridge_started(main_hwnd))
         return FALSE;
+    sync_host_filters_to_shm();
     if (ep && editp_is_editing(ep) && editp_get_edit_path(ep)[0])
     {
         plugin_bridge_open_video(editp_get_edit_path(ep), ep);
@@ -779,6 +813,7 @@ BOOL plugin_bridge_sync_to_bridge(EDITP *ep)
     int s = 0, e = 0, dw = 0, dh = 0, fn;
     if (!g_active || !g_shm || !ep)
         return FALSE;
+    sync_host_filters_to_shm();
     fn = editp_get_frame_n(ep);
     if (fn > 0)
     {

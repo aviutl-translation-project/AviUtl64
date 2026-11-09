@@ -1053,6 +1053,7 @@ static BOOL inspect_and_register_auo(const char *full_path, const char *file_nam
     if (!mod)
     {
         DWORD err = GetLastError();
+#if REAVIUTL_X64
         if (err == ERROR_BAD_EXE_FORMAT && saw_32bit_on_x64)
         {
             *saw_32bit_on_x64 = TRUE;
@@ -1060,6 +1061,10 @@ static BOOL inspect_and_register_auo(const char *full_path, const char *file_nam
                        file_name);
         }
         else
+#else
+        (void)saw_32bit_on_x64;
+        if (err != ERROR_BAD_EXE_FORMAT)
+#endif
         {
             dbg_warn("Failed to load output plugin '%s' (err=%lu)", full_path, (unsigned long)err);
         }

@@ -4686,13 +4686,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show)
              (unsigned long)GetCurrentProcessId(),
              REAVIUTL_VRAM_W, REAVIUTL_VRAM_H, REAVIUTL_MAX_FRAME);
 
+    i18n_init(hInst);
+
     if (!register_classes(hInst))
     {
         MessageBoxA(NULL, "Failed to register window class.", "AviUtl", MB_ICONERROR);
         return 1;
     }
-
-    i18n_init(hInst);
     {
         char ini[MAX_PATH];
         int prio;

@@ -960,7 +960,7 @@ BOOL aup_load_local(const char *aup_path, EDITP *ep)
         for (fi = 0; fi < fcount; fi++)
         {
             FILTER *fp = plugin_manager_get_filter(fi);
-            if (fp && fp->name && lstrcmpA(fp->name, flt_name) == 0)
+            if (fp && fp->name && plugin_manager_filter_names_match(fp->name, flt_name))
             {
                 matched = TRUE;
                 if (fp->func_project_load)

@@ -36,6 +36,8 @@ BOOL plugin_manager_load_single_auf(const char *auf_path, HWND main_hwnd, EDITP 
 void plugin_manager_shutdown(void);
 
 int plugin_manager_get_count(void);
+int plugin_manager_get_native_count(void);
+BOOL plugin_manager_filter_names_match(const char *a, const char *b);
 BOOL plugin_manager_is_builtin(int index);
 int plugin_manager_get_cmd_slot(int index);
 int plugin_manager_find_by_cmd_slot(int cmd_slot);

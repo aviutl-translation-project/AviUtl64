@@ -14,6 +14,7 @@
 #include "exfunc.h"
 #include "yc48_convert.h"
 #include "i18n.h"
+#include "darken_theme.h"
 #include "aviutl_dlg.h"
 #include "winsnap.h"
 #include "debug_console.h"
@@ -1272,8 +1273,10 @@ static HWND create_filter_window(PluginEntry *e, HWND owner_hwnd)
     HMENU sysm;
     HINSTANCE hInst = GetModuleHandleA(NULL);
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    HICON hIconLeft = (HICON)LoadImageA(hInst, "ICON_LEFT", IMAGE_ICON, 16, 16, 0);
-    HICON hIconRight = (HICON)LoadImageA(hInst, "ICON_RIGHT", IMAGE_ICON, 16, 16, 0);
+    HICON hIconLeft = darken_theme_recolor_icon(
+        (HICON)LoadImageA(hInst, "ICON_LEFT", IMAGE_ICON, 16, 16, 0), "ICON_LEFT");
+    HICON hIconRight = darken_theme_recolor_icon(
+        (HICON)LoadImageA(hInst, "ICON_RIGHT", IMAGE_ICON, 16, 16, 0), "ICON_RIGHT");
 
     if (!f)
         return NULL;
@@ -2166,6 +2169,42 @@ int plugin_manager_get_count(void)
     return g_plugin_count + (plugin_bridge_is_active() ? plugin_bridge_get_filter_count() : 0);
 }
 
+int plugin_manager_get_native_count(void)
+{
+    return g_plugin_count;
+}
+
+static BOOL is_exedit_main_name(const char *s)
+{
+    if (!s || !s[0])
+        return FALSE;
+    return lstrcmpA(s, "\x8a\x67\x92\xa3\x95\xd2\x8f\x57") == 0 ||
+           _stricmp(s, "Advanced Editing") == 0 ||
+           _stricmp(s, "Adv.Edit") == 0;
+}
+
+static BOOL is_exedit_audio_name(const char *s)
+{
+    if (!s || !s[0])
+        return FALSE;
+    return lstrcmpA(s, "\x8a\x67\x92\xa3\x95\xd2\x8f\x57(\x89\xb9\x90\xba)") == 0 ||
+           _stricmp(s, "Advanced Editing (Audio)") == 0 ||
+           _stricmp(s, "Advanced Editing(Audio)") == 0;
+}
+
+BOOL plugin_manager_filter_names_match(const char *a, const char *b)
+{
+    if (!a || !b)
+        return FALSE;
+    if (lstrcmpA(a, b) == 0)
+        return TRUE;
+    if (is_exedit_main_name(a) && is_exedit_main_name(b))
+        return TRUE;
+    if (is_exedit_audio_name(a) && is_exedit_audio_name(b))
+        return TRUE;
+    return FALSE;
+}
+
 BOOL plugin_manager_is_builtin(int index)
 {
     if (index < 0 || index >= g_plugin_count)
@@ -2500,7 +2539,7 @@ int plugin_manager_find_by_name(const char *name)
     for (i = 0; i < n; i++)
     {
         const char *nm = plugin_manager_get_name(i);
-        if (nm && lstrcmpA(nm, name) == 0)
+        if (nm && plugin_manager_filter_names_match(nm, name))
             return i;
     }
     return -1;
@@ -2842,8 +2881,8 @@ static PluginEntry *find_plugin_entry_for_cfg_name(const char *rec_name)
         PluginEntry *e = &g_plugins[i];
         if (!e->stage1_initialized)
             continue;
-        if ((e->runtime.name && lstrcmpA(e->runtime.name, rec_name) == 0) ||
-            lstrcmpA(e->name, rec_name) == 0)
+        if ((e->runtime.name && plugin_manager_filter_names_match(e->runtime.name, rec_name)) ||
+            plugin_manager_filter_names_match(e->name, rec_name))
         {
             return e;
         }
@@ -2860,8 +2899,8 @@ static PluginEntry *find_plugin_entry_for_cfg_name(const char *rec_name)
                 PluginEntry *e = &g_plugins[i];
                 if (!e->stage1_initialized)
                     continue;
-                if ((e->runtime.name && lstrcmpA(e->runtime.name, sub) == 0) ||
-                    lstrcmpA(e->name, sub) == 0)
+                if ((e->runtime.name && plugin_manager_filter_names_match(e->runtime.name, sub)) ||
+                    plugin_manager_filter_names_match(e->name, sub))
                 {
                     return e;
                 }

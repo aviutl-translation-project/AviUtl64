@@ -4,9 +4,12 @@
 
 #include "i18n.h"
 #include "aviutl_dlg.h"
+#include "darken_theme.h"
+#include "debug_console.h"
 #include "plugin_cache.h"
 
 #define I18N_MAX_PACKS 16
+#define I18N_MAX_CODE_AULS 32
 #define I18N_CACHE_LOW 256
 #define I18N_RING_SLOTS 8
 
@@ -22,6 +25,9 @@ typedef struct LangPackEntry
 
 static HINSTANCE g_exe_mod = NULL;
 static HMODULE g_active_mod = NULL;
+static HMODULE g_code_auls[I18N_MAX_CODE_AULS];
+static int g_code_aul_count = 0;
+static BOOL g_bridge_mode = FALSE;
 static int g_pack_count = 0;
 static int g_active_pack = 0;
 static BOOL g_is_auto = TRUE;
@@ -225,6 +231,60 @@ static void clear_string_cache(void)
     ZeroMemory(g_wcache_valid, sizeof(g_wcache_valid));
 }
 
+void i18n_set_bridge_mode(BOOL is_bridge)
+{
+    g_bridge_mode = is_bridge;
+}
+
+static BOOL check_pe_non_stock_32bit_exedit(const char *path)
+{
+    HANDLE hf;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS32 nt;
+    DWORD got = 0;
+
+    hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    if (!ReadFile(hf, &dos, sizeof(dos), &got, NULL) ||
+        got != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        CloseHandle(hf);
+        return FALSE;
+    }
+    if (SetFilePointer(hf, dos.e_lfanew, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER ||
+        !ReadFile(hf, &nt, sizeof(nt), &got, NULL) ||
+        got != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
+    {
+        CloseHandle(hf);
+        return FALSE;
+    }
+    CloseHandle(hf);
+
+    if (nt.FileHeader.Machine == IMAGE_FILE_MACHINE_I386 &&
+        nt.FileHeader.TimeDateStamp != 0x51e3fd29u)
+    {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL has_non_stock_32bit_exedit(const char *exe_dir)
+{
+    char p[MAX_PATH];
+    if (!exe_dir || !exe_dir[0])
+        return FALSE;
+    _snprintf(p, sizeof(p), "%sexedit.auf", exe_dir);
+    p[sizeof(p) - 1] = '\0';
+    if (check_pe_non_stock_32bit_exedit(p))
+        return TRUE;
+    _snprintf(p, sizeof(p), "%splugins\\exedit.auf", exe_dir);
+    p[sizeof(p) - 1] = '\0';
+    return check_pe_non_stock_32bit_exedit(p);
+}
+
 static void scan_aul_dir(const char *dir)
 {
     char pattern[MAX_PATH];
@@ -233,7 +293,7 @@ static void scan_aul_dir(const char *dir)
     WIN32_FIND_DATAA fd;
     HANDLE hFind;
 
-    if (!dir || !dir[0] || g_pack_count >= I18N_MAX_PACKS)
+    if (!dir || !dir[0])
         return;
 
     get_exe_dir(exe_dir, sizeof(exe_dir));
@@ -250,7 +310,10 @@ static void scan_aul_dir(const char *dir)
     do
     {
         char full[MAX_PATH];
-        HMODULE hMod;
+        HMODULE hMod = NULL;
+        BOOL loaded_exec = FALSE;
+        BOOL skip_exec = FALSE;
+        BOOL is_lang_pack = FALSE;
         WORD lang = 0;
         HRSRC hRes;
         wchar_t nm[260], cr[260];
@@ -260,14 +323,13 @@ static void scan_aul_dir(const char *dir)
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
-        if (g_pack_count >= I18N_MAX_PACKS)
-            break;
 
         _snprintf(full, sizeof(full), "%s%s", dir, fd.cFileName);
         full[sizeof(full) - 1] = '\0';
 
         // 0x004541e0: check [system] plugincache=1 before loading .aul resource DLL
-        if (plugin_cache_try_load(ini_a, full, &fd, 0,
+        if (g_pack_count < I18N_MAX_PACKS &&
+            plugin_cache_try_load(ini_a, full, &fd, 0,
                                   &cached_lang, cached_nm_a, sizeof(cached_nm_a),
                                   NULL, 0, NULL,
                                   cached_cr_a, sizeof(cached_cr_a)) == PLUGIN_CACHE_HIT_NATIVE &&
@@ -294,15 +356,53 @@ static void scan_aul_dir(const char *dir)
             continue;
         }
 
-        // LOAD_LIBRARY_AS_DATAFILE allows 64-bit reaviutl to load 32-bit .aul resource DLLs
-        hMod = LoadLibraryExA(full, NULL, LOAD_LIBRARY_AS_DATAFILE);
+        // binary patchers targeting stock 32-bit aviutl.exe 1.10 RVAs must only be read as datafiles
+        if (_stricmp(fd.cFileName, "patch.aul") == 0 ||
+            _stricmp(fd.cFileName, "SplitWindow.aul") == 0)
+        {
+            skip_exec = TRUE;
+            if (!g_bridge_mode && _stricmp(fd.cFileName, "SplitWindow.aul") == 0)
+            {
+                dbg_info("skipping executable load of stock-RVA patcher '%s'", fd.cFileName);
+            }
+        }
+#if !REAVIUTL_X64
+        else if (!g_bridge_mode && _stricmp(fd.cFileName, "DarkenWindow.aul") == 0 &&
+                 has_non_stock_32bit_exedit(exe_dir))
+        {
+            skip_exec = TRUE;
+            darken_theme_on_aul_detected(full);
+        }
+#endif
+
+        if (!skip_exec)
+        {
+            hMod = LoadLibraryExA(full, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (hMod)
+            {
+                loaded_exec = TRUE;
+            }
+            else if (GetLastError() == ERROR_BAD_EXE_FORMAT &&
+                     !g_bridge_mode && _stricmp(fd.cFileName, "DarkenWindow.aul") == 0)
+            {
+                darken_theme_on_aul_detected(full);
+            }
+        }
+
+        if (!hMod)
+        {
+            // fallback allows 64-bit host to read 32-bit resource-only .aul language packs
+            hMod = LoadLibraryExA(full, NULL, LOAD_LIBRARY_AS_DATAFILE);
+        }
         if (!hMod)
             continue;
 
         hRes = find_res_any_lang(hMod, (LPCWSTR)RT_STRING, MAKEINTRESOURCEW(1), &lang);
-        if (hRes && load_string_from_mod(hMod, 0, nm, 260) && nm[0])
+        if (g_pack_count < I18N_MAX_PACKS &&
+            hRes && load_string_from_mod(hMod, 0, nm, 260) && nm[0])
         {
             LangPackEntry *e = &g_packs[g_pack_count++];
+            is_lang_pack = TRUE;
             ZeroMemory(e, sizeof(*e));
             e->valid = TRUE;
             e->is_exe = FALSE;
@@ -334,7 +434,16 @@ static void scan_aul_dir(const char *dir)
                 }
             }
         }
-        FreeLibrary(hMod);
+
+        if (loaded_exec && !is_lang_pack && g_code_aul_count < I18N_MAX_CODE_AULS)
+        {
+            g_code_auls[g_code_aul_count++] = hMod;
+            dbg_info("loaded extension .aul '%s' (0x%p)", fd.cFileName, (void *)hMod);
+        }
+        else
+        {
+            FreeLibrary(hMod);
+        }
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
@@ -458,11 +567,22 @@ void i18n_init(HINSTANCE hInst)
 
 void i18n_shutdown(void)
 {
+    int i;
+    darken_theme_shutdown();
     if (g_active_mod && g_active_mod != (HMODULE)g_exe_mod)
     {
         FreeLibrary(g_active_mod);
     }
     g_active_mod = NULL;
+    for (i = 0; i < g_code_aul_count; i++)
+    {
+        if (g_code_auls[i])
+        {
+            FreeLibrary(g_code_auls[i]);
+            g_code_auls[i] = NULL;
+        }
+    }
+    g_code_aul_count = 0;
     g_pack_count = 0;
     g_active_pack = 0;
     clear_string_cache();
